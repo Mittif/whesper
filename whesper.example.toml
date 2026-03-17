@@ -1,0 +1,44 @@
+[app]
+storage_dir = ".whesper"
+default_session = "main"
+history_limit = 16
+
+[persona]
+name = "Whesper"
+system_prompt = """
+You are Whesper, a warm, attentive, emotionally aware AI companion.
+Keep replies natural, supportive, and conversational.
+Do not mention internal routing or model selection unless the user asks.
+"""
+
+[scheduler]
+chat_model = "local_chat"
+reasoning_model = "local_chat"
+search_model = "kimi_search"
+long_message_chars = 600
+reasoning_keywords = ["分析", "总结", "比较", "计划", "设计", "为什么", "how", "why"]
+
+[providers.ollama_local]
+kind = "ollama_native"
+base_url = "http://localhost:11434/"
+api_key = "ollama"
+timeout_seconds = 180
+
+[providers.kimi]
+kind = "openai_compatible"
+base_url = "https://api.moonshot.cn/v1"
+api_key_env = "WHESPER_KIMI_API_KEY"
+timeout_seconds = 180
+
+[models.local_chat]
+provider = "ollama_local"
+model = "your-model"
+temperature = 0.7
+max_tokens = 1200
+think = false
+
+[models.kimi_search]
+provider = "kimi"
+model = "replace-with-your-kimi-model"
+temperature = 0.4
+max_tokens = 1600

@@ -1,3 +1,11 @@
+Metadata-Version: 2.4
+Name: whesper
+Version: 0.1.0
+Summary: A Python-first CLI companion with multi-model routing.
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: prompt_toolkit<4,>=3.0.43
+
 # whesper
 
 A companion agent for immersive, adaptive intimate experiences.
@@ -17,29 +25,29 @@ A companion agent for immersive, adaptive intimate experiences.
 
 ### Quickstart
 
-1. 创建虚拟环境并安装依赖：
-
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -e .
-```
-
-2. 复制配置模板：
+1. 复制配置模板：
 
 ```bash
 cp whesper.example.toml whesper.toml
 ```
 
-3. 为 Kimi 设置环境变量：
+2. 为 Kimi 设置环境变量：
 
 ```bash
 export WHESPER_KIMI_API_KEY="your-api-key"
 ```
 
-4. 启动 CLI：
+3. 启动 CLI：
 
 ```bash
-.venv/bin/whesper --config whesper.toml chat
+python3 -m whesper --config whesper.toml chat
+```
+
+或者安装为命令：
+
+```bash
+python3 -m pip install -e .
+whesper --config whesper.toml chat
 ```
 
 ### Useful Commands
@@ -60,8 +68,6 @@ export WHESPER_KIMI_API_KEY="your-api-key"
 - `Up/Down` 浏览输入历史
 - `Ctrl+R` 搜索历史
 - `Tab` 做 slash command 自动补全
-- 首 token 前显示 `thinking...` 动效
-- 模型回复流式输出
 - 底部状态栏展示当前 `session / model / route`
 - `/help`、`/use`、`/mode`、`/new` 等命令更适合交互式使用
 
@@ -71,7 +77,4 @@ export WHESPER_KIMI_API_KEY="your-api-key"
 - 长输入或命中推理关键词时切换到 `scheduler.reasoning_model`
 - `/search ...` 或 `search` 模式使用 `scheduler.search_model`
 
-当前 provider 通过统一抽象接入：
-
-- 本地 `Ollama` 默认走原生 `/api/chat`，这样可以显式关闭 `thinking`
-- 远程 `Kimi` 继续走 OpenAI-compatible API
+当前 provider 按 OpenAI-compatible API 统一接入，因此本地 `Ollama` 和远程 `Kimi` 都可以走同一套客户端。

@@ -1,0 +1,2 @@
+[console_scripts]
+whesper = whesper.cli:main
