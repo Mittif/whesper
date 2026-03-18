@@ -5,3 +5,5 @@ __pycache__/
 .pytest_cache/
 .venv/
 whesper.toml
+DEVELOPMENT_NOTES.local.md
+src/whesper.egg-info/

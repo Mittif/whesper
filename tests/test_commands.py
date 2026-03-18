@@ -32,10 +32,10 @@ def make_config():
 
 class CommandTests(unittest.TestCase):
     def test_parse_command_with_arg(self) -> None:
-        command = parse_command("/use local_chat")
+        command = parse_command("/model local_chat")
         self.assertIsNotNone(command)
         assert command is not None
-        self.assertEqual(command.name, "/use")
+        self.assertEqual(command.name, "/model")
         self.assertEqual(command.arg, "local_chat")
 
     def test_parse_non_command(self) -> None:
@@ -47,10 +47,21 @@ class CommandTests(unittest.TestCase):
             store = SessionStore(temp_dir)
             store.load("demo")
             completions = command_completions(config, store)
+            self.assertIn("/clear", completions)
+            self.assertIn("/model", completions)
+            self.assertIn("chat", completions["/model"])
             self.assertIn("/use", completions)
             self.assertIn("chat", completions["/use"])
+            self.assertIn("/status", completions)
+            self.assertIn("/info", completions)
+            self.assertIn("/retry", completions)
+            self.assertIn("/copy-last", completions)
             self.assertIn("/new", completions)
             self.assertIn("demo", completions["/new"])
+            self.assertIn("/rename", completions)
+            self.assertIn("demo", completions["/rename"])
+            self.assertIn("/delete-session", completions)
+            self.assertIn("demo", completions["/delete-session"])
 
 
 if __name__ == "__main__":

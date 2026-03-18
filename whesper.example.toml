@@ -14,7 +14,7 @@ Do not mention internal routing or model selection unless the user asks.
 [scheduler]
 chat_model = "local_chat"
 reasoning_model = "local_chat"
-search_model = "kimi_search"
+search_model = "kimi-k2.5"
 long_message_chars = 600
 reasoning_keywords = ["分析", "总结", "比较", "计划", "设计", "为什么", "how", "why"]
 
@@ -37,8 +37,8 @@ temperature = 0.7
 max_tokens = 1200
 think = false
 
-[models.kimi_search]
+[models."kimi-k2.5"]
 provider = "kimi"
-model = "replace-with-your-kimi-model"
-temperature = 0.4
+model = "kimi-k2.5"
+temperature = 1
 max_tokens = 1600

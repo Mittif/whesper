@@ -15,6 +15,9 @@ src/whesper.egg-info/dependency_links.txt
 src/whesper.egg-info/entry_points.txt
 src/whesper.egg-info/requires.txt
 src/whesper.egg-info/top_level.txt
+tests/test_chat.py
+tests/test_client.py
 tests/test_commands.py
 tests/test_config.py
+tests/test_payload.py
 tests/test_router.py

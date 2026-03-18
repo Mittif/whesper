@@ -1,77 +1,105 @@
-# whesper
+# Whesper
 
-A companion agent for immersive, adaptive intimate experiences.
+Whesper is a Python-first companion agent prototype focused on natural conversation, configurable personas, and multi-model routing.
 
-## Docs
+The current repository ships a local CLI experience first, so the core dialogue loop can be tested quickly before moving to richer surfaces such as a web app.
 
-- [Whesper MVP 开发规格说明](docs/whesper_mvp_development_spec.md)
+## Current Scope
 
-## CLI MVP
+- Interactive CLI chat experience
+- Configurable persona and system prompt
+- Multi-model routing with provider abstraction
+- Local Ollama support
+- Remote Kimi support
+- Session persistence and command-driven model switching
 
-当前仓库已经包含一个 Python-first 的本地 CLI 聊天原型，重点是：
+## Features
 
-- 先把基础对话跑通
-- 用 `TOML` 做多模型配置
-- 支持多 provider / 多模型调度
-- 本地会话历史落盘到 `.whesper/`
+- Claude Code-inspired terminal UX with history, completion, and slash commands
+- Streaming responses with a lightweight `thinking...` state
+- Per-session model selection via `/model`
+- Config-driven provider setup through `TOML`
+- Python-first implementation built around a small, inspectable codebase
 
-### Quickstart
+## Quick Start
 
-1. 创建虚拟环境并安装依赖：
+1. Create a virtual environment and install the package:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -e .
 ```
 
-2. 复制配置模板：
+2. Create your local config from the example:
 
 ```bash
 cp whesper.example.toml whesper.toml
 ```
 
-3. 为 Kimi 设置环境变量：
+3. Export your Kimi API key if you want to use the Kimi model:
 
 ```bash
 export WHESPER_KIMI_API_KEY="your-api-key"
 ```
 
-4. 启动 CLI：
+4. Start the CLI:
 
 ```bash
-.venv/bin/whesper --config whesper.toml chat
+.venv/bin/python -m whesper --config whesper.toml chat
 ```
 
-### Useful Commands
+## Common Commands
 
 - `/models`
-- `/use local_chat`
-- `/use auto`
+- `/model local_chat`
+- `/model kimi-k2.5`
+- `/model auto`
 - `/mode auto`
 - `/mode reasoning`
-- `/new test-session`
+- `/status`
+- `/info`
+- `/retry`
+- `/copy-last`
+- `/rename test-session`
+- `/delete-session old-session`
 - `/history`
+- `/new test-session`
+- `/clear`
 - `/exit`
 
-### Enhanced CLI UX
+## Configuration
 
-当前交互已经朝 Claude Code 风格做了第一轮重构，依赖 `prompt_toolkit`，支持：
+The repository includes a tracked example config:
 
-- `Up/Down` 浏览输入历史
-- `Ctrl+R` 搜索历史
-- `Tab` 做 slash command 自动补全
-- 首 token 前显示 `thinking...` 动效
-- 模型回复流式输出
-- 底部状态栏展示当前 `session / model / route`
-- `/help`、`/use`、`/mode`、`/new` 等命令更适合交互式使用
+- [whesper.example.toml](whesper.example.toml)
 
-### Multi-model Strategy
+Your real local config should live in:
 
-- 默认聊天使用 `scheduler.chat_model`
-- 长输入或命中推理关键词时切换到 `scheduler.reasoning_model`
-- `/search ...` 或 `search` 模式使用 `scheduler.search_model`
+- `whesper.toml`
 
-当前 provider 通过统一抽象接入：
+`whesper.toml` is ignored by git so local secrets and internal endpoints stay out of version control.
 
-- 本地 `Ollama` 默认走原生 `/api/chat`，这样可以显式关闭 `thinking`
-- 远程 `Kimi` 继续走 OpenAI-compatible API
+## Providers
+
+- `local_chat` is configured for an Ollama-compatible local or private endpoint
+- `kimi-k2.5` is configured for Moonshot/Kimi via `WHESPER_KIMI_API_KEY`
+
+## Project Status
+
+Whesper is currently in an MVP / prototype phase. The main focus right now is:
+
+- making the conversation loop solid
+- improving CLI usability
+- validating multi-model behavior before expanding into a web application
+
+## Development
+
+This README is intentionally written as a project-facing overview for GitHub readers.
+
+Local development notes can live in an ignored file such as:
+
+- `DEVELOPMENT_NOTES.local.md`
+
+The current CLI task list lives in:
+
+- [CLI_TODO.md](CLI_TODO.md)

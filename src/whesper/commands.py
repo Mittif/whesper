@@ -19,12 +19,20 @@ class CommandSpec:
 COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/help", description="Show available commands"),
     CommandSpec("/exit", description="Exit the CLI"),
+    CommandSpec("/clear", description="Clear the current terminal screen"),
     CommandSpec("/models", description="List configured models"),
     CommandSpec("/sessions", description="List saved sessions"),
+    CommandSpec("/status", description="Show current session and routing state"),
+    CommandSpec("/info", description="Show the active model configuration"),
     CommandSpec("/history", description="Show recent transcript"),
+    CommandSpec("/retry", description="Regenerate the last assistant reply"),
+    CommandSpec("/copy-last", description="Print the last assistant reply as plain text"),
+    CommandSpec("/model", "<alias|auto>", "Switch the current session model"),
     CommandSpec("/use", "<alias|auto>", "Pin the current session model"),
     CommandSpec("/mode", "<auto|chat|reasoning|search>", "Override routing mode"),
     CommandSpec("/new", "[session_id]", "Create or switch session"),
+    CommandSpec("/rename", "<session_id>", "Rename the current session"),
+    CommandSpec("/delete-session", "<session_id>", "Delete a saved session"),
 )
 
 
@@ -60,11 +68,18 @@ def command_completions(config: AppConfig, store: SessionStore) -> dict[str, obj
     return {
         "/help": None,
         "/exit": None,
+        "/clear": None,
         "/models": None,
         "/sessions": None,
+        "/status": None,
+        "/info": None,
         "/history": None,
+        "/retry": None,
+        "/copy-last": None,
+        "/model": {alias: None for alias in ("auto", *config.models.keys())},
         "/use": {alias: None for alias in ("auto", *config.models.keys())},
         "/mode": {mode: None for mode in VALID_MODES},
         "/new": {session_id: None for session_id in store.list_sessions()},
+        "/rename": {session_id: None for session_id in store.list_sessions()},
+        "/delete-session": {session_id: None for session_id in store.list_sessions()},
     }
-

@@ -80,13 +80,46 @@ class AppConfig:
         try:
             return self.providers[name]
         except KeyError as exc:
-            raise ConfigError(f"Unknown provider: {name}") from exc
+            available = ", ".join(sorted(self.providers.keys()))
+            if available:
+                raise ConfigError(
+                    f"Unknown provider: {name}. available providers: {available}"
+                ) from exc
+            raise ConfigError(
+                f"Unknown provider: {name}. no providers are configured."
+            ) from exc
 
     def get_model(self, name: str) -> ModelConfig:
         try:
             return self.models[name]
         except KeyError as exc:
-            raise ConfigError(f"Unknown model alias: {name}") from exc
+            available = ", ".join(sorted(self.models.keys()))
+            if available:
+                raise ConfigError(
+                    f"Unknown model alias: {name}. available models: {available}"
+                ) from exc
+            raise ConfigError(
+                f"Unknown model alias: {name}. no models are configured."
+            ) from exc
+
+
+def _available_items_text(items: dict[str, object]) -> str:
+    names = ", ".join(sorted(items.keys()))
+    return names or "none"
+
+
+def _scheduler_model_error(field_name: str, alias: str, models: dict[str, ModelConfig]) -> ConfigError:
+    available = _available_items_text(models)
+    if models:
+        return ConfigError(
+            f"{field_name} refers to unknown model alias '{alias}'. "
+            f"available models: {available}. "
+            f"Update [scheduler] {field_name.split('.')[-1]} or add [models.\"{alias}\"]."
+        )
+    return ConfigError(
+        f"{field_name} refers to unknown model alias '{alias}', but no models are configured. "
+        "Add at least one [models.<alias>] section and point scheduler.chat_model to it."
+    )
 
 
 def _require_table(data: dict[str, Any], key: str) -> dict[str, Any]:
@@ -185,6 +218,12 @@ def load_config(path: str | Path) -> AppConfig:
             tags=_to_tuple(item.get("tags")),
         )
 
+    if not models:
+        raise ConfigError(
+            "No models are configured. Add at least one [models.<alias>] section "
+            "and set scheduler.chat_model to that alias."
+        )
+
     config = AppConfig(
         app=app,
         persona=persona,
@@ -195,16 +234,20 @@ def load_config(path: str | Path) -> AppConfig:
     )
 
     if scheduler.chat_model not in models:
-        raise ConfigError("scheduler.chat_model must refer to a defined model.")
+        raise _scheduler_model_error("scheduler.chat_model", scheduler.chat_model, models)
     if scheduler.reasoning_model and scheduler.reasoning_model not in models:
-        raise ConfigError("scheduler.reasoning_model must refer to a defined model.")
+        raise _scheduler_model_error(
+            "scheduler.reasoning_model", scheduler.reasoning_model, models
+        )
     if scheduler.search_model and scheduler.search_model not in models:
-        raise ConfigError("scheduler.search_model must refer to a defined model.")
+        raise _scheduler_model_error("scheduler.search_model", scheduler.search_model, models)
 
     for model in models.values():
         if model.provider not in providers:
             raise ConfigError(
-                f"Model alias '{model.name}' refers to unknown provider '{model.provider}'."
+                f"Model alias '{model.name}' refers to unknown provider '{model.provider}'. "
+                f"available providers: {_available_items_text(providers)}. "
+                f"Update [models.\"{model.name}\"] provider or add [providers.{model.provider}]."
             )
 
     return config

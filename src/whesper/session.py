@@ -101,3 +101,24 @@ class SessionStore:
     def list_sessions(self) -> list[str]:
         return sorted(path.stem for path in self.sessions_dir.glob("*.json"))
 
+    def rename_session(self, current_session_id: str, next_session_id: str) -> ConversationSession:
+        current_path = self.path_for(current_session_id)
+        next_path = self.path_for(next_session_id)
+        if not current_path.exists():
+            raise FileNotFoundError(f"Session not found: {current_session_id}")
+        if next_path.exists() and next_path != current_path:
+            raise FileExistsError(f"Session already exists: {next_session_id}")
+
+        session = self.load(current_session_id)
+        session.session_id = next_session_id
+        self.save(session)
+        if next_path != current_path and current_path.exists():
+            current_path.unlink()
+        return session
+
+    def delete_session(self, session_id: str) -> bool:
+        path = self.path_for(session_id)
+        if not path.exists():
+            return False
+        path.unlink()
+        return True
