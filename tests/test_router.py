@@ -57,7 +57,25 @@ class RouterTests(unittest.TestCase):
         decision = select_model(config, "/search latest release notes")
         self.assertEqual(decision.model_alias, "search")
 
+    def test_search_shortcut_overrides_pinned_model(self) -> None:
+        config = make_config()
+        decision = select_model(
+            config,
+            "/search latest release notes",
+            pinned_model="chat",
+        )
+        self.assertEqual(decision.model_alias, "search")
+
+    def test_explicit_search_intent_routes_to_search_model(self) -> None:
+        config = make_config()
+        decision = select_model(config, "帮我查一下 OpenAI release notes")
+        self.assertEqual(decision.model_alias, "search")
+
+    def test_current_info_keywords_route_to_search_model(self) -> None:
+        config = make_config()
+        decision = select_model(config, "OpenAI 最新新闻")
+        self.assertEqual(decision.model_alias, "search")
+
 
 if __name__ == "__main__":
     unittest.main()
-

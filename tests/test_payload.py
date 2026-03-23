@@ -57,6 +57,38 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(payload["options"]["num_predict"], 300)
         self.assertFalse(payload["think"])
 
+    def test_request_payload_includes_tools_when_provided(self) -> None:
+        provider = ProviderConfig(
+            name="local",
+            kind="openai_compatible",
+            base_url="http://localhost:11434/v1",
+        )
+        model = ModelConfig(
+            name="chat",
+            provider="local",
+            model="qwen3.5:27b",
+        )
+        payload = json.loads(
+            _request_payload(
+                provider,
+                model,
+                [{"role": "user", "content": "hello"}],
+                stream=False,
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "description": "Search the web",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            ).decode("utf-8")
+        )
+        self.assertIn("tools", payload)
+        self.assertEqual(payload["tools"][0]["function"]["name"], "web_search")
+
 
 if __name__ == "__main__":
     unittest.main()

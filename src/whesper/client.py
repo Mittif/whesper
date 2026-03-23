@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import http.client
 import json
+import re
 from typing import Iterable
 from urllib import error, request
+from xml.etree import ElementTree
 
 from whesper.config import ModelConfig, ProviderConfig
 
@@ -14,16 +16,26 @@ class ProviderError(RuntimeError):
 
 
 @dataclass(slots=True)
+class ToolCall:
+    tool_call_id: str
+    name: str
+    arguments_json: str
+
+
+@dataclass(slots=True)
 class CompletionResult:
     content: str
     raw_response: dict
+    tool_calls: tuple[ToolCall, ...] = ()
 
 
 def _build_openai_payload(
     model: ModelConfig,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, object]],
     *,
     stream: bool,
+    tools: list[dict[str, object]] | None = None,
+    tool_choice: str | dict[str, object] | None = None,
 ) -> bytes:
     payload: dict[str, object] = {
         "model": model.model,
@@ -31,6 +43,10 @@ def _build_openai_payload(
         "temperature": model.temperature,
         "stream": stream,
     }
+    if tools:
+        payload["tools"] = tools
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
     if model.max_tokens is not None:
         payload["max_tokens"] = model.max_tokens
     if model.top_p is not None:
@@ -42,9 +58,11 @@ def _build_openai_payload(
 
 def _build_ollama_payload(
     model: ModelConfig,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, object]],
     *,
     stream: bool,
+    tools: list[dict[str, object]] | None = None,
+    tool_choice: str | dict[str, object] | None = None,
 ) -> bytes:
     payload: dict[str, object] = {
         "model": model.model,
@@ -54,6 +72,10 @@ def _build_ollama_payload(
             "temperature": model.temperature,
         },
     }
+    if tools:
+        payload["tools"] = tools
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
     if model.top_p is not None:
         payload["options"]["top_p"] = model.top_p
     if model.max_tokens is not None:
@@ -76,13 +98,27 @@ def _request_headers(provider: ProviderConfig) -> dict[str, str]:
 def _request_payload(
     provider: ProviderConfig,
     model: ModelConfig,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, object]],
     *,
     stream: bool,
+    tools: list[dict[str, object]] | None = None,
+    tool_choice: str | dict[str, object] | None = None,
 ) -> bytes:
     if provider.kind == "ollama_native":
-        return _build_ollama_payload(model, messages, stream=stream)
-    return _build_openai_payload(model, messages, stream=stream)
+        return _build_ollama_payload(
+            model,
+            messages,
+            stream=stream,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+    return _build_openai_payload(
+        model,
+        messages,
+        stream=stream,
+        tools=tools,
+        tool_choice=tool_choice,
+    )
 
 
 def _completion_endpoint(provider: ProviderConfig) -> str:
@@ -92,6 +128,8 @@ def _completion_endpoint(provider: ProviderConfig) -> str:
 
 
 def _normalize_content(value: object) -> str:
+    if value is None:
+        return ""
     if isinstance(value, str):
         return value
     if isinstance(value, list):
@@ -132,6 +170,89 @@ def _extract_stream_text(raw: dict) -> str:
     return ""
 
 
+def _tool_calls_from_items(raw_calls: object) -> tuple[ToolCall, ...]:
+    if not isinstance(raw_calls, list):
+        return ()
+
+    tool_calls: list[ToolCall] = []
+    for index, item in enumerate(raw_calls):
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        arguments = function.get("arguments", "{}")
+        if not isinstance(name, str):
+            continue
+        if isinstance(arguments, dict):
+            arguments_json = json.dumps(arguments, ensure_ascii=False)
+        else:
+            arguments_json = str(arguments)
+        tool_calls.append(
+            ToolCall(
+                tool_call_id=str(item.get("id") or f"tool-call-{index}"),
+                name=name,
+                arguments_json=arguments_json,
+            )
+        )
+    return tuple(tool_calls)
+
+
+def _extract_tool_calls(provider: ProviderConfig, raw: dict) -> tuple[ToolCall, ...]:
+    try:
+        if provider.kind == "ollama_native":
+            message = raw["message"]
+            if isinstance(message, dict):
+                return _tool_calls_from_items(message.get("tool_calls"))
+            return ()
+        choice = raw["choices"][0]
+        if not isinstance(choice, dict):
+            return ()
+        message = choice.get("message")
+        if isinstance(message, dict):
+            return _tool_calls_from_items(message.get("tool_calls"))
+    except (KeyError, IndexError, TypeError):
+        return ()
+    return ()
+
+
+FUNCTION_CALLS_BLOCK_PATTERN = re.compile(
+    r"<function_calls>\s*.*?</function_calls>",
+    re.DOTALL,
+)
+
+
+def _extract_tool_calls_from_text(content: str) -> tuple[ToolCall, ...]:
+    match = FUNCTION_CALLS_BLOCK_PATTERN.search(content)
+    if match is None:
+        return ()
+    try:
+        root = ElementTree.fromstring(match.group(0))
+    except ElementTree.ParseError:
+        return ()
+
+    tool_calls: list[ToolCall] = []
+    for index, invoke in enumerate(root.findall("invoke")):
+        name = invoke.attrib.get("name")
+        if not name:
+            continue
+        arguments: dict[str, object] = {}
+        for parameter in invoke.findall("parameter"):
+            parameter_name = parameter.attrib.get("name")
+            if not parameter_name:
+                continue
+            arguments[parameter_name] = "".join(parameter.itertext()).strip()
+        tool_calls.append(
+            ToolCall(
+                tool_call_id=f"text-tool-call-{index}",
+                name=name,
+                arguments_json=json.dumps(arguments, ensure_ascii=False),
+            )
+        )
+    return tuple(tool_calls)
+
+
 def _iter_sse_events(lines: Iterable[bytes]) -> Iterable[str]:
     buffer: list[str] = []
     for raw_line in lines:
@@ -166,11 +287,21 @@ class OpenAICompatibleClient:
         self,
         provider: ProviderConfig,
         model: ModelConfig,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, object]],
+        *,
+        tools: list[dict[str, object]] | None = None,
+        tool_choice: str | dict[str, object] | None = None,
     ) -> CompletionResult:
         req = request.Request(
             _completion_endpoint(provider),
-            data=_request_payload(provider, model, messages, stream=False),
+            data=_request_payload(
+                provider,
+                model,
+                messages,
+                stream=False,
+                tools=tools,
+                tool_choice=tool_choice,
+            ),
             headers=_request_headers(provider),
             method="POST",
         )
@@ -194,6 +325,8 @@ class OpenAICompatibleClient:
                 "OpenAI-compatible /chat/completions requests."
             ) from exc
 
+        tool_calls = _extract_tool_calls(provider, raw)
+
         try:
             if provider.kind == "ollama_native":
                 content = _normalize_content(raw["message"]["content"])
@@ -206,17 +339,36 @@ class OpenAICompatibleClient:
                 f"Provider '{provider.name}' returned an unexpected response shape."
             ) from exc
 
-        return CompletionResult(content=content.strip(), raw_response=raw)
+        if not tool_calls and content:
+            tool_calls = _extract_tool_calls_from_text(content)
+            if tool_calls:
+                content = ""
+
+        return CompletionResult(
+            content=content.strip(),
+            raw_response=raw,
+            tool_calls=tool_calls,
+        )
 
     def create_chat_completion_stream(
         self,
         provider: ProviderConfig,
         model: ModelConfig,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, object]],
+        *,
+        tools: list[dict[str, object]] | None = None,
+        tool_choice: str | dict[str, object] | None = None,
     ) -> Iterable[str]:
         req = request.Request(
             _completion_endpoint(provider),
-            data=_request_payload(provider, model, messages, stream=True),
+            data=_request_payload(
+                provider,
+                model,
+                messages,
+                stream=True,
+                tools=tools,
+                tool_choice=tool_choice,
+            ),
             headers=_request_headers(provider),
             method="POST",
         )

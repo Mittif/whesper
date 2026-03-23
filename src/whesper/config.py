@@ -68,10 +68,32 @@ class AppSettings:
 
 
 @dataclass(slots=True)
+class LiveContextEndpointConfig:
+    name: str
+    url_template: str
+    trigger_keywords: tuple[str, ...] = ()
+    timeout_seconds: int = 15
+    response_format: str = "json"
+    query_param: str | None = None
+    instruction: str | None = None
+    api_key_env: str | None = None
+    api_key_header: str = "Authorization"
+    api_key_prefix: str = "Bearer "
+    extra_headers: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class LiveContextSettings:
+    custom_api: dict[str, LiveContextEndpointConfig] = field(default_factory=dict)
+    status_api: dict[str, LiveContextEndpointConfig] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class AppConfig:
     app: AppSettings
     persona: PersonaConfig
     scheduler: SchedulerConfig
+    live_context: LiveContextSettings
     providers: dict[str, ProviderConfig]
     models: dict[str, ModelConfig]
     source_path: Path
@@ -147,6 +169,45 @@ def _optional_think(value: Any) -> bool | str | None:
     raise ConfigError("Expected 'think' to be a boolean or string.")
 
 
+def _parse_live_context_endpoints(raw: Any, section_name: str) -> dict[str, LiveContextEndpointConfig]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"Invalid [live_context.{section_name}] section in config.")
+
+    endpoints: dict[str, LiveContextEndpointConfig] = {}
+    for name, item in raw.items():
+        if not isinstance(item, dict):
+            raise ConfigError(f"live_context.{section_name}.{name} must be a table.")
+        url_template = item.get("url_template")
+        if not isinstance(url_template, str) or not url_template.strip():
+            raise ConfigError(
+                f"live_context.{section_name}.{name} must define a non-empty url_template."
+            )
+        response_format = str(item.get("response_format", "json"))
+        if response_format not in {"json", "text"}:
+            raise ConfigError(
+                f"live_context.{section_name}.{name} response_format must be 'json' or 'text'."
+            )
+        endpoints[name] = LiveContextEndpointConfig(
+            name=name,
+            url_template=url_template.strip(),
+            trigger_keywords=_to_tuple(item.get("trigger_keywords")),
+            timeout_seconds=int(item.get("timeout_seconds", 15)),
+            response_format=response_format,
+            query_param=str(item["query_param"]) if item.get("query_param") else None,
+            instruction=str(item["instruction"]) if item.get("instruction") else None,
+            api_key_env=str(item["api_key_env"]) if item.get("api_key_env") else None,
+            api_key_header=str(item.get("api_key_header", "Authorization")),
+            api_key_prefix=str(item.get("api_key_prefix", "Bearer ")),
+            extra_headers={
+                str(key): str(value)
+                for key, value in item.get("extra_headers", {}).items()
+            },
+        )
+    return endpoints
+
+
 def load_config(path: str | Path) -> AppConfig:
     config_path = Path(path).expanduser().resolve()
     with config_path.open("rb") as fh:
@@ -154,6 +215,7 @@ def load_config(path: str | Path) -> AppConfig:
 
     app_raw = raw.get("app", {})
     persona_raw = raw.get("persona", {})
+    live_context_raw = raw.get("live_context", {})
     scheduler_raw = _require_table(raw, "scheduler")
     providers_raw = _require_table(raw, "providers")
     models_raw = _require_table(raw, "models")
@@ -181,6 +243,18 @@ def load_config(path: str | Path) -> AppConfig:
         ),
         long_message_chars=int(scheduler_raw.get("long_message_chars", 800)),
         reasoning_keywords=_to_tuple(scheduler_raw.get("reasoning_keywords")),
+    )
+    if live_context_raw and not isinstance(live_context_raw, dict):
+        raise ConfigError("Invalid [live_context] section in config.")
+    live_context = LiveContextSettings(
+        custom_api=_parse_live_context_endpoints(
+            live_context_raw.get("custom_api") if isinstance(live_context_raw, dict) else None,
+            "custom_api",
+        ),
+        status_api=_parse_live_context_endpoints(
+            live_context_raw.get("status_api") if isinstance(live_context_raw, dict) else None,
+            "status_api",
+        ),
     )
 
     providers: dict[str, ProviderConfig] = {}
@@ -228,6 +302,7 @@ def load_config(path: str | Path) -> AppConfig:
         app=app,
         persona=persona,
         scheduler=scheduler,
+        live_context=live_context,
         providers=providers,
         models=models,
         source_path=config_path,

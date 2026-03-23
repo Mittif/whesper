@@ -4,12 +4,41 @@ from dataclasses import dataclass
 
 from whesper.config import AppConfig
 
+AUTO_SEARCH_KEYWORDS = (
+    "search",
+    "look up",
+    "lookup",
+    "find online",
+    "check online",
+    "查一下",
+    "查查",
+    "搜一下",
+    "搜索",
+    "最新",
+    "最近",
+    "新闻",
+    "headline",
+    "release notes",
+    "changelog",
+    "现任",
+    "current",
+    "today",
+)
+
 
 @dataclass(slots=True)
 class RouteDecision:
     model_alias: str
     mode: str
     reason: str
+
+
+def _matched_search_keyword(text: str) -> str | None:
+    lowered = text.casefold()
+    for keyword in AUTO_SEARCH_KEYWORDS:
+        if keyword.casefold() in lowered:
+            return keyword
+    return None
 
 
 def select_model(
@@ -20,14 +49,6 @@ def select_model(
     mode_override: str = "auto",
 ) -> RouteDecision:
     text = user_text.strip()
-
-    if pinned_model and pinned_model != "auto":
-        config.get_model(pinned_model)
-        return RouteDecision(
-            model_alias=pinned_model,
-            mode="manual",
-            reason="session pinned model",
-        )
 
     if mode_override == "search" and config.scheduler.search_model:
         return RouteDecision(
@@ -57,6 +78,22 @@ def select_model(
             reason="slash search shortcut",
         )
 
+    if pinned_model and pinned_model != "auto":
+        config.get_model(pinned_model)
+        return RouteDecision(
+            model_alias=pinned_model,
+            mode="manual",
+            reason="session pinned model",
+        )
+
+    matched_search_keyword = _matched_search_keyword(text)
+    if matched_search_keyword and config.scheduler.search_model:
+        return RouteDecision(
+            model_alias=config.scheduler.search_model,
+            mode="search",
+            reason=f"matched search keyword: {matched_search_keyword}",
+        )
+
     if len(text) >= config.scheduler.long_message_chars:
         alias = config.scheduler.reasoning_model or config.scheduler.chat_model
         return RouteDecision(
@@ -80,4 +117,3 @@ def select_model(
         mode="chat",
         reason="default chat model",
     )
-

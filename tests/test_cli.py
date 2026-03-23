@@ -11,17 +11,21 @@ from whesper.cli import (
     handle_command,
 )
 from whesper.chat import ChatService, ChatTurnResult
+from whesper.client import CompletionResult
 from whesper.commands import ParsedCommand
 from whesper.config import (
     AppConfig,
     AppSettings,
+    LiveContextSettings,
     ModelConfig,
     PersonaConfig,
     ProviderConfig,
     SchedulerConfig,
 )
+from whesper.memory import MemoryStore
 from whesper.router import RouteDecision
 from whesper.session import ChatMessage, ConversationSession, SessionStore
+from whesper.trace import TraceStore, make_trace_event
 
 
 class FakeStreamingClient:
@@ -29,8 +33,8 @@ class FakeStreamingClient:
         yield "new"
         yield " reply"
 
-    def create_chat_completion(self, provider, model, messages):
-        raise AssertionError("fallback should not be called in this test")
+    def create_chat_completion(self, provider, model, messages, *, tools=None):
+        return CompletionResult(content="", raw_response={})
 
 
 class InterruptingStreamingClient:
@@ -38,8 +42,16 @@ class InterruptingStreamingClient:
         yield "partial"
         raise KeyboardInterrupt()
 
-    def create_chat_completion(self, provider, model, messages):
-        raise AssertionError("fallback should not be called in this test")
+    def create_chat_completion(self, provider, model, messages, *, tools=None):
+        return CompletionResult(content="", raw_response={})
+
+
+class DebugClient:
+    def create_chat_completion_stream(self, provider, model, messages):
+        raise AssertionError("streaming should not be called in this test")
+
+    def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
+        return CompletionResult(content="debug answer", raw_response={})
 
 
 def build_config() -> AppConfig:
@@ -47,6 +59,7 @@ def build_config() -> AppConfig:
         app=AppSettings(),
         persona=PersonaConfig(),
         scheduler=SchedulerConfig(chat_model="local_chat"),
+        live_context=LiveContextSettings(),
         providers={
             "local": ProviderConfig(
                 name="local",
@@ -71,6 +84,14 @@ class CliTests(unittest.TestCase):
 
     def build_interrupting_chat_service(self, config: AppConfig) -> ChatService:
         return ChatService(config, client=InterruptingStreamingClient())
+
+    def build_debug_chat_service(
+        self,
+        config: AppConfig,
+        *,
+        trace_store: TraceStore | None = None,
+    ) -> ChatService:
+        return ChatService(config, client=DebugClient(), trace_store=trace_store)
 
     def test_invalid_model_alias_is_handled_without_crash(self) -> None:
         config = build_config()
@@ -269,6 +290,108 @@ class CliTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertTrue(outcome.handled)
         self.assertIn("Session is empty.", rendered)
+
+    def test_trace_command_handles_empty_trace_store(self) -> None:
+        config = build_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            trace_store = TraceStore(tmpdir)
+            session = store.load("main")
+            output = io.StringIO()
+
+            outcome = handle_command(
+                ParsedCommand(name="/trace"),
+                config=config,
+                store=store,
+                chat_service=self.build_chat_service(config),
+                trace_store=trace_store,
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertTrue(outcome.handled)
+        self.assertIn("No trace events yet.", rendered)
+
+    def test_trace_command_renders_recent_trace_events(self) -> None:
+        config = build_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            trace_store = TraceStore(tmpdir)
+            trace_store.append(
+                make_trace_event(
+                    kind="completion_request",
+                    session_id="main",
+                    model_alias="local_chat",
+                    provider_name="local",
+                    route_mode="search",
+                    streamed=False,
+                    tools_enabled=True,
+                    tool_choice="required",
+                    note="testing trace",
+                    preview="user: 今天原油价格走势怎么样",
+                )
+            )
+            session = store.load("main")
+            output = io.StringIO()
+
+            outcome = handle_command(
+                ParsedCommand(name="/trace"),
+                config=config,
+                store=store,
+                chat_service=self.build_chat_service(config),
+                trace_store=trace_store,
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertTrue(outcome.handled)
+        self.assertIn("Trace (1)", rendered)
+        self.assertIn("completion_request", rendered)
+        self.assertIn("tool_choice required", rendered)
+        self.assertIn("今天原油价格走势怎么样", rendered)
+
+    def test_trace_command_with_message_runs_shadow_debug_turn(self) -> None:
+        config = build_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            trace_store = TraceStore(tmpdir)
+            session = store.load("main")
+            session.messages.append(
+                ChatMessage(
+                    role="assistant",
+                    content="existing reply",
+                    created_at="2026-03-18T00:00:00+00:00",
+                    model_alias="local_chat",
+                )
+            )
+            output = io.StringIO()
+
+            outcome = handle_command(
+                ParsedCommand(name="/trace", arg="帮我看看今天原油价格走势"),
+                config=config,
+                store=store,
+                chat_service=self.build_debug_chat_service(config, trace_store=trace_store),
+                trace_store=trace_store,
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertTrue(outcome.handled)
+        self.assertEqual(len(session.messages), 1)
+        self.assertEqual(session.messages[0].content, "existing reply")
+        self.assertIn("Trace Debug", rendered)
+        self.assertIn("Payload Debug", rendered)
+        self.assertIn("\"messages\"", rendered)
+        self.assertIn("Execution Timeline", rendered)
+        self.assertIn("completion_request", rendered)
+        self.assertIn("Final Reply", rendered)
+        self.assertIn("debug answer", rendered)
 
     def test_retry_command_replaces_last_assistant_reply(self) -> None:
         config = build_config()
@@ -469,6 +592,75 @@ class CliTests(unittest.TestCase):
         self.assertIn("reason default chat model", footer)
         self.assertIn("10 chars", footer)
         self.assertIn("2 msgs", footer)
+
+    def test_remember_and_memory_commands_round_trip_saved_memory(self) -> None:
+        config = build_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            memory_store = MemoryStore(tmpdir)
+            session = store.load("main")
+            output = io.StringIO()
+
+            remember_outcome = handle_command(
+                ParsedCommand(name="/remember", arg="I like jasmine tea."),
+                config=config,
+                store=store,
+                chat_service=self.build_chat_service(config),
+                memory_store=memory_store,
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+            memory_outcome = handle_command(
+                ParsedCommand(name="/memory"),
+                config=config,
+                store=store,
+                chat_service=self.build_chat_service(config),
+                memory_store=memory_store,
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertTrue(remember_outcome.handled)
+        self.assertTrue(memory_outcome.handled)
+        self.assertIn("Saved memory:", rendered)
+        self.assertIn("I like jasmine tea.", rendered)
+        self.assertIn("profile_memory", rendered)
+
+    def test_forget_command_removes_saved_memory(self) -> None:
+        config = build_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            memory_store = MemoryStore(tmpdir)
+            session = store.load("main")
+            saved = memory_store.remember(
+                memory_type="profile_memory",
+                title="Saved Note",
+                content="The user likes jasmine tea.",
+                source="manual_command",
+                confidence=1.0,
+                session_id=session.session_id,
+            )
+            output = io.StringIO()
+
+            outcome = handle_command(
+                ParsedCommand(name="/forget", arg=saved.memory_id),
+                config=config,
+                store=store,
+                chat_service=self.build_chat_service(config),
+                memory_store=memory_store,
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertTrue(outcome.handled)
+        self.assertIn(f"Forgot memory: {saved.memory_id}", rendered)
+        self.assertEqual(memory_store.list_memories(include_expired=True), [])
 
 
 if __name__ == "__main__":

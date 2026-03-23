@@ -6,6 +6,7 @@ import unittest
 
 from whesper.commands import command_completions, parse_command
 from whesper.config import load_config
+from whesper.memory import MemoryStore
 from whesper.session import SessionStore
 
 
@@ -38,6 +39,9 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(command.name, "/model")
         self.assertEqual(command.arg, "local_chat")
 
+    def test_parse_search_with_arg_is_treated_as_chat_input(self) -> None:
+        self.assertIsNone(parse_command("/search latest release notes"))
+
     def test_parse_non_command(self) -> None:
         self.assertIsNone(parse_command("hello there"))
 
@@ -45,9 +49,20 @@ class CommandTests(unittest.TestCase):
         config = make_config()
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SessionStore(temp_dir)
+            memory_store = MemoryStore(temp_dir)
+            memory_store.remember(
+                memory_type="profile_memory",
+                title="Saved Note",
+                content="The user likes jasmine tea.",
+                source="manual_command",
+                confidence=1.0,
+                session_id="demo",
+            )
             store.load("demo")
-            completions = command_completions(config, store)
+            completions = command_completions(config, store, memory_store)
             self.assertIn("/clear", completions)
+            self.assertIn("/search", completions)
+            self.assertIn("/trace", completions)
             self.assertIn("/model", completions)
             self.assertIn("chat", completions["/model"])
             self.assertIn("/use", completions)
@@ -56,6 +71,10 @@ class CommandTests(unittest.TestCase):
             self.assertIn("/info", completions)
             self.assertIn("/retry", completions)
             self.assertIn("/copy-last", completions)
+            self.assertIn("/memory", completions)
+            self.assertIn("/remember", completions)
+            self.assertIn("/forget", completions)
+            self.assertTrue(completions["/forget"])
             self.assertIn("/new", completions)
             self.assertIn("demo", completions["/new"])
             self.assertIn("/rename", completions)

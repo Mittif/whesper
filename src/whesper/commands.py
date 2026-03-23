@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from whesper.config import AppConfig
+from whesper.memory import MemoryStore
 from whesper.session import SessionStore
 
 
@@ -20,11 +21,16 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/help", description="Show available commands"),
     CommandSpec("/exit", description="Exit the CLI"),
     CommandSpec("/clear", description="Clear the current terminal screen"),
+    CommandSpec("/search", "<query>", "Run a web-backed search turn"),
+    CommandSpec("/trace", "[message]", "Show recent trace or debug one message step-by-step"),
     CommandSpec("/models", description="List configured models"),
     CommandSpec("/sessions", description="List saved sessions"),
     CommandSpec("/status", description="Show current session and routing state"),
     CommandSpec("/info", description="Show the active model configuration"),
     CommandSpec("/history", description="Show recent transcript"),
+    CommandSpec("/memory", description="Show saved user memory"),
+    CommandSpec("/remember", "<text>", "Save a memory note for future chats"),
+    CommandSpec("/forget", "<memory_id>", "Delete a saved memory item"),
     CommandSpec("/retry", description="Regenerate the last assistant reply"),
     CommandSpec("/copy-last", description="Print the last assistant reply as plain text"),
     CommandSpec("/model", "<alias|auto>", "Switch the current session model"),
@@ -61,19 +67,31 @@ def parse_command(text: str) -> ParsedCommand | None:
     parts = stripped.split(maxsplit=1)
     name = parts[0]
     arg = parts[1].strip() if len(parts) > 1 else None
+    if name == "/search" and arg:
+        return None
     return ParsedCommand(name=name, arg=arg or None)
 
 
-def command_completions(config: AppConfig, store: SessionStore) -> dict[str, object]:
+def command_completions(
+    config: AppConfig,
+    store: SessionStore,
+    memory_store: MemoryStore | None = None,
+) -> dict[str, object]:
+    memory_ids = memory_store.list_memory_ids() if memory_store is not None else []
     return {
         "/help": None,
         "/exit": None,
         "/clear": None,
+        "/search": None,
+        "/trace": None,
         "/models": None,
         "/sessions": None,
         "/status": None,
         "/info": None,
         "/history": None,
+        "/memory": None,
+        "/remember": None,
+        "/forget": {memory_id: None for memory_id in memory_ids},
         "/retry": None,
         "/copy-last": None,
         "/model": {alias: None for alias in ("auto", *config.models.keys())},

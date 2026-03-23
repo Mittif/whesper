@@ -17,6 +17,9 @@ class ChatMessage:
     created_at: str
     model_alias: str | None = None
     route_reason: str | None = None
+    name: str | None = None
+    tool_call_id: str | None = None
+    tool_calls: list[dict[str, object]] | None = None
 
 
 @dataclass(slots=True)
@@ -77,6 +80,21 @@ class SessionStore:
                     route_reason=(
                         str(item["route_reason"])
                         if item.get("route_reason") is not None
+                        else None
+                    ),
+                    name=(
+                        str(item["name"])
+                        if item.get("name") is not None
+                        else None
+                    ),
+                    tool_call_id=(
+                        str(item["tool_call_id"])
+                        if item.get("tool_call_id") is not None
+                        else None
+                    ),
+                    tool_calls=(
+                        item["tool_calls"]
+                        if isinstance(item.get("tool_calls"), list)
                         else None
                     ),
                 )

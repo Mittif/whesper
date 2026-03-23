@@ -12,12 +12,14 @@ The current repository ships a local CLI experience first, so the core dialogue 
 - Local Ollama support
 - Remote Kimi support
 - Session persistence and command-driven model switching
+- Local memory capture and recall for user facts and preferences
 
 ## Features
 
 - Claude Code-inspired terminal UX with history, completion, and slash commands
 - Streaming responses with a lightweight `thinking...` state
 - Per-session model selection via `/model`
+- Local memory extraction from user messages plus `/memory`, `/remember`, `/forget`
 - Config-driven provider setup through `TOML`
 - Python-first implementation built around a small, inspectable codebase
 
@@ -63,6 +65,9 @@ export WHESPER_KIMI_API_KEY="your-api-key"
 - `/rename test-session`
 - `/delete-session old-session`
 - `/history`
+- `/memory`
+- `/remember I like jasmine tea`
+- `/forget profile-memory-id`
 - `/new test-session`
 - `/clear`
 - `/exit`

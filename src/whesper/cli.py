@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import threading
 import time
@@ -18,8 +20,10 @@ from whesper.commands import (
     parse_command,
 )
 from whesper.config import AppConfig, ConfigError, load_config
+from whesper.memory import MemoryService, MemoryStore
 from whesper.router import select_model
-from whesper.session import ConversationSession, SessionStore
+from whesper.session import ChatMessage, ConversationSession, SessionStore, utc_now_iso
+from whesper.trace import TraceStore
 
 
 DEFAULT_CONFIG_PATH = "whesper.toml"
@@ -120,6 +124,220 @@ def print_history(
         print(file=output_stream)
         print(colorize(message.content, body_style), file=output_stream)
         print(file=output_stream)
+
+
+def print_memory(
+    memory_store: MemoryStore,
+    *,
+    limit: int = 12,
+    output_stream: object = sys.stdout,
+) -> None:
+    memories = memory_store.list_memories()[:limit]
+    if not memories:
+        print("No saved memories yet.", file=output_stream)
+        return
+
+    print(divider(f"Memory ({len(memories)})", color=SLATE), file=output_stream)
+    print(file=output_stream)
+    for memory in memories:
+        meta_parts = [memory.memory_id, memory.memory_type, memory.source]
+        if memory.last_confirmed_at:
+            meta_parts.append(f"confirmed {memory.last_confirmed_at}")
+        print(divider(memory.title, color=GOLD), file=output_stream)
+        print(
+            colorize(memory.title.lower(), GOLD, BOLD)
+            + colorize(f"  {' | '.join(meta_parts)}", SLATE, DIM),
+            file=output_stream,
+        )
+        print(file=output_stream)
+        print(colorize(memory.content, MINT), file=output_stream)
+        print(file=output_stream)
+
+
+def print_trace(
+    trace_store: TraceStore,
+    *,
+    limit: int = 20,
+    session_id: str | None = None,
+    title: str = "Trace",
+    output_stream: object = sys.stdout,
+) -> None:
+    events = trace_store.tail(limit=limit, session_id=session_id)
+    if not events:
+        print("No trace events yet.", file=output_stream)
+        return
+
+    print(divider(f"{title} ({len(events)})", color=SLATE), file=output_stream)
+    print(file=output_stream)
+    for event in events:
+        meta_parts = [
+            event.timestamp,
+            event.kind,
+            f"session {event.session_id}",
+            f"model {event.model_alias}",
+            f"provider {event.provider_name}",
+            f"route {event.route_mode}",
+            "stream" if event.streamed else "sync",
+            "tools on" if event.tools_enabled else "tools off",
+        ]
+        if event.tool_choice:
+            meta_parts.append(f"tool_choice {event.tool_choice}")
+        print(colorize(" | ".join(meta_parts), GOLD, BOLD), file=output_stream)
+        if event.note:
+            print(colorize(f"note: {event.note}", SLATE, DIM), file=output_stream)
+        if event.preview:
+            print(colorize(f"preview: {event.preview}", MINT), file=output_stream)
+        print(file=output_stream)
+
+
+def clone_session(
+    session: ConversationSession,
+    *,
+    session_id: str,
+) -> ConversationSession:
+    return ConversationSession(
+        session_id=session_id,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+        pinned_model=session.pinned_model,
+        messages=[
+            ChatMessage(
+                role=message.role,
+                content=message.content,
+                created_at=message.created_at,
+                model_alias=message.model_alias,
+                route_reason=message.route_reason,
+                name=message.name,
+                tool_call_id=message.tool_call_id,
+                tool_calls=copy.deepcopy(message.tool_calls),
+            )
+            for message in session.messages
+        ],
+    )
+
+
+def trim_debug_value(value: object, *, limit: int = 800) -> object:
+    if isinstance(value, str):
+        normalized = value.strip()
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[: limit - 3] + "..."
+    if isinstance(value, list):
+        return [trim_debug_value(item, limit=limit) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): trim_debug_value(item, limit=limit)
+            for key, item in value.items()
+        }
+    return value
+
+
+def print_debug_payload(
+    payload: dict[str, object],
+    *,
+    output_stream: object = sys.stdout,
+) -> None:
+    print(divider("Payload Debug", color=SLATE), file=output_stream)
+    print(file=output_stream)
+    print(
+        colorize(
+            json.dumps(trim_debug_value(payload), ensure_ascii=False, indent=2),
+            MINT,
+        ),
+        file=output_stream,
+    )
+    print(file=output_stream)
+
+
+def run_trace_debug_turn(
+    chat_service: ChatService,
+    session: ConversationSession,
+    *,
+    user_text: str,
+    mode_override: str,
+    trace_store: TraceStore,
+    output_stream: object = sys.stdout,
+) -> None:
+    shadow_session_id = f"{session.session_id}__trace_debug__{time.time_ns()}"
+    shadow_session = clone_session(session, session_id=shadow_session_id)
+    shadow_session.append(
+        ChatMessage(
+            role="user",
+            content=user_text,
+            created_at=utc_now_iso(),
+        )
+    )
+    decision = select_model(
+        chat_service.config,
+        user_text,
+        pinned_model=shadow_session.pinned_model,
+        mode_override=mode_override,
+    )
+    model_config = chat_service.config.get_model(decision.model_alias)
+    provider_config = chat_service.config.get_provider(model_config.provider)
+    tool_message_format = chat_service._tool_message_format(model_config, provider_config)
+    messages = chat_service._build_messages(
+        shadow_session,
+        model_config.system_prompt,
+        tool_message_format=tool_message_format,
+        user_text=user_text,
+        route_mode=decision.mode,
+    )
+    tools = chat_service._tools_for_request(
+        provider_name=provider_config.name,
+        user_text=user_text,
+        route_mode=decision.mode,
+    )
+    tool_choice = chat_service._tool_choice_for_request(
+        tools,
+        route_mode=decision.mode,
+    )
+
+    print(divider("Trace Debug", color=SLATE), file=output_stream)
+    print(file=output_stream)
+    print(f"shadow session: {shadow_session.session_id}", file=output_stream)
+    print(f"user input: {user_text}", file=output_stream)
+    print(f"route mode: {decision.mode}", file=output_stream)
+    print(f"route reason: {decision.reason}", file=output_stream)
+    print(f"model alias: {decision.model_alias}", file=output_stream)
+    print(f"provider: {provider_config.name} ({provider_config.kind})", file=output_stream)
+    print(file=output_stream)
+
+    print_debug_payload(
+        {
+            "provider": {
+                "name": provider_config.name,
+                "kind": provider_config.kind,
+                "base_url": provider_config.base_url,
+            },
+            "request": {
+                "model_alias": model_config.name,
+                "model_id": model_config.model,
+                "stream": False,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": tool_choice,
+            },
+        },
+        output_stream=output_stream,
+    )
+
+    result = chat_service._complete_turn(
+        shadow_session,
+        user_text,
+        mode_override=mode_override,
+    )
+
+    print_trace(
+        trace_store,
+        session_id=shadow_session.session_id,
+        title="Execution Timeline",
+        output_stream=output_stream,
+    )
+    print(divider("Final Reply", color=SLATE), file=output_stream)
+    print(file=output_stream)
+    print(colorize(result.assistant_message.content or "(empty reply)", MINT), file=output_stream)
+    print(file=output_stream)
 
 
 RESET = "\033[0m"
@@ -469,11 +687,17 @@ def handle_command(
     config: AppConfig,
     store: SessionStore,
     chat_service: ChatService,
+    memory_store: MemoryStore | None = None,
+    trace_store: TraceStore | None = None,
     session: ConversationSession,
     mode_override: str,
     output_stream: object = sys.stdout,
     refresh_completions: Callable[[], None] | None = None,
 ) -> CommandOutcome:
+    if memory_store is None:
+        memory_store = MemoryStore(store.base_dir)
+    if trace_store is None:
+        trace_store = TraceStore(store.base_dir)
     try:
         if parsed.name == "/help":
             print(help_text(), file=output_stream)
@@ -484,6 +708,23 @@ def handle_command(
             return CommandOutcome(True, session, mode_override, should_exit=True)
         if parsed.name == "/clear":
             clear_screen(output_stream=output_stream)
+            return CommandOutcome(True, session, mode_override)
+        if parsed.name == "/search":
+            print_cli_error("Missing query for /search.", output_stream=output_stream)
+            print_cli_hint("Usage: /search <query>", output_stream=output_stream)
+            return CommandOutcome(True, session, mode_override)
+        if parsed.name == "/trace":
+            if parsed.arg:
+                run_trace_debug_turn(
+                    chat_service,
+                    session,
+                    user_text=parsed.arg,
+                    mode_override=mode_override,
+                    trace_store=trace_store,
+                    output_stream=output_stream,
+                )
+                return CommandOutcome(True, session, mode_override)
+            print_trace(trace_store, output_stream=output_stream)
             return CommandOutcome(True, session, mode_override)
         if parsed.name == "/models":
             print_models(config)
@@ -509,6 +750,38 @@ def handle_command(
             return CommandOutcome(True, session, mode_override)
         if parsed.name == "/history":
             print_history(session, output_stream=output_stream)
+            return CommandOutcome(True, session, mode_override)
+        if parsed.name == "/memory":
+            print_memory(memory_store, output_stream=output_stream)
+            return CommandOutcome(True, session, mode_override)
+        if parsed.name == "/remember":
+            content = parsed.arg
+            if not content:
+                print_cli_error("Missing text for /remember.", output_stream=output_stream)
+                print_cli_hint("Usage: /remember <text>", output_stream=output_stream)
+                return CommandOutcome(True, session, mode_override)
+            memory = MemoryService(memory_store).remember_manual(session.session_id, content)
+            if refresh_completions is not None:
+                refresh_completions()
+            print(f"Saved memory: {memory.memory_id}", file=output_stream)
+            return CommandOutcome(True, session, mode_override)
+        if parsed.name == "/forget":
+            memory_id = parsed.arg
+            if not memory_id:
+                print_cli_error("Missing memory id for /forget.", output_stream=output_stream)
+                print_cli_hint("Usage: /forget <memory_id>", output_stream=output_stream)
+                return CommandOutcome(True, session, mode_override)
+            if not memory_store.delete(memory_id):
+                print_cli_error(f"Memory not found: {memory_id}", output_stream=output_stream)
+                available_memories = ", ".join(memory_store.list_memory_ids()) or "none"
+                print_cli_hint(
+                    f"available memories: {available_memories}",
+                    output_stream=output_stream,
+                )
+                return CommandOutcome(True, session, mode_override)
+            if refresh_completions is not None:
+                refresh_completions()
+            print(f"Forgot memory: {memory_id}", file=output_stream)
             return CommandOutcome(True, session, mode_override)
         if parsed.name == "/retry":
             print_cli_hint("Retrying the last user message...", output_stream=output_stream)
@@ -730,7 +1003,14 @@ def interactive_chat(
     if pinned_model:
         apply_pinned_model_override(config, store, session, pinned_model)
 
-    chat_service = ChatService(config)
+    memory_store = MemoryStore(store.base_dir)
+    memory_service = MemoryService(memory_store)
+    trace_store = TraceStore(store.base_dir)
+    chat_service = ChatService(
+        config,
+        memory_service=memory_service,
+        trace_store=trace_store,
+    )
     mode_override = "auto"
     history_path = store.base_dir / "prompt_history.txt"
 
@@ -749,7 +1029,9 @@ def interactive_chat(
     prompt_session = PromptSession(
         history=FileHistory(str(history_path)),
         auto_suggest=AutoSuggestFromHistory(),
-        completer=NestedCompleter.from_nested_dict(command_completions(config, store)),
+        completer=NestedCompleter.from_nested_dict(
+            command_completions(config, store, memory_store)
+        ),
         complete_while_typing=True,
         complete_in_thread=True,
         reserve_space_for_menu=8,
@@ -797,12 +1079,16 @@ def interactive_chat(
                 config=config,
                 store=store,
                 chat_service=chat_service,
+                memory_store=memory_store,
+                trace_store=trace_store,
                 session=session,
                 mode_override=mode_override,
                 refresh_completions=lambda: setattr(
                     prompt_session,
                     "completer",
-                    NestedCompleter.from_nested_dict(command_completions(config, store)),
+                    NestedCompleter.from_nested_dict(
+                        command_completions(config, store, memory_store)
+                    ),
                 ),
             )
             session = outcome.session
