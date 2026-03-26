@@ -1,32 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import http.client
 import json
-import re
 from typing import Iterable
 from urllib import error, request
-from xml.etree import ElementTree
 
+from whesper.agent_types import AgentCompletion, ToolInvocation
 from whesper.config import ModelConfig, ProviderConfig
+from whesper.tool_protocol import DefaultToolProtocolAdapter
 
 
 class ProviderError(RuntimeError):
     pass
 
 
-@dataclass(slots=True)
-class ToolCall:
-    tool_call_id: str
-    name: str
-    arguments_json: str
-
-
-@dataclass(slots=True)
-class CompletionResult:
-    content: str
-    raw_response: dict
-    tool_calls: tuple[ToolCall, ...] = ()
+ToolCall = ToolInvocation
+CompletionResult = AgentCompletion
+DEFAULT_TOOL_PROTOCOL_ADAPTER = DefaultToolProtocolAdapter()
 
 
 def _build_openai_payload(
@@ -170,87 +160,35 @@ def _extract_stream_text(raw: dict) -> str:
     return ""
 
 
-def _tool_calls_from_items(raw_calls: object) -> tuple[ToolCall, ...]:
-    if not isinstance(raw_calls, list):
-        return ()
-
-    tool_calls: list[ToolCall] = []
-    for index, item in enumerate(raw_calls):
-        if not isinstance(item, dict):
-            continue
-        function = item.get("function")
-        if not isinstance(function, dict):
-            continue
-        name = function.get("name")
-        arguments = function.get("arguments", "{}")
-        if not isinstance(name, str):
-            continue
-        if isinstance(arguments, dict):
-            arguments_json = json.dumps(arguments, ensure_ascii=False)
-        else:
-            arguments_json = str(arguments)
-        tool_calls.append(
-            ToolCall(
-                tool_call_id=str(item.get("id") or f"tool-call-{index}"),
-                name=name,
-                arguments_json=arguments_json,
-            )
-        )
-    return tuple(tool_calls)
-
-
 def _extract_tool_calls(provider: ProviderConfig, raw: dict) -> tuple[ToolCall, ...]:
+    return DEFAULT_TOOL_PROTOCOL_ADAPTER.extract_tool_calls(provider, raw)
+
+
+def _extract_tool_calls_from_text(content: str) -> tuple[ToolCall, ...]:
+    return DEFAULT_TOOL_PROTOCOL_ADAPTER.extract_tool_calls_from_text(content)
+
+
+def _extract_reasoning_content(provider: ProviderConfig, raw: dict) -> str | None:
     try:
         if provider.kind == "ollama_native":
             message = raw["message"]
             if isinstance(message, dict):
-                return _tool_calls_from_items(message.get("tool_calls"))
-            return ()
+                value = message.get("reasoning_content")
+                if isinstance(value, str):
+                    return value
+                return None
+            return None
         choice = raw["choices"][0]
         if not isinstance(choice, dict):
-            return ()
+            return None
         message = choice.get("message")
         if isinstance(message, dict):
-            return _tool_calls_from_items(message.get("tool_calls"))
+            value = message.get("reasoning_content")
+            if isinstance(value, str):
+                return value
     except (KeyError, IndexError, TypeError):
-        return ()
-    return ()
-
-
-FUNCTION_CALLS_BLOCK_PATTERN = re.compile(
-    r"<function_calls>\s*.*?</function_calls>",
-    re.DOTALL,
-)
-
-
-def _extract_tool_calls_from_text(content: str) -> tuple[ToolCall, ...]:
-    match = FUNCTION_CALLS_BLOCK_PATTERN.search(content)
-    if match is None:
-        return ()
-    try:
-        root = ElementTree.fromstring(match.group(0))
-    except ElementTree.ParseError:
-        return ()
-
-    tool_calls: list[ToolCall] = []
-    for index, invoke in enumerate(root.findall("invoke")):
-        name = invoke.attrib.get("name")
-        if not name:
-            continue
-        arguments: dict[str, object] = {}
-        for parameter in invoke.findall("parameter"):
-            parameter_name = parameter.attrib.get("name")
-            if not parameter_name:
-                continue
-            arguments[parameter_name] = "".join(parameter.itertext()).strip()
-        tool_calls.append(
-            ToolCall(
-                tool_call_id=f"text-tool-call-{index}",
-                name=name,
-                arguments_json=json.dumps(arguments, ensure_ascii=False),
-            )
-        )
-    return tuple(tool_calls)
+        return None
+    return None
 
 
 def _iter_sse_events(lines: Iterable[bytes]) -> Iterable[str]:
@@ -348,6 +286,7 @@ class OpenAICompatibleClient:
             content=content.strip(),
             raw_response=raw,
             tool_calls=tool_calls,
+            reasoning_content=_extract_reasoning_content(provider, raw),
         )
 
     def create_chat_completion_stream(

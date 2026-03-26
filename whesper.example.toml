@@ -18,6 +18,29 @@ search_model = "kimi-k2.5"
 long_message_chars = 600
 reasoning_keywords = ["分析", "总结", "比较", "计划", "设计", "为什么", "how", "why"]
 
+# Optional live-context endpoints. Keep them empty if you want the companion
+# to stay intentionally narrow by default.
+#
+# [live_context.status_api.flight]
+# url_template = "https://status.example.com/flight/{query}"
+# response_format = "json"
+#
+# [live_context.status_api.train]
+# url_template = "https://status.example.com/train/{query}"
+# response_format = "json"
+#
+# [live_context.status_api.parcel]
+# url_template = "https://status.example.com/parcel/{query}"
+# response_format = "json"
+#
+# [live_context.custom_api.device_status]
+# url_template = "https://internal.example.com/device"
+# trigger_keywords = ["device status", "设备状态"]
+# query_param = "q"
+# response_format = "json"
+# instruction = "Use this internal device payload only when it directly answers the user's request."
+# api_key_env = "WHESPER_DEVICE_STATUS_API_KEY"
+
 [providers.ollama_local]
 kind = "ollama_native"
 base_url = "http://localhost:11434/"

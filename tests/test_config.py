@@ -108,6 +108,42 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(endpoint.query_param, "q")
         self.assertEqual(endpoint.api_key_env, "DEVICE_STATUS_KEY")
 
+    def test_loads_optional_shell_sandbox_config(self) -> None:
+        content = textwrap.dedent(
+            """
+            [scheduler]
+            chat_model = "local"
+
+            [providers.main]
+            base_url = "http://localhost:11434/v1"
+
+            [models.local]
+            provider = "main"
+            model = "qwen"
+
+            [shell_sandbox]
+            enabled = true
+            timeout_seconds = 7
+            max_output_chars = 2048
+            allowed_roots = [".", "src"]
+            allowed_command_prefixes = [["pwd"], ["git", "status"], ["rg"]]
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        config = load_config(temp_path)
+        self.assertTrue(config.shell_sandbox.enabled)
+        self.assertEqual(config.shell_sandbox.timeout_seconds, 7)
+        self.assertEqual(config.shell_sandbox.max_output_chars, 2048)
+        self.assertEqual(config.shell_sandbox.allowed_roots, (".", "src"))
+        self.assertEqual(
+            config.shell_sandbox.allowed_command_prefixes,
+            (("pwd",), ("git", "status"), ("rg",)),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

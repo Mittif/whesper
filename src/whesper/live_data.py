@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from html.parser import HTMLParser
 import json
 import re
@@ -14,6 +14,8 @@ from whesper.config import AppConfig, LiveContextEndpointConfig
 
 
 USER_AGENT = "Whesper/0.1"
+WEATHER_FORECAST_DAYS = 8
+WTTR_BASE_URL = "https://wttr.in"
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
 CITY_PATTERN = re.compile(
     r"(?P<place>[A-Za-z][A-Za-z .'-]{1,40}|[\u4e00-\u9fff][\u4e00-\u9fffA-Za-z·\-\s]{0,20})"
@@ -73,6 +75,39 @@ WEATHER_KEYWORDS = (
     "多云",
 )
 
+WEATHER_DAY_KEYWORDS = (
+    "today",
+    "tomorrow",
+    "day after tomorrow",
+    "tonight",
+    "今天",
+    "明天",
+    "后天",
+    "今晚",
+)
+
+WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+WEEKEND_KEYWORDS = (
+    "weekend",
+    "this weekend",
+    "next weekend",
+    "周末",
+    "本周末",
+    "这周末",
+    "下周末",
+)
+
+WEEKDAY_KEYWORDS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (0, ("monday", "mon", "周一", "星期一", "礼拜一", "本周一", "这周一", "下周一")),
+    (1, ("tuesday", "tue", "周二", "星期二", "礼拜二", "本周二", "这周二", "下周二")),
+    (2, ("wednesday", "wed", "周三", "星期三", "礼拜三", "本周三", "这周三", "下周三")),
+    (3, ("thursday", "thu", "周四", "星期四", "礼拜四", "本周四", "这周四", "下周四")),
+    (4, ("friday", "fri", "周五", "星期五", "礼拜五", "本周五", "这周五", "下周五")),
+    (5, ("saturday", "sat", "周六", "星期六", "礼拜六", "本周六", "这周六", "下周六")),
+    (6, ("sunday", "sun", "周日", "周天", "星期日", "星期天", "礼拜日", "礼拜天", "本周日", "这周日", "下周日")),
+)
+
 LOCAL_TIME_KEYWORDS = (
     "today",
     "tonight",
@@ -118,6 +153,30 @@ SEARCH_KEYWORDS = (
     "最新",
     "最近",
     "新闻",
+)
+
+PLACE_QUERY_PREFIXES = (
+    "/search ",
+    "search ",
+    "look up ",
+    "find ",
+    "搜索",
+    "查一下",
+    "查查",
+    "搜一下",
+    "搜搜",
+    "帮我搜索",
+    "帮我查一下",
+    "帮我查",
+    "帮我搜一下",
+    "请搜索",
+    "请查一下",
+    "请查",
+    "请搜一下",
+    "麻烦搜索",
+    "麻烦查一下",
+    "麻烦查",
+    "麻烦搜一下",
 )
 
 NEWS_KEYWORDS = (
@@ -325,7 +384,36 @@ class WeatherReport:
     today_high_c: float
     today_low_c: float
     today_precipitation_probability_max_percent: float
+    tomorrow_condition: str | None = None
+    tomorrow_high_c: float | None = None
+    tomorrow_low_c: float | None = None
+    tomorrow_precipitation_probability_max_percent: float | None = None
+    daily_forecasts: tuple["WeatherDailyForecast", ...] = ()
     public_ip: str | None = None
+
+
+@dataclass(slots=True)
+class WeatherDailyForecast:
+    date: str
+    condition: str
+    high_c: float
+    low_c: float
+    precipitation_probability_max_percent: float
+
+
+@dataclass(slots=True)
+class IpLocation:
+    public_ip: str
+    city: str
+    region: str
+    country: str
+    latitude: float
+    longitude: float
+    timezone: str
+
+    @property
+    def label(self) -> str:
+        return ", ".join(part for part in (self.city, self.region, self.country) if part) or "Unknown"
 
 
 def _http_request(url: str, headers: dict[str, str] | None = None) -> request.Request:
@@ -429,8 +517,10 @@ def _looks_like_docs_url(url: str) -> bool:
 
 def _normalize_place_candidate(candidate: str) -> str | None:
     cleaned = candidate.strip(" ,.?，。！？")
+    cleaned = _strip_place_query_prefixes(cleaned)
     cleaned = re.sub(r"^(in|for|at)\s+", "", cleaned, flags=re.IGNORECASE)
     cleaned = cleaned.removeprefix("在").removeprefix("去")
+    cleaned = _strip_weather_time_words(cleaned)
     cleaned = cleaned.strip()
     if not cleaned:
         return None
@@ -442,11 +532,48 @@ def _normalize_place_candidate(candidate: str) -> str | None:
     return cleaned
 
 
+def _strip_place_query_prefixes(value: str) -> str:
+    cleaned = value.strip()
+    while cleaned:
+        lowered = cleaned.casefold()
+        matched_prefix = next(
+            (
+                prefix
+                for prefix in sorted(PLACE_QUERY_PREFIXES, key=len, reverse=True)
+                if lowered.startswith(prefix.casefold())
+            ),
+            None,
+        )
+        if matched_prefix is None:
+            break
+        cleaned = cleaned[len(matched_prefix) :].lstrip(" ,.?，。！？")
+    return cleaned
+
+
+def _strip_weather_time_words(value: str) -> str:
+    cleaned = value
+    phrases = list(WEATHER_DAY_KEYWORDS) + list(WEEKEND_KEYWORDS)
+    for weekday, aliases in WEEKDAY_KEYWORDS:
+        phrases.extend(aliases)
+        phrases.append(f"next {WEEKDAY_NAMES[weekday]}")
+    for keyword in sorted(set(phrases), key=len, reverse=True):
+        cleaned = re.sub(re.escape(keyword), " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*的\s*", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip(" ,.?，。！？")
+
+
 def should_fetch_local_weather(user_text: str) -> bool:
     lowered = user_text.casefold()
     has_weather_keyword = any(keyword in lowered for keyword in WEATHER_KEYWORDS)
     has_local_time_keyword = any(keyword in lowered for keyword in LOCAL_TIME_KEYWORDS)
+    if not has_local_time_keyword:
+        has_local_time_keyword = _extract_weather_request_window(user_text, reference_date=None) is not None
     return has_weather_keyword and has_local_time_keyword
+
+
+def should_fetch_weather(user_text: str) -> bool:
+    return should_fetch_local_weather(user_text) or _extract_city_weather_place(user_text) is not None
 
 
 def _extract_currency_pair(user_text: str) -> tuple[str, str] | None:
@@ -849,34 +976,11 @@ class LocalWeatherContextService:
             "Live weather data for the user's current IP-based location:",
             report,
             include_ip=True,
+            user_text=user_text,
         )
 
     def _lookup_weather_report(self) -> WeatherReport:
-        ip_response = self.fetch_json("https://api.ipify.org?format=json", self.timeout_seconds)
-        public_ip = str(ip_response["ip"])
-        geo_response = self.fetch_json(f"https://ipwho.is/{parse.quote(public_ip)}", self.timeout_seconds)
-        if geo_response.get("success") is False:
-            detail = str(geo_response.get("message", "unknown geolocation error"))
-            raise RuntimeError(f"IP geolocation failed: {detail}")
-
-        location = ", ".join(
-            part
-            for part in (
-                str(geo_response.get("city", "")),
-                str(geo_response.get("region", "")),
-                str(geo_response.get("country", "")),
-            )
-            if part
-        )
-        return _fetch_weather_report(
-            self.fetch_json,
-            self.timeout_seconds,
-            latitude=float(geo_response["latitude"]),
-            longitude=float(geo_response["longitude"]),
-            timezone=str(geo_response.get("timezone", {}).get("id", "auto")),
-            location_label=location or "Unknown",
-            public_ip=public_ip,
-        )
+        return lookup_weather_for_ip(self.fetch_json, self.timeout_seconds)
 
 
 @dataclass(slots=True)
@@ -890,15 +994,7 @@ class CityWeatherContextService:
             return None
 
         try:
-            geocode = _geocode_place(self.fetch_json, self.timeout_seconds, place)
-            report = _fetch_weather_report(
-                self.fetch_json,
-                self.timeout_seconds,
-                latitude=geocode["latitude"],
-                longitude=geocode["longitude"],
-                timezone=geocode["timezone"],
-                location_label=str(geocode["label"]),
-            )
+            report = lookup_weather_for_place(self.fetch_json, self.timeout_seconds, place)
         except Exception as exc:
             return (
                 "Live weather lookup status:\n"
@@ -911,6 +1007,7 @@ class CityWeatherContextService:
             "Live weather data for a requested location:",
             report,
             include_ip=False,
+            user_text=user_text,
         )
 
 
@@ -1327,7 +1424,13 @@ class CustomApiContextService:
         return None
 
 
-def _weather_context_lines(title: str, report: WeatherReport, *, include_ip: bool) -> str:
+def _weather_context_lines(
+    title: str,
+    report: WeatherReport,
+    *,
+    include_ip: bool,
+    user_text: str,
+) -> str:
     lines = [
         title,
         f"- fetched_at_utc: {report.fetched_at_utc}",
@@ -1349,10 +1452,188 @@ def _weather_context_lines(title: str, report: WeatherReport, *, include_ip: boo
             f"- today_high_c: {_format_number(report.today_high_c)}",
             f"- today_low_c: {_format_number(report.today_low_c)}",
             f"- today_precipitation_probability_max_percent: {_format_number(report.today_precipitation_probability_max_percent)}",
-            "- instruction: Use this live weather data instead of model priors when answering weather questions.",
         )
     )
+    if report.tomorrow_condition is not None:
+        lines.extend(
+            (
+                f"- tomorrow_condition: {report.tomorrow_condition}",
+                f"- tomorrow_high_c: {_format_number(report.tomorrow_high_c)}",
+                f"- tomorrow_low_c: {_format_number(report.tomorrow_low_c)}",
+                f"- tomorrow_precipitation_probability_max_percent: {_format_number(report.tomorrow_precipitation_probability_max_percent)}",
+            )
+        )
+    request_window = _extract_weather_request_window(
+        user_text,
+        reference_date=_weather_reference_date(report),
+    )
+    if request_window is not None:
+        start_index, end_index, label = request_window
+        selected = report.daily_forecasts[start_index : end_index + 1]
+        if selected:
+            lines.append(f"- requested_period: {label}")
+            if len(selected) == 1:
+                forecast = selected[0]
+                lines.extend(
+                    (
+                        f"- requested_date: {forecast.date}",
+                        f"- requested_condition: {forecast.condition}",
+                        f"- requested_high_c: {_format_number(forecast.high_c)}",
+                        f"- requested_low_c: {_format_number(forecast.low_c)}",
+                        f"- requested_precipitation_probability_max_percent: {_format_number(forecast.precipitation_probability_max_percent)}",
+                    )
+                )
+            else:
+                for index, forecast in enumerate(selected, start=1):
+                    lines.extend(
+                        (
+                            f"- requested_day_{index}_date: {forecast.date}",
+                            f"- requested_day_{index}_condition: {forecast.condition}",
+                            f"- requested_day_{index}_high_c: {_format_number(forecast.high_c)}",
+                            f"- requested_day_{index}_low_c: {_format_number(forecast.low_c)}",
+                            f"- requested_day_{index}_precipitation_probability_max_percent: {_format_number(forecast.precipitation_probability_max_percent)}",
+                        )
+                    )
+    lines.append(
+        "- instruction: Use this live weather data instead of model priors when answering weather questions. If requested_* fields are present, prefer them because they match the user's requested day or period."
+    )
     return "\n".join(lines)
+
+
+def _weather_reference_date(report: WeatherReport) -> date | None:
+    if report.daily_forecasts:
+        try:
+            return date.fromisoformat(report.daily_forecasts[0].date)
+        except ValueError:
+            return None
+    return None
+
+
+def _extract_weather_request_window(
+    user_text: str,
+    *,
+    reference_date: date | None,
+) -> tuple[int, int, str] | None:
+    lowered = user_text.casefold()
+
+    if "day after tomorrow" in lowered or "后天" in user_text:
+        return (2, 2, "day_after_tomorrow")
+    if "tomorrow" in lowered or "明天" in user_text:
+        return (1, 1, "tomorrow")
+    if "today" in lowered or "今晚" in user_text or "今天" in user_text:
+        return (0, 0, "today")
+
+    if reference_date is None:
+        return None
+
+    weekend = _extract_weekend_window(user_text, reference_date)
+    if weekend is not None:
+        return weekend
+
+    weekday = _extract_weekday_window(user_text, reference_date)
+    if weekday is not None:
+        return weekday
+
+    return None
+
+
+def _extract_weekend_window(user_text: str, reference_date: date) -> tuple[int, int, str] | None:
+    lowered = user_text.casefold()
+    has_weekend = any(keyword.casefold() in lowered for keyword in WEEKEND_KEYWORDS)
+    if not has_weekend:
+        return None
+
+    weekday = reference_date.weekday()
+    saturday_offset = (5 - weekday) % 7
+    if "next weekend" in lowered or "下周末" in user_text:
+        saturday_offset += 7
+        label = "next_weekend"
+    else:
+        label = "weekend"
+    sunday_offset = saturday_offset + 1
+    return (saturday_offset, sunday_offset, label)
+
+
+def _extract_weekday_window(user_text: str, reference_date: date) -> tuple[int, int, str] | None:
+    lowered = user_text.casefold()
+    for target_weekday, aliases in WEEKDAY_KEYWORDS:
+        matched_alias = next(
+            (alias for alias in sorted(aliases, key=len, reverse=True) if alias.casefold() in lowered),
+            None,
+        )
+        if matched_alias is None:
+            continue
+
+        offset = (target_weekday - reference_date.weekday()) % 7
+        english_name = _weekday_label(target_weekday)
+        is_explicit_next = (
+            matched_alias.startswith("下周")
+            or f"next {english_name}" in lowered
+        )
+        if is_explicit_next and offset == 0:
+            offset = 7
+        label = _weekday_label(target_weekday, prefix="next_" if is_explicit_next else "")
+        return (offset, offset, label)
+    return None
+
+
+def _weekday_label(weekday: int, *, prefix: str = "") -> str:
+    return f"{prefix}{WEEKDAY_NAMES[weekday]}"
+
+
+def lookup_public_ip(fetch_json: JsonFetcher, timeout_seconds: int) -> str:
+    ip_response = fetch_json("https://api.ipify.org?format=json", timeout_seconds)
+    public_ip = ip_response.get("ip")
+    if not isinstance(public_ip, str) or not public_ip.strip():
+        raise RuntimeError("IP lookup returned no usable IP address")
+    return public_ip.strip()
+
+
+def lookup_ip_location(
+    fetch_json: JsonFetcher,
+    timeout_seconds: int,
+    public_ip: str,
+) -> IpLocation:
+    geo_response = fetch_json(f"https://ipwho.is/{parse.quote(public_ip)}", timeout_seconds)
+    if geo_response.get("success") is False:
+        detail = str(geo_response.get("message", "unknown geolocation error"))
+        raise RuntimeError(f"IP geolocation failed: {detail}")
+
+    return IpLocation(
+        public_ip=public_ip,
+        city=str(geo_response.get("city", "")),
+        region=str(geo_response.get("region", "")),
+        country=str(geo_response.get("country", "")),
+        latitude=float(geo_response["latitude"]),
+        longitude=float(geo_response["longitude"]),
+        timezone=str(geo_response.get("timezone", {}).get("id", "auto")),
+    )
+
+
+def lookup_weather_for_ip(fetch_json: JsonFetcher, timeout_seconds: int) -> WeatherReport:
+    public_ip = lookup_public_ip(fetch_json, timeout_seconds)
+    location = lookup_ip_location(fetch_json, timeout_seconds, public_ip)
+    return _fetch_weather_report(
+        fetch_json,
+        timeout_seconds,
+        latitude=location.latitude,
+        longitude=location.longitude,
+        timezone=location.timezone,
+        location_label=location.label,
+        public_ip=public_ip,
+    )
+
+
+def lookup_weather_for_place(fetch_json: JsonFetcher, timeout_seconds: int, place: str) -> WeatherReport:
+    geocode = _geocode_place(fetch_json, timeout_seconds, place)
+    return _fetch_weather_report(
+        fetch_json,
+        timeout_seconds,
+        latitude=float(geocode["latitude"]),
+        longitude=float(geocode["longitude"]),
+        timezone=str(geocode["timezone"]),
+        location_label=str(geocode["label"]),
+    )
 
 
 def _geocode_place(fetch_json: JsonFetcher, timeout_seconds: int, place: str) -> dict[str, object]:
@@ -1388,54 +1669,174 @@ def _fetch_weather_report(
     location_label: str,
     public_ip: str | None = None,
 ) -> WeatherReport:
-    weather_url = (
-        "https://api.open-meteo.com/v1/forecast?"
-        + parse.urlencode(
-            {
-                "latitude": latitude,
-                "longitude": longitude,
-                "current": ",".join(
-                    (
-                        "temperature_2m",
-                        "relative_humidity_2m",
-                        "apparent_temperature",
-                        "weather_code",
-                        "wind_speed_10m",
-                    )
-                ),
-                "daily": ",".join(
-                    (
-                        "weather_code",
-                        "temperature_2m_max",
-                        "temperature_2m_min",
-                        "precipitation_probability_max",
-                    )
-                ),
-                "forecast_days": 1,
-                "timezone": timezone,
-            }
-        )
-    )
+    weather_url = _wttr_weather_url(latitude=latitude, longitude=longitude)
     weather_response = fetch_json(weather_url, timeout_seconds)
-    current = weather_response["current"]
-    daily = weather_response["daily"]
+    current = _wttr_current_condition(weather_response)
+    daily_forecasts = _wttr_daily_forecasts(weather_response)
+    today_forecast = daily_forecasts[0] if daily_forecasts else None
+    tomorrow_forecast = daily_forecasts[1] if len(daily_forecasts) > 1 else None
     return WeatherReport(
         fetched_at_utc=datetime.now(UTC).replace(microsecond=0).isoformat(),
         location_label=location_label,
         latitude=latitude,
         longitude=longitude,
-        timezone=str(weather_response.get("timezone", timezone)),
-        current_condition=_weather_label(current.get("weather_code")),
-        current_temperature_c=float(current["temperature_2m"]),
-        apparent_temperature_c=float(current["apparent_temperature"]),
-        relative_humidity_percent=float(current["relative_humidity_2m"]),
-        wind_speed_kmh=float(current["wind_speed_10m"]),
-        today_condition=_weather_label(daily["weather_code"][0]),
-        today_high_c=float(daily["temperature_2m_max"][0]),
-        today_low_c=float(daily["temperature_2m_min"][0]),
-        today_precipitation_probability_max_percent=float(daily["precipitation_probability_max"][0]),
+        timezone=timezone,
+        current_condition=_wttr_desc(current.get("weatherDesc")) or "Unknown",
+        current_temperature_c=_wttr_float(current.get("temp_C")),
+        apparent_temperature_c=_wttr_float(current.get("FeelsLikeC")),
+        relative_humidity_percent=_wttr_float(current.get("humidity")),
+        wind_speed_kmh=_wttr_float(current.get("windspeedKmph")),
+        today_condition=(
+            today_forecast.condition
+            if today_forecast is not None
+            else "Unknown"
+        ),
+        today_high_c=(
+            today_forecast.high_c
+            if today_forecast is not None
+            else 0.0
+        ),
+        today_low_c=(
+            today_forecast.low_c
+            if today_forecast is not None
+            else 0.0
+        ),
+        today_precipitation_probability_max_percent=(
+            today_forecast.precipitation_probability_max_percent
+            if today_forecast is not None
+            else 0.0
+        ),
+        tomorrow_condition=(
+            tomorrow_forecast.condition if tomorrow_forecast is not None else None
+        ),
+        tomorrow_high_c=(
+            tomorrow_forecast.high_c if tomorrow_forecast is not None else None
+        ),
+        tomorrow_low_c=(
+            tomorrow_forecast.low_c if tomorrow_forecast is not None else None
+        ),
+        tomorrow_precipitation_probability_max_percent=(
+            tomorrow_forecast.precipitation_probability_max_percent
+            if tomorrow_forecast is not None
+            else None
+        ),
+        daily_forecasts=daily_forecasts,
         public_ip=public_ip,
     )
+
+
+def _wttr_weather_url(*, latitude: float, longitude: float) -> str:
+    coordinates = f"{_format_number(latitude)},{_format_number(longitude)}"
+    return f"{WTTR_BASE_URL}/{parse.quote(coordinates, safe=',')}?format=j1&m"
+
+
+def _wttr_current_condition(weather_response: dict[str, object]) -> dict[str, object]:
+    current = weather_response.get("current_condition")
+    if isinstance(current, list) and current and isinstance(current[0], dict):
+        return current[0]
+    raise RuntimeError("wttr.in response did not include current_condition data.")
+
+
+def _wttr_daily_forecasts(weather_response: dict[str, object]) -> tuple[WeatherDailyForecast, ...]:
+    raw_weather = weather_response.get("weather")
+    if not isinstance(raw_weather, list) or not raw_weather:
+        raise RuntimeError("wttr.in response did not include daily forecast data.")
+    forecasts: list[WeatherDailyForecast] = []
+    for item in raw_weather:
+        if not isinstance(item, dict):
+            continue
+        hourly = item.get("hourly")
+        forecasts.append(
+            WeatherDailyForecast(
+                date=str(item.get("date", "")),
+                condition=_wttr_daily_condition(hourly),
+                high_c=_wttr_float(item.get("maxtempC")),
+                low_c=_wttr_float(item.get("mintempC")),
+                precipitation_probability_max_percent=_wttr_daily_precipitation_probability(hourly),
+            )
+        )
+    if not forecasts:
+        raise RuntimeError("wttr.in response did not include any usable daily forecasts.")
+    return tuple(forecasts)
+
+
+def _wttr_daily_condition(hourly: object) -> str:
+    selected = _wttr_hourly_snapshot(hourly)
+    return _wttr_desc(selected.get("weatherDesc")) or "Unknown"
+
+
+def _wttr_daily_precipitation_probability(hourly: object) -> float:
+    if not isinstance(hourly, list) or not hourly:
+        return 0.0
+    probabilities = [
+        _wttr_hourly_precipitation_probability(item)
+        for item in hourly
+        if isinstance(item, dict)
+    ]
+    if not probabilities:
+        return 0.0
+    return max(probabilities)
+
+
+def _wttr_hourly_snapshot(hourly: object) -> dict[str, object]:
+    if not isinstance(hourly, list) or not hourly:
+        return {}
+    snapshots = [item for item in hourly if isinstance(item, dict)]
+    if not snapshots:
+        return {}
+    selected = snapshots[0]
+    best_distance = abs(_wttr_hour_time(selected) - 1200)
+    for item in snapshots[1:]:
+        distance = abs(_wttr_hour_time(item) - 1200)
+        if distance < best_distance:
+            selected = item
+            best_distance = distance
+    return selected
+
+
+def _wttr_hour_time(snapshot: dict[str, object]) -> int:
+    value = snapshot.get("time")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _wttr_hourly_precipitation_probability(snapshot: dict[str, object]) -> float:
+    return max(
+        _wttr_float(snapshot.get("chanceofrain")),
+        _wttr_float(snapshot.get("chanceofsnow")),
+        _wttr_float(snapshot.get("chanceofthunder")),
+    )
+
+
+def _wttr_desc(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list) and value:
+        first = value[0]
+        if isinstance(first, dict):
+            nested = first.get("value")
+            if isinstance(nested, str):
+                return nested.strip()
+        if isinstance(first, str):
+            return first.strip()
+    return ""
+
+
+def _wttr_float(value: object) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 def _build_endpoint_context(

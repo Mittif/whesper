@@ -5,22 +5,79 @@ from urllib import parse
 
 from whesper.config import LiveContextEndpointConfig
 from whesper.live_data import (
+    _extract_city_weather_place,
     CityWeatherContextService,
     CustomApiContextService,
     ExchangeRateContextService,
     FetchedTextResponse,
     GeocodingContextService,
+    lookup_ip_location,
+    lookup_public_ip,
+    lookup_weather_for_ip,
+    lookup_weather_for_place,
     LiveContextService,
     LocalWeatherContextService,
     MarketPriceContextService,
     NewsContextService,
     SearchContextService,
+    should_fetch_weather,
     TechDocsContextService,
     TimeContextService,
     TransportStatusContextService,
     UrlSummaryContextService,
     should_fetch_local_weather,
 )
+
+
+def wttr_weather_url(latitude: float, longitude: float) -> str:
+    return f"https://wttr.in/{latitude},{longitude}?format=j1&m"
+
+
+def wttr_day(
+    date_value: str,
+    *,
+    condition: str,
+    high_c: float,
+    low_c: float,
+    precipitation_probability_max_percent: float,
+) -> dict[str, object]:
+    return {
+        "date": date_value,
+        "maxtempC": str(high_c),
+        "mintempC": str(low_c),
+        "hourly": [
+            {
+                "time": "1200",
+                "weatherDesc": [{"value": condition}],
+                "chanceofrain": str(precipitation_probability_max_percent),
+                "chanceofsnow": "0",
+                "chanceofthunder": "0",
+            }
+        ],
+    }
+
+
+def wttr_response(
+    *,
+    current_condition: str,
+    current_temperature_c: float,
+    apparent_temperature_c: float,
+    relative_humidity_percent: float,
+    wind_speed_kmh: float,
+    daily_forecasts: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "current_condition": [
+            {
+                "temp_C": str(current_temperature_c),
+                "FeelsLikeC": str(apparent_temperature_c),
+                "humidity": str(relative_humidity_percent),
+                "windspeedKmph": str(wind_speed_kmh),
+                "weatherDesc": [{"value": current_condition}],
+            }
+        ],
+        "weather": daily_forecasts,
+    }
 
 
 class LiveDataTests(unittest.TestCase):
@@ -30,36 +87,17 @@ class LiveDataTests(unittest.TestCase):
         self.assertFalse(should_fetch_local_weather("Explain how weather systems form."))
         self.assertFalse(should_fetch_local_weather("今天心情怎么样？"))
 
-    def test_build_prompt_context_formats_live_weather_report(self) -> None:
-        weather_url = (
-            "https://api.open-meteo.com/v1/forecast?"
-            + parse.urlencode(
-                {
-                    "latitude": 31.2304,
-                    "longitude": 121.4737,
-                    "current": ",".join(
-                        (
-                            "temperature_2m",
-                            "relative_humidity_2m",
-                            "apparent_temperature",
-                            "weather_code",
-                            "wind_speed_10m",
-                        )
-                    ),
-                    "daily": ",".join(
-                        (
-                            "weather_code",
-                            "temperature_2m_max",
-                            "temperature_2m_min",
-                            "precipitation_probability_max",
-                        )
-                    ),
-                    "forecast_days": 1,
-                    "timezone": "Asia/Shanghai",
-                }
-            )
-        )
+    def test_should_fetch_weather_includes_named_location_queries(self) -> None:
+        self.assertTrue(should_fetch_weather("Tokyo weather today"))
+        self.assertTrue(should_fetch_weather("上海天气怎么样"))
+        self.assertFalse(should_fetch_weather("今天心情怎么样？"))
 
+    def test_extract_city_weather_place_strips_search_prefixes(self) -> None:
+        self.assertEqual(_extract_city_weather_place("搜索上海天气"), "上海")
+        self.assertEqual(_extract_city_weather_place("查一下上海天气"), "上海")
+        self.assertEqual(_extract_city_weather_place("/search 上海天气"), "上海")
+
+    def test_build_prompt_context_formats_live_weather_report(self) -> None:
         responses = {
             "https://api.ipify.org?format=json": {"ip": "203.0.113.10"},
             "https://ipwho.is/203.0.113.10": {
@@ -71,22 +109,29 @@ class LiveDataTests(unittest.TestCase):
                 "longitude": 121.4737,
                 "timezone": {"id": "Asia/Shanghai"},
             },
-            weather_url: {
-                "timezone": "Asia/Shanghai",
-                "current": {
-                    "temperature_2m": 23.4,
-                    "relative_humidity_2m": 61,
-                    "apparent_temperature": 24.0,
-                    "weather_code": 2,
-                    "wind_speed_10m": 12.1,
-                },
-                "daily": {
-                    "weather_code": [3],
-                    "temperature_2m_max": [27.2],
-                    "temperature_2m_min": [19.8],
-                    "precipitation_probability_max": [30],
-                },
-            },
+            wttr_weather_url(31.2304, 121.4737): wttr_response(
+                current_condition="Partly cloudy",
+                current_temperature_c=23.4,
+                apparent_temperature_c=24.0,
+                relative_humidity_percent=61,
+                wind_speed_kmh=12.1,
+                daily_forecasts=[
+                    wttr_day(
+                        "2026-03-25",
+                        condition="Overcast",
+                        high_c=27.2,
+                        low_c=19.8,
+                        precipitation_probability_max_percent=30,
+                    ),
+                    wttr_day(
+                        "2026-03-26",
+                        condition="Slight rain",
+                        high_c=25.1,
+                        low_c=18.3,
+                        precipitation_probability_max_percent=70,
+                    ),
+                ],
+            ),
         }
 
         service = LocalWeatherContextService(
@@ -102,6 +147,8 @@ class LiveDataTests(unittest.TestCase):
         self.assertIn("today_condition: Overcast", context)
         self.assertIn("today_high_c: 27.2", context)
         self.assertIn("today_low_c: 19.8", context)
+        self.assertIn("tomorrow_condition: Slight rain", context)
+        self.assertIn("tomorrow_high_c: 25.1", context)
 
     def test_build_prompt_context_returns_failure_instruction_when_lookup_breaks(self) -> None:
         service = LocalWeatherContextService(
@@ -113,6 +160,54 @@ class LiveDataTests(unittest.TestCase):
         assert context is not None
         self.assertIn("failed: TimeoutError: network timeout", context)
         self.assertIn("Do not invent the user's current weather", context)
+
+    def test_lookup_weather_helpers_split_ip_geo_and_weather_steps(self) -> None:
+        responses = {
+            "https://api.ipify.org?format=json": {"ip": "203.0.113.10"},
+            "https://ipwho.is/203.0.113.10": {
+                "success": True,
+                "city": "Shanghai",
+                "region": "Shanghai",
+                "country": "China",
+                "latitude": 31.2304,
+                "longitude": 121.4737,
+                "timezone": {"id": "Asia/Shanghai"},
+            },
+            wttr_weather_url(31.2304, 121.4737): wttr_response(
+                current_condition="Partly cloudy",
+                current_temperature_c=23.4,
+                apparent_temperature_c=24.0,
+                relative_humidity_percent=61,
+                wind_speed_kmh=12.1,
+                daily_forecasts=[
+                    wttr_day(
+                        "2026-03-25",
+                        condition="Overcast",
+                        high_c=27.2,
+                        low_c=19.8,
+                        precipitation_probability_max_percent=30,
+                    ),
+                    wttr_day(
+                        "2026-03-26",
+                        condition="Slight rain",
+                        high_c=25.1,
+                        low_c=18.3,
+                        precipitation_probability_max_percent=70,
+                    ),
+                ],
+            ),
+        }
+        fetch_json = lambda url, timeout: responses[url]
+
+        public_ip = lookup_public_ip(fetch_json, 10)
+        location = lookup_ip_location(fetch_json, 10, public_ip)
+        report = lookup_weather_for_ip(fetch_json, 10)
+
+        self.assertEqual(public_ip, "203.0.113.10")
+        self.assertEqual(location.label, "Shanghai, Shanghai, China")
+        self.assertEqual(report.public_ip, "203.0.113.10")
+        self.assertEqual(report.location_label, "Shanghai, Shanghai, China")
+        self.assertEqual(report.tomorrow_condition, "Slight rain")
 
     def test_exchange_rate_context_formats_live_rate(self) -> None:
         service = ExchangeRateContextService(
@@ -134,33 +229,56 @@ class LiveDataTests(unittest.TestCase):
             "https://geocoding-api.open-meteo.com/v1/search?"
             + parse.urlencode({"name": "Tokyo", "count": 1, "language": "en", "format": "json"})
         )
-        weather_url = (
-            "https://api.open-meteo.com/v1/forecast?"
-            + parse.urlencode(
-                {
-                    "latitude": 35.6895,
-                    "longitude": 139.6917,
-                    "current": ",".join(
-                        (
-                            "temperature_2m",
-                            "relative_humidity_2m",
-                            "apparent_temperature",
-                            "weather_code",
-                            "wind_speed_10m",
-                        )
+        responses = {
+            geocode_url: {
+                "results": [
+                    {
+                        "name": "Tokyo",
+                        "admin1": "Tokyo",
+                        "country": "Japan",
+                        "latitude": 35.6895,
+                        "longitude": 139.6917,
+                        "timezone": "Asia/Tokyo",
+                    }
+                ]
+            },
+            wttr_weather_url(35.6895, 139.6917): wttr_response(
+                current_condition="Mainly clear",
+                current_temperature_c=18.2,
+                apparent_temperature_c=18.0,
+                relative_humidity_percent=70,
+                wind_speed_kmh=8.4,
+                daily_forecasts=[
+                    wttr_day(
+                        "2026-03-25",
+                        condition="Partly cloudy",
+                        high_c=22.5,
+                        low_c=14.3,
+                        precipitation_probability_max_percent=20,
                     ),
-                    "daily": ",".join(
-                        (
-                            "weather_code",
-                            "temperature_2m_max",
-                            "temperature_2m_min",
-                            "precipitation_probability_max",
-                        )
+                    wttr_day(
+                        "2026-03-26",
+                        condition="Overcast",
+                        high_c=21.4,
+                        low_c=15.0,
+                        precipitation_probability_max_percent=35,
                     ),
-                    "forecast_days": 1,
-                    "timezone": "Asia/Tokyo",
-                }
-            )
+                ],
+            ),
+        }
+        service = CityWeatherContextService(fetch_json=lambda url, timeout: responses[url])
+
+        context = service.build_prompt_context("Tokyo weather today")
+
+        assert context is not None
+        self.assertIn("location: Tokyo, Tokyo, Japan", context)
+        self.assertIn("current_condition: Mainly clear", context)
+        self.assertIn("tomorrow_condition: Overcast", context)
+
+    def test_lookup_weather_for_place_returns_report(self) -> None:
+        geocode_url = (
+            "https://geocoding-api.open-meteo.com/v1/search?"
+            + parse.urlencode({"name": "Tokyo", "count": 1, "language": "en", "format": "json"})
         )
         responses = {
             geocode_url: {
@@ -175,30 +293,176 @@ class LiveDataTests(unittest.TestCase):
                     }
                 ]
             },
-            weather_url: {
-                "timezone": "Asia/Tokyo",
-                "current": {
-                    "temperature_2m": 18.2,
-                    "relative_humidity_2m": 70,
-                    "apparent_temperature": 18.0,
-                    "weather_code": 1,
-                    "wind_speed_10m": 8.4,
-                },
-                "daily": {
-                    "weather_code": [2],
-                    "temperature_2m_max": [22.5],
-                    "temperature_2m_min": [14.3],
-                    "precipitation_probability_max": [20],
-                },
+            wttr_weather_url(35.6895, 139.6917): wttr_response(
+                current_condition="Mainly clear",
+                current_temperature_c=18.2,
+                apparent_temperature_c=18.0,
+                relative_humidity_percent=70,
+                wind_speed_kmh=8.4,
+                daily_forecasts=[
+                    wttr_day(
+                        "2026-03-25",
+                        condition="Partly cloudy",
+                        high_c=22.5,
+                        low_c=14.3,
+                        precipitation_probability_max_percent=20,
+                    ),
+                    wttr_day(
+                        "2026-03-26",
+                        condition="Overcast",
+                        high_c=21.4,
+                        low_c=15.0,
+                        precipitation_probability_max_percent=35,
+                    ),
+                ],
+            ),
+        }
+
+        report = lookup_weather_for_place(lambda url, timeout: responses[url], 10, "Tokyo")
+
+        self.assertEqual(report.location_label, "Tokyo, Tokyo, Japan")
+        self.assertEqual(report.timezone, "Asia/Tokyo")
+        self.assertEqual(report.tomorrow_condition, "Overcast")
+
+    def test_city_weather_context_handles_chinese_district_tomorrow_query(self) -> None:
+        geocode_url = (
+            "https://geocoding-api.open-meteo.com/v1/search?"
+            + parse.urlencode({"name": "嘉定区", "count": 1, "language": "en", "format": "json"})
+        )
+        responses = {
+            geocode_url: {
+                "results": [
+                    {
+                        "name": "Jiading District",
+                        "admin1": "Shanghai",
+                        "country": "China",
+                        "latitude": 31.3835,
+                        "longitude": 121.2503,
+                        "timezone": "Asia/Shanghai",
+                    }
+                ]
             },
+            wttr_weather_url(31.3835, 121.2503): wttr_response(
+                current_condition="Partly cloudy",
+                current_temperature_c=22.1,
+                apparent_temperature_c=22.0,
+                relative_humidity_percent=65,
+                wind_speed_kmh=10.2,
+                daily_forecasts=[
+                    wttr_day(
+                        "2026-03-25",
+                        condition="Partly cloudy",
+                        high_c=25.0,
+                        low_c=18.1,
+                        precipitation_probability_max_percent=20,
+                    ),
+                    wttr_day(
+                        "2026-03-26",
+                        condition="Slight rain",
+                        high_c=23.4,
+                        low_c=17.2,
+                        precipitation_probability_max_percent=80,
+                    ),
+                ],
+            ),
         }
         service = CityWeatherContextService(fetch_json=lambda url, timeout: responses[url])
 
-        context = service.build_prompt_context("Tokyo weather today")
+        context = service.build_prompt_context("嘉定区明天的天气")
 
         assert context is not None
-        self.assertIn("location: Tokyo, Tokyo, Japan", context)
-        self.assertIn("current_condition: Mainly clear", context)
+        self.assertIn("location: Jiading District, Shanghai, China", context)
+        self.assertIn("tomorrow_condition: Slight rain", context)
+        self.assertIn("tomorrow_high_c: 23.4", context)
+        self.assertIn("requested_period: tomorrow", context)
+        self.assertIn("requested_date: 2026-03-26", context)
+
+    def test_city_weather_context_handles_next_monday_query(self) -> None:
+        geocode_url = (
+            "https://geocoding-api.open-meteo.com/v1/search?"
+            + parse.urlencode({"name": "嘉定区", "count": 1, "language": "en", "format": "json"})
+        )
+        responses = {
+            geocode_url: {
+                "results": [
+                    {
+                        "name": "Jiading District",
+                        "admin1": "Shanghai",
+                        "country": "China",
+                        "latitude": 31.3835,
+                        "longitude": 121.2503,
+                        "timezone": "Asia/Shanghai",
+                    }
+                ]
+            },
+            wttr_weather_url(31.3835, 121.2503): wttr_response(
+                current_condition="Partly cloudy",
+                current_temperature_c=22.1,
+                apparent_temperature_c=22.0,
+                relative_humidity_percent=65,
+                wind_speed_kmh=10.2,
+                daily_forecasts=[
+                    wttr_day("2026-03-25", condition="Partly cloudy", high_c=25.0, low_c=18.1, precipitation_probability_max_percent=20),
+                    wttr_day("2026-03-26", condition="Slight rain", high_c=23.4, low_c=17.2, precipitation_probability_max_percent=80),
+                    wttr_day("2026-03-27", condition="Overcast", high_c=24.2, low_c=16.4, precipitation_probability_max_percent=40),
+                    wttr_day("2026-03-28", condition="Partly cloudy", high_c=26.1, low_c=18.8, precipitation_probability_max_percent=10),
+                    wttr_day("2026-03-29", condition="Fog", high_c=21.0, low_c=15.0, precipitation_probability_max_percent=15),
+                    wttr_day("2026-03-30", condition="Moderate rain", high_c=19.8, low_c=13.7, precipitation_probability_max_percent=75),
+                ],
+            ),
+        }
+        service = CityWeatherContextService(fetch_json=lambda url, timeout: responses[url])
+
+        context = service.build_prompt_context("嘉定区下周一的天气")
+
+        assert context is not None
+        self.assertIn("requested_period: next_monday", context)
+        self.assertIn("requested_date: 2026-03-30", context)
+        self.assertIn("requested_condition: Moderate rain", context)
+
+    def test_city_weather_context_handles_weekend_query(self) -> None:
+        geocode_url = (
+            "https://geocoding-api.open-meteo.com/v1/search?"
+            + parse.urlencode({"name": "嘉定区", "count": 1, "language": "en", "format": "json"})
+        )
+        responses = {
+            geocode_url: {
+                "results": [
+                    {
+                        "name": "Jiading District",
+                        "admin1": "Shanghai",
+                        "country": "China",
+                        "latitude": 31.3835,
+                        "longitude": 121.2503,
+                        "timezone": "Asia/Shanghai",
+                    }
+                ]
+            },
+            wttr_weather_url(31.3835, 121.2503): wttr_response(
+                current_condition="Partly cloudy",
+                current_temperature_c=22.1,
+                apparent_temperature_c=22.0,
+                relative_humidity_percent=65,
+                wind_speed_kmh=10.2,
+                daily_forecasts=[
+                    wttr_day("2026-03-25", condition="Partly cloudy", high_c=25.0, low_c=18.1, precipitation_probability_max_percent=20),
+                    wttr_day("2026-03-26", condition="Slight rain", high_c=23.4, low_c=17.2, precipitation_probability_max_percent=80),
+                    wttr_day("2026-03-27", condition="Overcast", high_c=24.2, low_c=16.4, precipitation_probability_max_percent=40),
+                    wttr_day("2026-03-28", condition="Partly cloudy", high_c=26.1, low_c=18.8, precipitation_probability_max_percent=10),
+                    wttr_day("2026-03-29", condition="Fog", high_c=21.0, low_c=15.0, precipitation_probability_max_percent=15),
+                    wttr_day("2026-03-30", condition="Moderate rain", high_c=19.8, low_c=13.7, precipitation_probability_max_percent=75),
+                ],
+            ),
+        }
+        service = CityWeatherContextService(fetch_json=lambda url, timeout: responses[url])
+
+        context = service.build_prompt_context("嘉定区周末天气")
+
+        assert context is not None
+        self.assertIn("requested_period: weekend", context)
+        self.assertIn("requested_day_1_date: 2026-03-28", context)
+        self.assertIn("requested_day_2_date: 2026-03-29", context)
+        self.assertIn("requested_day_2_condition: Fog", context)
 
     def test_market_price_context_formats_live_quote_data(self) -> None:
         expected_url = (

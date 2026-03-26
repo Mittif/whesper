@@ -1,30 +1,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 from typing import Callable
 
+from whesper.agent_harness import AgentHarness, AGENTIC_PLANNING_PROMPT, StepCallback
 from whesper.client import CompletionResult, OpenAICompatibleClient, ProviderError, ToolCall
 from whesper.config import AppConfig
 from whesper.live_data import LiveContextService
+from whesper.message_builder import SessionMessageBuilder
 from whesper.memory import MemoryService
 from whesper.router import RouteDecision, select_model
 from whesper.session import ChatMessage, ConversationSession, utc_now_iso
+from whesper.tool_executor import ToolExecutor
+from whesper.tool_protocol import DefaultToolProtocolAdapter, ToolMessageFormat
 from whesper.trace import TraceStore, make_trace_event
-from whesper.tools import ToolExecutionError, ToolRegistry
+from whesper.tools import ToolRegistry
 
 
 @dataclass(slots=True)
 class ChatTurnResult:
     decision: RouteDecision
     assistant_message: ChatMessage
-
-
-@dataclass(slots=True, frozen=True)
-class ToolMessageFormat:
-    assistant_tool_content_null: bool = True
-    tool_arguments_mode: str = "string"
-    include_tool_name: bool = False
 
 
 class GenerationInterrupted(RuntimeError):
@@ -34,38 +30,7 @@ class GenerationInterrupted(RuntimeError):
 
 
 class ChatService:
-    MAX_TOOL_ROUNDS = 3
-    INTERNAL_CONTINUE_PROMPT = (
-        "Continue the same turn internally. Do not narrate that you will search or check. "
-        "If fresh information is needed, call an appropriate tool now. Otherwise provide the "
-        "final user-facing answer directly."
-    )
-    INTERIM_TOOL_RESPONSE_MARKERS = (
-        "我来帮你查",
-        "我来查",
-        "让我看看",
-        "让我查",
-        "让我先搜索",
-        "稍等",
-        "稍等一下",
-        "正在帮你",
-        "i'll check",
-        "let me check",
-        "let me look",
-        "let me search",
-        "one moment",
-    )
-    DEFAULT_TOOL_MESSAGE_FORMAT = ToolMessageFormat()
-    KIMI_TOOL_MESSAGE_FORMAT = ToolMessageFormat(
-        assistant_tool_content_null=True,
-        tool_arguments_mode="string",
-        include_tool_name=False,
-    )
-    QWEN_TOOL_MESSAGE_FORMAT = ToolMessageFormat(
-        assistant_tool_content_null=True,
-        tool_arguments_mode="object",
-        include_tool_name=False,
-    )
+    MAX_AGENT_ROUNDS = 10
 
     def __init__(
         self,
@@ -80,9 +45,28 @@ class ChatService:
         self.client = client or OpenAICompatibleClient()
         self.memory_service = memory_service
         self.live_context_service = live_context_service or LiveContextService.from_config(config)
-        self.tool_registry = tool_registry or ToolRegistry.default()
+        self.tool_registry = tool_registry or ToolRegistry.default(config)
+        self.tool_protocol_adapter = DefaultToolProtocolAdapter()
+        self.message_builder = SessionMessageBuilder(
+            config,
+            tool_protocol_adapter=self.tool_protocol_adapter,
+            memory_service=self.memory_service,
+            live_context_service=self.live_context_service,
+            tool_registry=self.tool_registry,
+        )
+        self.tool_executor = ToolExecutor(self.tool_registry)
         self.trace_store = trace_store
         self._tool_unsupported_providers: set[str] = set()
+        self.harness = AgentHarness(
+            message_builder=self.message_builder,
+            tool_executor=self.tool_executor,
+            completion_requester=self._client_create_chat_completion,
+            tool_call_payload_builder=self._tool_call_payload,
+            tool_choice_builder=self._tool_choice_for_request,
+            reasoning_content_resolver=self._tool_message_reasoning_content,
+            trace_emitter=self._append_trace,
+            max_rounds=self.MAX_AGENT_ROUNDS,
+        )
 
     def send(
         self,
@@ -90,19 +74,16 @@ class ChatService:
         user_text: str,
         *,
         mode_override: str = "auto",
+        on_step: StepCallback | None = None,
     ) -> ChatTurnResult:
-        user_message = ChatMessage(
-            role="user",
-            content=user_text,
-            created_at=utc_now_iso(),
-        )
-        session.append(user_message)
+        self._append_user_message(session, user_text)
         if self.memory_service is not None:
             self.memory_service.capture_user_message(session.session_id, user_text)
         return self._complete_turn(
             session,
             user_text,
             mode_override=mode_override,
+            on_step=on_step,
         )
 
     def send_stream(
@@ -112,13 +93,9 @@ class ChatService:
         *,
         mode_override: str = "auto",
         on_chunk: Callable[[str], None] | None = None,
+        on_step: StepCallback | None = None,
     ) -> ChatTurnResult:
-        user_message = ChatMessage(
-            role="user",
-            content=user_text,
-            created_at=utc_now_iso(),
-        )
-        session.append(user_message)
+        self._append_user_message(session, user_text)
         if self.memory_service is not None:
             self.memory_service.capture_user_message(session.session_id, user_text)
         return self._complete_turn_stream(
@@ -126,6 +103,7 @@ class ChatService:
             user_text,
             mode_override=mode_override,
             on_chunk=on_chunk,
+            on_step=on_step,
         )
 
     def retry_stream(
@@ -134,6 +112,7 @@ class ChatService:
         *,
         mode_override: str = "auto",
         on_chunk: Callable[[str], None] | None = None,
+        on_step: StepCallback | None = None,
     ) -> ChatTurnResult:
         last_user_index = self._last_user_index(session)
         if last_user_index is None:
@@ -141,12 +120,16 @@ class ChatService:
 
         last_user_message = session.messages[last_user_index]
         del session.messages[last_user_index + 1 :]
+        transcript_last_user_index = self._last_user_index_in_messages(session.transcript_messages)
+        if transcript_last_user_index is not None:
+            del session.transcript_messages[transcript_last_user_index + 1 :]
         self._sync_session_updated_at(session)
         return self._complete_turn_stream(
             session,
             last_user_message.content,
             mode_override=mode_override,
             on_chunk=on_chunk,
+            on_step=on_step,
         )
 
     def _complete_turn(
@@ -155,6 +138,7 @@ class ChatService:
         user_text: str,
         *,
         mode_override: str = "auto",
+        on_step: StepCallback | None = None,
     ) -> ChatTurnResult:
         decision = select_model(
             self.config,
@@ -176,7 +160,7 @@ class ChatService:
         )
         tools = self._tools_for_request(provider_name=provider_config.name, user_text=user_text, route_mode=decision.mode)
         if tools is not None:
-            completion = self._resolve_pre_tool_completion(
+            run_result = self.harness.run_until_final(
                 session,
                 decision,
                 provider=provider_config,
@@ -186,26 +170,10 @@ class ChatService:
                 route_mode=decision.mode,
                 tools=tools,
                 tool_message_format=tool_message_format,
+                on_step=on_step,
             )
+            completion = run_result.completion
         else:
-            completion = self._client_create_chat_completion(
-                session_id=session.session_id,
-                decision=decision,
-                provider=provider_config,
-                model=model_config,
-                messages=messages,
-                streamed=False,
-            )
-        if completion.tool_calls:
-            self._append_tool_interaction_messages(session, decision, completion)
-            self._execute_tool_calls(session, decision, completion.tool_calls)
-            messages = self._build_messages(
-                session,
-                model_config.system_prompt,
-                tool_message_format=tool_message_format,
-                user_text=user_text,
-                route_mode=decision.mode,
-            )
             completion = self._client_create_chat_completion(
                 session_id=session.session_id,
                 decision=decision,
@@ -227,6 +195,7 @@ class ChatService:
         *,
         mode_override: str = "auto",
         on_chunk: Callable[[str], None] | None = None,
+        on_step: StepCallback | None = None,
     ) -> ChatTurnResult:
 
         decision = select_model(
@@ -260,7 +229,7 @@ class ChatService:
                 messages=messages,
                 on_chunk=on_chunk,
             )
-        completion = self._resolve_pre_tool_completion(
+        run_result = self.harness.run_until_final(
             session,
             decision,
             provider=provider_config,
@@ -270,32 +239,19 @@ class ChatService:
             route_mode=decision.mode,
             tools=tools,
             tool_message_format=tool_message_format,
+            on_step=on_step,
         )
-        if completion.tool_calls:
-            self._append_tool_interaction_messages(session, decision, completion)
-            self._execute_tool_calls(session, decision, completion.tool_calls)
-            messages = self._build_messages(
-                session,
-                model_config.system_prompt,
-                tool_message_format=tool_message_format,
-                user_text=user_text,
-                route_mode=decision.mode,
-            )
-            return self._stream_final_answer(
-                session,
-                decision,
-                provider=provider_config,
-                model=model_config,
-                messages=messages,
-                on_chunk=on_chunk,
-            )
+        completion = run_result.completion
         if on_chunk is not None and completion.content:
             on_chunk(completion.content)
         return self._append_assistant_message(session, decision, completion.content)
 
     def _last_user_index(self, session: ConversationSession) -> int | None:
-        for index in range(len(session.messages) - 1, -1, -1):
-            if session.messages[index].role == "user":
+        return self._last_user_index_in_messages(session.messages)
+
+    def _last_user_index_in_messages(self, messages: list[ChatMessage]) -> int | None:
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index].role == "user":
                 return index
         return None
 
@@ -305,6 +261,22 @@ class ChatService:
             return
         session.updated_at = session.created_at
 
+    def _append_user_message(self, session: ConversationSession, user_text: str) -> ChatMessage:
+        user_message = ChatMessage(
+            role="user",
+            content=user_text,
+            created_at=utc_now_iso(),
+        )
+        session.append(user_message)
+        session.append_transcript(
+            ChatMessage(
+                role="user",
+                content=user_text,
+                created_at=user_message.created_at,
+            )
+        )
+        return user_message
+
     def _build_messages(
         self,
         session: ConversationSession,
@@ -313,247 +285,20 @@ class ChatService:
         tool_message_format: ToolMessageFormat,
         user_text: str,
         route_mode: str,
+        include_planning_prompt: bool = True,
     ) -> list[dict[str, object]]:
-        prompts = [self.config.persona.system_prompt.strip()]
-        if model_system_prompt:
-            prompts.append(model_system_prompt.strip())
-        if self.tool_registry is not None:
-            prompts.append(self.tool_registry.tool_prompt())
-        if self.memory_service is not None:
-            memory_prompt = self.memory_service.build_prompt_context(user_text)
-            if memory_prompt:
-                prompts.append(memory_prompt)
-        if self.live_context_service is not None:
-            live_context_prompt = self.live_context_service.build_prompt_context(
-                user_text,
-                route_mode=route_mode,
-            )
-            if live_context_prompt:
-                prompts.append(live_context_prompt)
-        system_message = "\n\n".join(part for part in prompts if part)
-
-        result: list[dict[str, object]] = [{"role": "system", "content": system_message}]
-        recent_messages = session.messages[-self.config.app.history_limit :]
-        for message in recent_messages:
-            payload: dict[str, object] = {"role": message.role}
-            if (
-                message.role == "assistant"
-                and message.tool_calls is not None
-                and not message.content.strip()
-                and tool_message_format.assistant_tool_content_null
-            ):
-                payload["content"] = None
-            else:
-                payload["content"] = message.content
-            if (
-                message.name is not None
-                and (message.role != "tool" or tool_message_format.include_tool_name)
-            ):
-                payload["name"] = message.name
-            if message.tool_call_id is not None:
-                payload["tool_call_id"] = message.tool_call_id
-            if message.tool_calls is not None:
-                payload["tool_calls"] = self._serialize_tool_calls(
-                    message.tool_calls,
-                    tool_message_format=tool_message_format,
-                )
-            result.append(payload)
-        return result
-
-    def _append_tool_interaction_messages(
-        self,
-        session: ConversationSession,
-        decision: RouteDecision,
-        completion: CompletionResult,
-    ) -> None:
-        assistant_message = ChatMessage(
-            role="assistant",
-            content="",
-            created_at=utc_now_iso(),
-            model_alias=decision.model_alias,
-            route_reason=decision.reason,
-            tool_calls=[self._tool_call_payload(item) for item in completion.tool_calls],
-        )
-        session.append(assistant_message)
-        self._append_trace(
-            kind="tool_calls",
-            session_id=session.session_id,
-            decision=decision,
-            provider_name=self.config.get_provider(
-                self.config.get_model(decision.model_alias).provider
-            ).name,
-            streamed=False,
-            tools_enabled=True,
-            tool_choice=self._tool_choice_for_request(
-                self.tool_registry.openai_tools(),
-                route_mode=decision.mode,
-            ),
-            note=", ".join(item.name for item in completion.tool_calls),
-            preview=completion.content or None,
-        )
-
-    def _execute_tool_calls(
-        self,
-        session: ConversationSession,
-        decision: RouteDecision,
-        tool_calls: tuple[ToolCall, ...],
-    ) -> list[ChatMessage]:
-        tool_messages: list[ChatMessage] = []
-        for tool_call in tool_calls:
-            try:
-                result = self.tool_registry.execute(tool_call)
-                content = result.content
-                name = result.name
-                tool_call_id = result.tool_call_id
-            except ToolExecutionError as exc:
-                content = str(exc)
-                name = tool_call.name
-                tool_call_id = tool_call.tool_call_id
-            message = ChatMessage(
-                role="tool",
-                content=content,
-                created_at=utc_now_iso(),
-                name=name,
-                tool_call_id=tool_call_id,
-            )
-            session.append(message)
-            tool_messages.append(message)
-            self._append_trace(
-                kind="tool_result",
-                session_id=session.session_id,
-                decision=decision,
-                provider_name=self.config.get_provider(
-                    self.config.get_model(decision.model_alias).provider
-                ).name,
-                streamed=False,
-                tools_enabled=True,
-                tool_choice=self._tool_choice_for_request(
-                    self.tool_registry.openai_tools(),
-                    route_mode=decision.mode,
-                ),
-                note=name,
-                preview=content,
-            )
-        return tool_messages
-
-    def _tool_call_payload(self, tool_call: ToolCall) -> dict[str, object]:
-        return {
-            "id": tool_call.tool_call_id,
-            "type": "function",
-            "function": {
-                "name": tool_call.name,
-                "arguments": tool_call.arguments_json,
-            },
-        }
-
-    def _serialize_tool_calls(
-        self,
-        tool_calls: list[dict[str, object]],
-        *,
-        tool_message_format: ToolMessageFormat,
-    ) -> list[dict[str, object]]:
-        serialized_calls: list[dict[str, object]] = []
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                serialized_calls.append(tool_call)
-                continue
-            serialized_call = dict(tool_call)
-            function = serialized_call.get("function")
-            if isinstance(function, dict):
-                serialized_function = dict(function)
-                arguments = serialized_function.get("arguments")
-                if (
-                    tool_message_format.tool_arguments_mode == "object"
-                    and isinstance(arguments, str)
-                ):
-                    try:
-                        serialized_function["arguments"] = json.loads(arguments)
-                    except json.JSONDecodeError:
-                        serialized_function["arguments"] = arguments
-                elif (
-                    tool_message_format.tool_arguments_mode == "string"
-                    and isinstance(arguments, dict)
-                ):
-                    serialized_function["arguments"] = json.dumps(
-                        arguments,
-                        ensure_ascii=False,
-                    )
-                serialized_call["function"] = serialized_function
-            serialized_calls.append(serialized_call)
-        return serialized_calls
-
-    def _resolve_pre_tool_completion(
-        self,
-        session: ConversationSession,
-        decision: RouteDecision,
-        *,
-        provider,
-        model,
-        model_system_prompt: str | None,
-        user_text: str,
-        route_mode: str,
-        tools: list[dict[str, object]],
-        tool_message_format: ToolMessageFormat,
-    ) -> CompletionResult:
-        working_messages = self._build_messages(
+        planning_prompt = AGENTIC_PLANNING_PROMPT if include_planning_prompt else None
+        return self.message_builder.build_messages(
             session,
             model_system_prompt,
             tool_message_format=tool_message_format,
             user_text=user_text,
             route_mode=route_mode,
+            planning_prompt=planning_prompt,
         )
-        tool_choice = self._tool_choice_for_request(tools, route_mode=route_mode)
 
-        for round_index in range(self.MAX_TOOL_ROUNDS):
-            completion = self._client_create_chat_completion(
-                session_id=session.session_id,
-                decision=decision,
-                provider=provider,
-                model=model,
-                messages=working_messages,
-                tools=tools,
-                tool_choice=tool_choice,
-                streamed=False,
-            )
-            if completion.tool_calls:
-                return completion
-            if self._should_continue_tool_loop(
-                completion.content,
-                route_mode=route_mode,
-                round_index=round_index,
-            ):
-                self._append_trace(
-                    kind="planning_retry",
-                    session_id=session.session_id,
-                    decision=decision,
-                    provider_name=provider.name,
-                    streamed=False,
-                    tools_enabled=True,
-                    tool_choice=self._stringify_tool_choice(tool_choice),
-                    preview=completion.content,
-                )
-                working_messages = [
-                    *working_messages,
-                    {"role": "assistant", "content": completion.content},
-                    {"role": "user", "content": self.INTERNAL_CONTINUE_PROMPT},
-                ]
-                continue
-            return completion
-
-        self._append_trace(
-            kind="tool_loop_limit",
-            session_id=session.session_id,
-            decision=decision,
-            provider_name=provider.name,
-            streamed=False,
-            tools_enabled=True,
-            tool_choice=self._stringify_tool_choice(tool_choice),
-            note=f"max_rounds={self.MAX_TOOL_ROUNDS}",
-        )
-        return CompletionResult(
-            content="我刚才没有顺利拿到完整结果。要不要我换个方式继续帮你查？",
-            raw_response={},
-        )
+    def _tool_call_payload(self, tool_call: ToolCall) -> dict[str, object]:
+        return self.tool_protocol_adapter.tool_call_payload(tool_call)
 
     def _client_create_chat_completion(
         self,
@@ -568,6 +313,7 @@ class ChatService:
         streamed: bool,
         structured_tool_arguments: bool = False,
     ) -> CompletionResult:
+        messages = self.tool_protocol_adapter.messages_with_normalized_tool_call_ids(messages)
         self._append_trace(
             kind="completion_request",
             session_id=session_id,
@@ -700,6 +446,8 @@ class ChatService:
                 )
             if not tools:
                 raise
+            if not self._should_retry_without_tools(provider, exc):
+                raise
             self._tool_unsupported_providers.add(provider.name)
             self._append_trace(
                 kind="fallback",
@@ -730,9 +478,13 @@ class ChatService:
     ) -> list[dict[str, object]] | None:
         if provider_name in self._tool_unsupported_providers:
             return None
-        if not self.tool_registry.should_offer_tools(user_text, route_mode=route_mode):
+        tools = self.tool_registry.openai_tools()
+        if not tools:
             return None
-        return self.tool_registry.openai_tools()
+        # Always offer tools so the model can do multi-step agentic
+        # decomposition for any query. The model decides whether to
+        # actually call them based on the system prompt and user intent.
+        return tools
 
     def _tool_choice_for_request(
         self,
@@ -806,19 +558,7 @@ class ChatService:
         return str(tool_choice)
 
     def _tool_message_format(self, model, provider) -> ToolMessageFormat:
-        candidates = (
-            getattr(model, "name", ""),
-            getattr(model, "model", ""),
-            getattr(provider, "name", ""),
-        )
-        lowered = " ".join(str(item).casefold() for item in candidates if item)
-        if "kimi" in lowered or "moonshot" in lowered:
-            return self.KIMI_TOOL_MESSAGE_FORMAT
-        if "qwen" in lowered:
-            return self.QWEN_TOOL_MESSAGE_FORMAT
-        if getattr(provider, "kind", "") == "ollama_native":
-            return self.QWEN_TOOL_MESSAGE_FORMAT
-        return self.DEFAULT_TOOL_MESSAGE_FORMAT
+        return self.tool_protocol_adapter.tool_message_format(model, provider)
 
     def _should_continue_tool_loop(
         self,
@@ -827,17 +567,11 @@ class ChatService:
         route_mode: str,
         round_index: int,
     ) -> bool:
-        if round_index >= self.MAX_TOOL_ROUNDS - 1:
-            return False
-        if route_mode != "search":
-            return False
-        normalized = " ".join(content.split()).casefold()
-        if not normalized:
-            return False
-        for marker in self.INTERIM_TOOL_RESPONSE_MARKERS:
-            if marker.casefold() in normalized:
-                return True
-        return False
+        return self.harness.should_continue_tool_loop(
+            content,
+            route_mode=route_mode,
+            round_index=round_index,
+        )
 
     def _should_retry_with_structured_tool_arguments(
         self,
@@ -856,43 +590,57 @@ class ChatService:
         )
 
     def _has_assistant_tool_calls(self, messages: list[dict[str, object]]) -> bool:
-        for message in messages:
-            if message.get("role") != "assistant":
-                continue
-            if isinstance(message.get("tool_calls"), list):
-                return True
-        return False
+        return self.tool_protocol_adapter.has_assistant_tool_calls(messages)
 
     def _messages_with_structured_tool_arguments(
         self,
         messages: list[dict[str, object]],
     ) -> list[dict[str, object]]:
-        normalized_messages: list[dict[str, object]] = []
-        for message in messages:
-            normalized_message = dict(message)
-            raw_tool_calls = normalized_message.get("tool_calls")
-            if isinstance(raw_tool_calls, list):
-                normalized_tool_calls: list[dict[str, object]] = []
-                for tool_call in raw_tool_calls:
-                    if not isinstance(tool_call, dict):
-                        normalized_tool_calls.append(tool_call)
-                        continue
-                    normalized_call = dict(tool_call)
-                    function = normalized_call.get("function")
-                    if isinstance(function, dict):
-                        normalized_function = dict(function)
-                        arguments = normalized_function.get("arguments")
-                        if isinstance(arguments, str):
-                            try:
-                                parsed_arguments = json.loads(arguments)
-                            except json.JSONDecodeError:
-                                parsed_arguments = arguments
-                            normalized_function["arguments"] = parsed_arguments
-                        normalized_call["function"] = normalized_function
-                    normalized_tool_calls.append(normalized_call)
-                normalized_message["tool_calls"] = normalized_tool_calls
-            normalized_messages.append(normalized_message)
-        return normalized_messages
+        return self.tool_protocol_adapter.messages_with_structured_tool_arguments(messages)
+
+    def _should_retry_without_tools(self, provider, exc: ProviderError) -> bool:
+        error_text = str(exc).casefold()
+        if any(
+            marker in error_text
+            for marker in (
+                "unreachable",
+                "ssl",
+                "eof occurred in violation of protocol",
+                "closed the connection unexpectedly",
+                "timed out",
+                "timeout",
+                "connection reset",
+                "remote end closed connection",
+            )
+        ):
+            return False
+        if "tool" in error_text or "function" in error_text:
+            return True
+        provider_name = str(getattr(provider, "name", "")).casefold()
+        if "ollama" in provider_name and "400" in error_text:
+            return True
+        return False
+
+    def _tool_message_reasoning_content(
+        self,
+        decision: RouteDecision,
+        completion: CompletionResult,
+    ) -> str | None:
+        if completion.reasoning_content is not None:
+            return completion.reasoning_content
+        model_config = self.config.get_model(decision.model_alias)
+        provider_config = self.config.get_provider(model_config.provider)
+        if not self._requires_reasoning_content_replay(provider_config, model_config):
+            return None
+        return ""
+
+    def _requires_reasoning_content_replay(self, provider, model) -> bool:
+        think = getattr(model, "think", None)
+        if think in (None, False):
+            return False
+        provider_name = str(getattr(provider, "name", "")).casefold()
+        model_name = str(getattr(model, "model", "")).casefold()
+        return "kimi" in provider_name or "moonshot" in provider_name or "kimi" in model_name
 
     def _stream_final_answer(
         self,
@@ -904,6 +652,7 @@ class ChatService:
         messages: list[dict[str, object]],
         on_chunk: Callable[[str], None] | None,
     ) -> ChatTurnResult:
+        messages = self.tool_protocol_adapter.messages_with_normalized_tool_call_ids(messages)
         content_parts: list[str] = []
         self._append_trace(
             kind="stream_request",
@@ -977,6 +726,15 @@ class ChatService:
             route_reason=decision.reason,
         )
         session.append(assistant_message)
+        session.append_transcript(
+            ChatMessage(
+                role="assistant",
+                content=content,
+                created_at=assistant_message.created_at,
+                model_alias=decision.model_alias,
+                route_reason=decision.reason,
+            )
+        )
 
         return ChatTurnResult(
             decision=decision,

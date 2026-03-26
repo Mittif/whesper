@@ -9,7 +9,7 @@ from whesper.client import CompletionResult, ToolCall
 from whesper.config import load_config
 from whesper.live_data import LiveContextService
 from whesper.memory import MemoryService, MemoryStore
-from whesper.session import ConversationSession
+from whesper.session import ChatMessage, ConversationSession
 from whesper.tools import ToolRegistry, ToolSpec
 
 
@@ -77,7 +77,13 @@ class ToolCallingClient:
                     ),
                 ),
             )
-        raise AssertionError("unexpected extra non-stream completion")
+        assistant_tool_message = messages[-2]
+        tool_message = messages[-1]
+        if assistant_tool_message["role"] != "assistant":
+            raise AssertionError("assistant tool call message was not preserved")
+        if tool_message["role"] != "tool":
+            raise AssertionError("tool message missing")
+        return CompletionResult(content="我查到了最新结果", raw_response={})
 
     def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
         self.stream_requests.append(
@@ -112,6 +118,23 @@ class ProviderErrorToolClient:
         if tools is not None:
             raise ProviderError("Provider rejected tools payload")
         return CompletionResult(content="fallback answer", raw_response={})
+
+    def create_chat_completion_stream(self, provider, model, messages):
+        raise AssertionError("streaming should not be called in this test")
+
+
+class UnreachableProviderToolClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
+        from whesper.client import ProviderError
+
+        self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+        raise ProviderError(
+            "Provider 'kimi' is unreachable: [SSL: UNEXPECTED_EOF_WHILE_READING] "
+            "EOF occurred in violation of protocol (_ssl.c:1081)"
+        )
 
     def create_chat_completion_stream(self, provider, model, messages):
         raise AssertionError("streaming should not be called in this test")
@@ -192,35 +215,34 @@ class ToolCallingClientWithLeakyContent:
         self.completion_requests.append(
             {"messages": messages, "tools": tools, "tool_choice": tool_choice}
         )
-        return CompletionResult(
-            content=(
-                "我来帮你查一下。\n\n"
-                "<function_calls>\n"
-                "<invoke name=\"web_search\">\n"
-                "<parameter name=\"query\">今日原油价格走势 最新行情 Brent WTI 2025</parameter>\n"
-                "</invoke>\n"
-                "</function_calls>"
-            ),
-            raw_response={},
-            tool_calls=(
-                ToolCall(
-                    tool_call_id="call_leaky_1",
-                    name="web_search",
-                    arguments_json='{"query":"今日原油价格走势 最新行情 Brent WTI 2025"}',
+        if len(self.completion_requests) == 1:
+            return CompletionResult(
+                content=(
+                    "我来帮你查一下。\n\n"
+                    "<function_calls>\n"
+                    "<invoke name=\"web_search\">\n"
+                    "<parameter name=\"query\">今日原油价格走势 最新行情 Brent WTI 2025</parameter>\n"
+                    "</invoke>\n"
+                    "</function_calls>"
                 ),
-            ),
-        )
-
-    def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
-        self.stream_requests.append(
-            {"messages": messages, "tools": tools, "tool_choice": tool_choice}
-        )
+                raw_response={},
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="call_leaky_1",
+                        name="web_search",
+                        arguments_json='{"query":"今日原油价格走势 最新行情 Brent WTI 2025"}',
+                    ),
+                ),
+            )
         assistant_tool_message = messages[-2]
         if assistant_tool_message["role"] != "assistant":
             raise AssertionError("assistant tool call message missing")
         if assistant_tool_message.get("content", "unexpected") is not None:
             raise AssertionError("tool call assistant content should not leak to follow-up")
-        yield "最终答复"
+        return CompletionResult(content="最终答复", raw_response={})
+
+    def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
+        raise AssertionError("streaming should not be called in this test")
 
 
 class MultiRoundPlanningClient:
@@ -295,6 +317,158 @@ class OllamaStructuredArgumentsClient:
         raise AssertionError("streaming should not be called in this test")
 
 
+class KimiThinkingToolClient:
+    def __init__(self) -> None:
+        self.completion_requests: list[dict[str, object]] = []
+
+    def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
+        self.completion_requests.append(
+            {"messages": messages, "tools": tools, "tool_choice": tool_choice}
+        )
+        if len(self.completion_requests) == 1:
+            return CompletionResult(
+                content="",
+                raw_response={},
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="call_kimi_1",
+                        name="web_search",
+                        arguments_json='{"query":"latest release notes"}',
+                    ),
+                ),
+                reasoning_content="先搜索最新 release notes，再整理成简短答案。",
+            )
+        assistant_tool_message = messages[-2]
+        if assistant_tool_message["role"] != "assistant":
+            raise AssertionError("assistant tool call message missing")
+        if "reasoning_content" not in assistant_tool_message:
+            raise AssertionError("reasoning_content should be preserved for Kimi thinking mode")
+        return CompletionResult(content="Kimi thinking tool follow-up ok", raw_response={})
+
+    def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
+        raise AssertionError("streaming should not be called in this test")
+
+
+class KimiLegacyToolCallIdClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
+        self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+        for message in messages:
+            if message.get("role") == "tool":
+                raise AssertionError("legacy tool trace should not be replayed from transcript history")
+        return CompletionResult(content="legacy tool trace omitted from transcript replay", raw_response={})
+
+    def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
+        raise AssertionError("streaming should not be called in this test")
+
+
+class KimiOrphanToolMessageClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
+        self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+        for message in messages:
+            if message.get("role") == "tool":
+                raise AssertionError("orphan tool message should be removed before request")
+        return CompletionResult(content="orphan tool message dropped", raw_response={})
+
+    def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
+        raise AssertionError("streaming should not be called in this test")
+
+
+class MultiStepToolLoopClient:
+    def __init__(self) -> None:
+        self.completion_requests: list[dict[str, object]] = []
+
+    def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
+        self.completion_requests.append(
+            {"messages": messages, "tools": tools, "tool_choice": tool_choice}
+        )
+        if len(self.completion_requests) == 1:
+            return CompletionResult(
+                content="",
+                raw_response={},
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="call_1",
+                        name="web_search",
+                        arguments_json='{"query":"oil market latest news"}',
+                    ),
+                ),
+            )
+        if len(self.completion_requests) == 2:
+            if messages[-1]["role"] != "tool":
+                raise AssertionError("first tool result should be present")
+            return CompletionResult(
+                content="",
+                raw_response={},
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="call_2",
+                        name="summarize_findings",
+                        arguments_json='{"topic":"oil market"}',
+                    ),
+                ),
+            )
+        return CompletionResult(content="综合来看，油价受供应和库存预期共同影响。", raw_response={})
+
+    def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
+        raise AssertionError("streaming should not be called in this test")
+
+
+class WeatherToolChainClient:
+    def __init__(self) -> None:
+        self.completion_requests: list[dict[str, object]] = []
+
+    def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
+        self.completion_requests.append(
+            {"messages": messages, "tools": tools, "tool_choice": tool_choice}
+        )
+        if len(self.completion_requests) == 1:
+            return CompletionResult(
+                content="",
+                raw_response={},
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="call_ip_1",
+                        name="get_public_ip",
+                        arguments_json="{}",
+                    ),
+                ),
+            )
+        if len(self.completion_requests) == 2:
+            return CompletionResult(
+                content="",
+                raw_response={},
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="call_geo_1",
+                        name="get_ip_location",
+                        arguments_json='{"ip":"203.0.113.10"}',
+                    ),
+                ),
+            )
+        if len(self.completion_requests) == 3:
+            return CompletionResult(
+                content="",
+                raw_response={},
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="call_weather_1",
+                        name="get_weather_by_location",
+                        arguments_json='{"location":"Shanghai, Shanghai, China"}',
+                    ),
+                ),
+            )
+        return CompletionResult(content="上海当前多云，今天最高 27.2C。", raw_response={})
+
+    def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
+        raise AssertionError("streaming should not be called in this test")
+
+
 def make_config():
     content = textwrap.dedent(
         """
@@ -340,6 +514,30 @@ def make_ollama_native_config():
     return load_config(temp_path)
 
 
+def make_kimi_thinking_config():
+    content = textwrap.dedent(
+        """
+        [scheduler]
+        chat_model = "kimi"
+        search_model = "kimi"
+
+        [providers.kimi]
+        kind = "openai_compatible"
+        base_url = "https://api.moonshot.cn/v1"
+
+        [models.kimi]
+        provider = "kimi"
+        model = "kimi-k2.5"
+        think = true
+        """
+    ).strip()
+
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        fh.write(content)
+        temp_path = fh.name
+    return load_config(temp_path)
+
+
 class ChatTests(unittest.TestCase):
     def test_send_stream_builds_assistant_message(self) -> None:
         config = make_config()
@@ -350,7 +548,7 @@ class ChatTests(unittest.TestCase):
         )
         chunks: list[str] = []
         client = FakeStreamingClient()
-        service = ChatService(config, client=client)
+        service = ChatService(config, client=client, tool_registry=ToolRegistry(specs=()))
 
         result = service.send_stream(
             session,
@@ -370,7 +568,7 @@ class ChatTests(unittest.TestCase):
             created_at="2026-01-01T00:00:00+00:00",
             updated_at="2026-01-01T00:00:00+00:00",
         )
-        service = ChatService(config, client=FakeStreamingClient())
+        service = ChatService(config, client=FakeStreamingClient(), tool_registry=ToolRegistry(specs=()))
 
         service.send_stream(session, "你好")
         session.messages[-1].content = "旧回复"
@@ -395,7 +593,7 @@ class ChatTests(unittest.TestCase):
             created_at="2026-01-01T00:00:00+00:00",
             updated_at="2026-01-01T00:00:00+00:00",
         )
-        service = ChatService(config, client=InterruptingStreamingClient())
+        service = ChatService(config, client=InterruptingStreamingClient(), tool_registry=ToolRegistry(specs=()))
         chunks: list[str] = []
 
         with self.assertRaises(GenerationInterrupted) as context:
@@ -427,6 +625,7 @@ class ChatTests(unittest.TestCase):
                 config,
                 client=client,
                 memory_service=memory_service,
+                tool_registry=ToolRegistry(specs=()),
             )
 
             service.send_stream(session, "I like jasmine tea.")
@@ -451,6 +650,7 @@ class ChatTests(unittest.TestCase):
             live_context_service=StaticLiveContextService(
                 "Live weather data for the user's current IP-based location:\n- location: Shanghai"
             ),
+            tool_registry=ToolRegistry(specs=()),
         )
 
         service.send_stream(session, "今天天气怎么样？")
@@ -459,6 +659,77 @@ class ChatTests(unittest.TestCase):
         system_prompt = client.last_messages[0]["content"]
         self.assertIn("Live weather data for the user's current IP-based location", system_prompt)
         self.assertIn("- location: Shanghai", system_prompt)
+
+    def test_send_uses_text_transcript_for_prior_turns_not_old_tool_trace(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        session.messages.extend(
+            (
+                ChatMessage(
+                    role="user",
+                    content="帮我查一下油价",
+                    created_at="2026-01-01T00:00:00+00:00",
+                ),
+                ChatMessage(
+                    role="assistant",
+                    content="",
+                    created_at="2026-01-01T00:00:01+00:00",
+                    tool_calls=[
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": '{"query":"oil price"}',
+                            },
+                        }
+                    ],
+                ),
+                ChatMessage(
+                    role="tool",
+                    content='{"result":"old search result"}',
+                    created_at="2026-01-01T00:00:02+00:00",
+                    tool_call_id="call_1",
+                ),
+                ChatMessage(
+                    role="assistant",
+                    content="之前我查到油价有波动。",
+                    created_at="2026-01-01T00:00:03+00:00",
+                    model_alias="chat",
+                ),
+            )
+        )
+        session.transcript_messages.extend(
+            (
+                ChatMessage(
+                    role="user",
+                    content="帮我查一下油价",
+                    created_at="2026-01-01T00:00:00+00:00",
+                ),
+                ChatMessage(
+                    role="assistant",
+                    content="之前我查到油价有波动。",
+                    created_at="2026-01-01T00:00:03+00:00",
+                    model_alias="chat",
+                ),
+            )
+        )
+        client = CapturingClient()
+        service = ChatService(config, client=client, tool_registry=ToolRegistry(specs=()))
+
+        service.send_stream(session, "再总结一下", on_chunk=lambda chunk: None)
+
+        assert client.last_messages is not None
+        non_system_messages = client.last_messages[1:]
+        self.assertEqual(
+            [message["role"] for message in non_system_messages],
+            ["user", "assistant", "user"],
+        )
+        self.assertNotIn("tool_calls", non_system_messages[1])
 
     def test_send_stream_executes_tool_calls_and_streams_final_answer(self) -> None:
         config = make_config()
@@ -502,13 +773,13 @@ class ChatTests(unittest.TestCase):
             on_chunk=chunks.append,
         )
 
-        self.assertEqual(chunks, ["我查到了", "最新结果"])
+        self.assertEqual(chunks, ["我查到了最新结果"])
         self.assertEqual(result.assistant_message.content, "我查到了最新结果")
-        self.assertEqual(len(client.completion_requests), 1)
+        self.assertEqual(len(client.completion_requests), 2)
         self.assertTrue(client.completion_requests[0]["tools"])
         self.assertEqual(client.completion_requests[0]["tool_choice"], "required")
-        self.assertEqual(len(client.stream_requests), 1)
-        final_messages = client.stream_requests[0]["messages"]
+        self.assertEqual(len(client.stream_requests), 0)
+        final_messages = client.completion_requests[1]["messages"]
         self.assertEqual(final_messages[-2]["role"], "assistant")
         self.assertEqual(final_messages[-2]["tool_calls"][0]["function"]["name"], "web_search")
         self.assertEqual(final_messages[-1]["role"], "tool")
@@ -526,7 +797,22 @@ class ChatTests(unittest.TestCase):
             updated_at="2026-01-01T00:00:00+00:00",
         )
         client = DirectAnswerToolClient()
-        service = ChatService(config, client=client)
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="web_search",
+                    description="Search the web",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {"result": "ok"},
+                ),
+            )
+        )
+        service = ChatService(config, client=client, tool_registry=registry)
 
         chunks: list[str] = []
         result = service.send_stream(
@@ -577,6 +863,22 @@ class ChatTests(unittest.TestCase):
         self.assertIsNotNone(client.calls[0]["tools"])
         self.assertIsNone(client.calls[1]["tools"])
         self.assertIsNone(client.calls[2]["tools"])
+
+    def test_send_does_not_disable_tools_for_unreachable_provider_errors(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = UnreachableProviderToolClient()
+        service = ChatService(config, client=client)
+
+        with self.assertRaisesRegex(Exception, "unreachable"):
+            service.send(session, "帮我查一下最新 release notes", mode_override="search")
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertIsNotNone(client.calls[0]["tools"])
 
     def test_send_retries_without_tool_choice_when_client_signature_rejects_it(self) -> None:
         config = make_config()
@@ -668,6 +970,117 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(result.assistant_message.content, "ollama follow-up ok")
         self.assertEqual(len(client.completion_requests), 2)
 
+    def test_send_preserves_reasoning_content_for_kimi_tool_followup(self) -> None:
+        config = make_kimi_thinking_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = KimiThinkingToolClient()
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="web_search",
+                    description="Search the web",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {
+                        "query": arguments["query"],
+                        "result": "Found release notes",
+                    },
+                ),
+            )
+        )
+        service = ChatService(
+            config,
+            client=client,
+            tool_registry=registry,
+        )
+
+        result = service.send(session, "帮我查一下最新 release notes", mode_override="search")
+
+        self.assertEqual(result.assistant_message.content, "Kimi thinking tool follow-up ok")
+        self.assertEqual(len(client.completion_requests), 2)
+        self.assertEqual(
+            session.messages[1].reasoning_content,
+            "先搜索最新 release notes，再整理成简短答案。",
+        )
+
+    def test_send_omits_legacy_blank_tool_call_ids_from_transcript_replay(self) -> None:
+        config = make_kimi_thinking_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        session.messages.extend(
+            (
+                ChatMessage(
+                    role="assistant",
+                    content="",
+                    created_at="2026-01-01T00:00:01+00:00",
+                    tool_calls=[
+                        {
+                            "id": "",
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": '{"query":"old query"}',
+                            },
+                        }
+                    ],
+                ),
+                ChatMessage(
+                    role="tool",
+                    content='{"result":"old result"}',
+                    created_at="2026-01-01T00:00:02+00:00",
+                    tool_call_id="",
+                ),
+            )
+        )
+        session.transcript_messages.append(
+            ChatMessage(
+                role="user",
+                content="旧问题",
+                created_at="2026-01-01T00:00:00+00:00",
+            )
+        )
+        client = KimiLegacyToolCallIdClient()
+        service = ChatService(config, client=client)
+
+        result = service.send(session, "继续", mode_override="chat")
+
+        self.assertEqual(result.assistant_message.content, "legacy tool trace omitted from transcript replay")
+        self.assertEqual(len(client.calls), 1)
+
+    def test_send_drops_orphan_tool_messages_before_request(self) -> None:
+        config = make_kimi_thinking_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        session.messages.append(
+            ChatMessage(
+                role="tool",
+                content='{"result":"orphan"}',
+                created_at="2026-01-01T00:00:01+00:00",
+                tool_call_id="",
+            )
+        )
+        client = KimiOrphanToolMessageClient()
+        service = ChatService(config, client=client)
+
+        result = service.send(session, "继续", mode_override="chat")
+
+        self.assertEqual(result.assistant_message.content, "orphan tool message dropped")
+        self.assertEqual(len(client.calls), 1)
+
     def test_send_stream_hides_tool_call_content_from_user_and_followup(self) -> None:
         config = make_config()
         session = ConversationSession(
@@ -711,7 +1124,7 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(chunks, ["最终答复"])
         self.assertEqual(result.assistant_message.content, "最终答复")
         self.assertEqual(session.messages[1].content, "")
-        self.assertEqual(len(client.stream_requests), 1)
+        self.assertEqual(len(client.stream_requests), 0)
 
     def test_send_stream_continues_past_interim_planning_text_before_final_answer(self) -> None:
         config = make_config()
@@ -761,11 +1174,192 @@ class ChatTests(unittest.TestCase):
             result.assistant_message.content,
             "今天原油价格小幅上涨，主要受供应收紧预期影响。",
         )
-        self.assertEqual(len(client.completion_requests), 2)
-        self.assertEqual(client.stream_calls, 1)
+        self.assertEqual(len(client.completion_requests), 3)
+        self.assertEqual(client.stream_calls, 0)
         self.assertEqual(session.messages[1].role, "assistant")
         self.assertEqual(session.messages[1].content, "")
         self.assertEqual(session.messages[2].role, "tool")
+
+    def test_send_supports_multiple_post_tool_rounds(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = MultiStepToolLoopClient()
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="web_search",
+                    description="Search the web",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {
+                        "query": arguments["query"],
+                        "result": "Oil prices rose after new supply headlines",
+                    },
+                ),
+                ToolSpec(
+                    name="summarize_findings",
+                    description="Summarize search results",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"topic": {"type": "string"}},
+                        "required": ["topic"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {
+                        "topic": arguments["topic"],
+                        "summary": "Supply concerns and inventory expectations both mattered",
+                    },
+                ),
+            )
+        )
+        service = ChatService(
+            config,
+            client=client,
+            tool_registry=registry,
+        )
+
+        result = service.send(session, "分析一下最近油价变化原因", mode_override="search")
+
+        self.assertEqual(result.assistant_message.content, "综合来看，油价受供应和库存预期共同影响。")
+        self.assertEqual(len(client.completion_requests), 3)
+        self.assertEqual(session.messages[1].role, "assistant")
+        self.assertEqual(session.messages[2].role, "tool")
+        self.assertEqual(session.messages[3].role, "assistant")
+        self.assertEqual(session.messages[4].role, "tool")
+        self.assertEqual(session.messages[5].role, "assistant")
+
+    def test_send_stream_emits_agent_steps_for_multi_tool_loop(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = MultiStepToolLoopClient()
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="web_search",
+                    description="Search the web",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {
+                        "query": arguments["query"],
+                        "result": "Oil prices rose after new supply headlines",
+                    },
+                ),
+                ToolSpec(
+                    name="summarize_findings",
+                    description="Summarize search results",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"topic": {"type": "string"}},
+                        "required": ["topic"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {
+                        "topic": arguments["topic"],
+                        "summary": "Supply concerns and inventory expectations both mattered",
+                    },
+                ),
+            )
+        )
+        service = ChatService(config, client=client, tool_registry=registry)
+
+        steps: list[tuple[str, str | None]] = []
+        result = service.send_stream(
+            session,
+            "分析一下最近油价变化原因",
+            mode_override="search",
+            on_chunk=lambda chunk: None,
+            on_step=lambda step: steps.append((step.kind, step.tool_name)),
+        )
+
+        self.assertEqual(result.assistant_message.content, "综合来看，油价受供应和库存预期共同影响。")
+        self.assertEqual(
+            steps,
+            [
+                ("tool_call", "web_search"),
+                ("tool_result", "web_search"),
+                ("tool_call", "summarize_findings"),
+                ("tool_result", "summarize_findings"),
+                ("final", None),
+            ],
+        )
+
+    def test_send_supports_multi_step_weather_tool_chain(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = WeatherToolChainClient()
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="get_public_ip",
+                    description="Get public IP",
+                    parameters_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                    handler=lambda arguments: {"public_ip": "203.0.113.10"},
+                ),
+                ToolSpec(
+                    name="get_ip_location",
+                    description="Get IP location",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"ip": {"type": "string"}},
+                        "required": ["ip"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {
+                        "public_ip": arguments["ip"],
+                        "location": "Shanghai, Shanghai, China",
+                        "timezone": "Asia/Shanghai",
+                    },
+                ),
+                ToolSpec(
+                    name="get_weather_by_location",
+                    description="Get weather by location",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {
+                        "location": arguments["location"],
+                        "current_condition": "Partly cloudy",
+                        "today_high_c": 27.2,
+                    },
+                ),
+            )
+        )
+        service = ChatService(
+            config,
+            client=client,
+            tool_registry=registry,
+        )
+
+        result = service.send(session, "我这里今天天气怎么样？", mode_override="search")
+
+        self.assertEqual(result.assistant_message.content, "上海当前多云，今天最高 27.2C。")
+        self.assertEqual(len(client.completion_requests), 4)
+        self.assertEqual(session.messages[1].tool_calls[0]["function"]["name"], "get_public_ip")
+        self.assertEqual(session.messages[3].tool_calls[0]["function"]["name"], "get_ip_location")
+        self.assertEqual(session.messages[5].tool_calls[0]["function"]["name"], "get_weather_by_location")
 
 
 if __name__ == "__main__":

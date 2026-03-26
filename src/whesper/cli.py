@@ -10,6 +10,7 @@ import time
 import sys
 from typing import Callable
 
+from whesper.agent_types import AgentStep
 from whesper.chat import ChatService, ChatTurnResult, GenerationInterrupted
 from whesper.client import ProviderError
 from whesper.commands import (
@@ -207,11 +208,26 @@ def clone_session(
                 created_at=message.created_at,
                 model_alias=message.model_alias,
                 route_reason=message.route_reason,
+                reasoning_content=message.reasoning_content,
                 name=message.name,
                 tool_call_id=message.tool_call_id,
                 tool_calls=copy.deepcopy(message.tool_calls),
             )
             for message in session.messages
+        ],
+        transcript_messages=[
+            ChatMessage(
+                role=message.role,
+                content=message.content,
+                created_at=message.created_at,
+                model_alias=message.model_alias,
+                route_reason=message.route_reason,
+                reasoning_content=message.reasoning_content,
+                name=message.name,
+                tool_call_id=message.tool_call_id,
+                tool_calls=copy.deepcopy(message.tool_calls),
+            )
+            for message in session.transcript_messages
         ],
     )
 
@@ -403,6 +419,22 @@ def print_cli_hint(message: str, *, output_stream: object = sys.stdout) -> None:
     print(colorize(message, SLATE, DIM), file=output_stream)
 
 
+def describe_agent_step(step: AgentStep) -> str:
+    if step.kind == "tool_call" and step.tool_name:
+        return f"whesper> running {step.tool_name}"
+    if step.kind == "tool_result" and step.tool_name:
+        if step.is_error:
+            return f"whesper> {step.tool_name} failed"
+        return f"whesper> received {step.tool_name}"
+    if step.kind == "planning_retry":
+        return "whesper> replanning"
+    if step.kind == "error_recovery":
+        return "whesper> recovering"
+    if step.kind == "final":
+        return "whesper> answering"
+    return "whesper> thinking"
+
+
 def clear_screen(*, output_stream: object = sys.stdout) -> None:
     print("\033[2J\033[H", end="", flush=True, file=output_stream)
 
@@ -562,11 +594,15 @@ def run_streaming_turn(
             indicator.begin_stream(model_alias=decision.model_alias)
             stream_printer(chunk, output_stream=output_stream)
 
+        def handle_step(step: AgentStep) -> None:
+            indicator.set_label(describe_agent_step(step))
+
         if retry:
             result = chat_service.retry_stream(
                 session,
                 mode_override=mode_override,
                 on_chunk=handle_chunk_with_meta,
+                on_step=handle_step,
             )
         else:
             if user_text is None:
@@ -576,6 +612,7 @@ def run_streaming_turn(
                 user_text,
                 mode_override=mode_override,
                 on_chunk=handle_chunk_with_meta,
+                on_step=handle_step,
             )
         indicator.stop()
         store.save(session)
@@ -602,6 +639,15 @@ def run_streaming_turn(
                 "Generation interrupted before any reply was received.",
                 output_stream=output_stream,
             )
+    except KeyboardInterrupt:
+        if indicator is not None:
+            indicator.stop()
+        store.save(session)
+        print(file=output_stream)
+        print_cli_hint(
+            "Request interrupted before the provider finished responding.",
+            output_stream=output_stream,
+        )
     except (ConfigError, ProviderError) as exc:
         if indicator is not None:
             indicator.stop()
@@ -927,6 +973,7 @@ class StreamingIndicator:
         self._started_stream = False
         self.started_at = time.perf_counter()
         self.first_token_at: float | None = None
+        self._label_lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -954,15 +1001,21 @@ class StreamingIndicator:
         if not self._started_stream:
             print("\r\033[2K", end="", flush=True, file=self.output_stream)
 
+    def set_label(self, label: str) -> None:
+        with self._label_lock:
+            self.label = label
+
     def _run(self) -> None:
         frames = ("   ", ".  ", ".. ", "...")
         index = 0
         while True:
             if self._stop_event.is_set():
                 break
+            with self._label_lock:
+                label = self.label
             print(
                 colorize(
-                    f"\r\033[2K{self.label}{frames[index % len(frames)]}",
+                    f"\r\033[2K{label}{frames[index % len(frames)]}",
                     GOLD,
                     DIM,
                 ),

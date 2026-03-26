@@ -9,10 +9,12 @@ from whesper.cli import (
     build_footer_meta,
     ensure_valid_session_model,
     handle_command,
+    run_streaming_turn,
 )
 from whesper.chat import ChatService, ChatTurnResult
 from whesper.client import CompletionResult
 from whesper.commands import ParsedCommand
+from whesper.tools import ToolRegistry
 from whesper.config import (
     AppConfig,
     AppSettings,
@@ -21,6 +23,7 @@ from whesper.config import (
     PersonaConfig,
     ProviderConfig,
     SchedulerConfig,
+    ShellSandboxSettings,
 )
 from whesper.memory import MemoryStore
 from whesper.router import RouteDecision
@@ -54,12 +57,21 @@ class DebugClient:
         return CompletionResult(content="debug answer", raw_response={})
 
 
+class InterruptingToolProbeClient:
+    def create_chat_completion_stream(self, provider, model, messages):
+        raise AssertionError("streaming should not be called in this test")
+
+    def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
+        raise KeyboardInterrupt()
+
+
 def build_config() -> AppConfig:
     return AppConfig(
         app=AppSettings(),
         persona=PersonaConfig(),
         scheduler=SchedulerConfig(chat_model="local_chat"),
         live_context=LiveContextSettings(),
+        shell_sandbox=ShellSandboxSettings(),
         providers={
             "local": ProviderConfig(
                 name="local",
@@ -80,10 +92,10 @@ def build_config() -> AppConfig:
 
 class CliTests(unittest.TestCase):
     def build_chat_service(self, config: AppConfig) -> ChatService:
-        return ChatService(config, client=FakeStreamingClient())
+        return ChatService(config, client=FakeStreamingClient(), tool_registry=ToolRegistry(specs=()))
 
     def build_interrupting_chat_service(self, config: AppConfig) -> ChatService:
-        return ChatService(config, client=InterruptingStreamingClient())
+        return ChatService(config, client=InterruptingStreamingClient(), tool_registry=ToolRegistry(specs=()))
 
     def build_debug_chat_service(
         self,
@@ -91,7 +103,26 @@ class CliTests(unittest.TestCase):
         *,
         trace_store: TraceStore | None = None,
     ) -> ChatService:
-        return ChatService(config, client=DebugClient(), trace_store=trace_store)
+        return ChatService(config, client=DebugClient(), trace_store=trace_store, tool_registry=ToolRegistry(specs=()))
+
+    def build_interrupting_tool_probe_service(self, config: AppConfig) -> ChatService:
+        from whesper.tools import ToolSpec
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="web_search",
+                    description="Search the web",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {"result": "ok"},
+                ),
+            )
+        )
+        return ChatService(config, client=InterruptingToolProbeClient(), tool_registry=registry)
 
     def test_invalid_model_alias_is_handled_without_crash(self) -> None:
         config = build_config()
@@ -468,6 +499,27 @@ class CliTests(unittest.TestCase):
         self.assertTrue(outcome.handled)
         self.assertIn("Generation interrupted. Partial reply saved.", rendered)
         self.assertEqual(session.messages[-1].content, "partial")
+
+    def test_run_streaming_turn_handles_keyboard_interrupt_during_tool_probe(self) -> None:
+        config = build_config()
+        config.scheduler.search_model = "local_chat"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            session = store.load("main")
+            output = io.StringIO()
+
+            run_streaming_turn(
+                self.build_interrupting_tool_probe_service(config),
+                store,
+                session,
+                user_text="帮我查一下最新 release notes",
+                mode_override="search",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertIn("Request interrupted before the provider finished responding.", rendered)
+        self.assertEqual(session.messages[-1].role, "user")
 
     def test_copy_last_prints_last_assistant_reply(self) -> None:
         config = build_config()

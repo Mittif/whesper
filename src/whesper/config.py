@@ -89,11 +89,21 @@ class LiveContextSettings:
 
 
 @dataclass(slots=True)
+class ShellSandboxSettings:
+    enabled: bool = False
+    timeout_seconds: int = 10
+    max_output_chars: int = 8000
+    allowed_roots: tuple[str, ...] = (".",)
+    allowed_command_prefixes: tuple[tuple[str, ...], ...] = ()
+
+
+@dataclass(slots=True)
 class AppConfig:
     app: AppSettings
     persona: PersonaConfig
     scheduler: SchedulerConfig
     live_context: LiveContextSettings
+    shell_sandbox: ShellSandboxSettings
     providers: dict[str, ProviderConfig]
     models: dict[str, ModelConfig]
     source_path: Path
@@ -169,6 +179,26 @@ def _optional_think(value: Any) -> bool | str | None:
     raise ConfigError("Expected 'think' to be a boolean or string.")
 
 
+def _parse_shell_command_prefixes(raw: Any) -> tuple[tuple[str, ...], ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError(
+            "shell_sandbox.allowed_command_prefixes must be a list of string lists."
+        )
+
+    prefixes: list[tuple[str, ...]] = []
+    for item in raw:
+        if not isinstance(item, list) or not item or not all(
+            isinstance(part, str) and part.strip() for part in item
+        ):
+            raise ConfigError(
+                "shell_sandbox.allowed_command_prefixes entries must be non-empty string lists."
+            )
+        prefixes.append(tuple(part.strip() for part in item))
+    return tuple(prefixes)
+
+
 def _parse_live_context_endpoints(raw: Any, section_name: str) -> dict[str, LiveContextEndpointConfig]:
     if raw is None:
         return {}
@@ -216,6 +246,7 @@ def load_config(path: str | Path) -> AppConfig:
     app_raw = raw.get("app", {})
     persona_raw = raw.get("persona", {})
     live_context_raw = raw.get("live_context", {})
+    shell_sandbox_raw = raw.get("shell_sandbox", {})
     scheduler_raw = _require_table(raw, "scheduler")
     providers_raw = _require_table(raw, "providers")
     models_raw = _require_table(raw, "models")
@@ -246,6 +277,8 @@ def load_config(path: str | Path) -> AppConfig:
     )
     if live_context_raw and not isinstance(live_context_raw, dict):
         raise ConfigError("Invalid [live_context] section in config.")
+    if shell_sandbox_raw and not isinstance(shell_sandbox_raw, dict):
+        raise ConfigError("Invalid [shell_sandbox] section in config.")
     live_context = LiveContextSettings(
         custom_api=_parse_live_context_endpoints(
             live_context_raw.get("custom_api") if isinstance(live_context_raw, dict) else None,
@@ -254,6 +287,25 @@ def load_config(path: str | Path) -> AppConfig:
         status_api=_parse_live_context_endpoints(
             live_context_raw.get("status_api") if isinstance(live_context_raw, dict) else None,
             "status_api",
+        ),
+    )
+    shell_sandbox = ShellSandboxSettings(
+        enabled=bool(shell_sandbox_raw.get("enabled", False))
+        if isinstance(shell_sandbox_raw, dict)
+        else False,
+        timeout_seconds=int(shell_sandbox_raw.get("timeout_seconds", 10))
+        if isinstance(shell_sandbox_raw, dict)
+        else 10,
+        max_output_chars=int(shell_sandbox_raw.get("max_output_chars", 8000))
+        if isinstance(shell_sandbox_raw, dict)
+        else 8000,
+        allowed_roots=_to_tuple(shell_sandbox_raw.get("allowed_roots"))
+        if isinstance(shell_sandbox_raw, dict)
+        else (".",),
+        allowed_command_prefixes=_parse_shell_command_prefixes(
+            shell_sandbox_raw.get("allowed_command_prefixes")
+            if isinstance(shell_sandbox_raw, dict)
+            else None
         ),
     )
 
@@ -303,6 +355,7 @@ def load_config(path: str | Path) -> AppConfig:
         persona=persona,
         scheduler=scheduler,
         live_context=live_context,
+        shell_sandbox=shell_sandbox,
         providers=providers,
         models=models,
         source_path=config_path,

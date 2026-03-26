@@ -1,0 +1,10 @@
+{
+  "include": ["src", "tests"],
+  "extraPaths": ["src"],
+  "exclude": [
+    ".venv",
+    ".whesper",
+    "src/whesper.egg-info",
+    "**/__pycache__"
+  ]
+}

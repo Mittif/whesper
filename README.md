@@ -1,48 +1,70 @@
 # Whesper
 
-Whesper is a Python-first companion agent prototype focused on natural conversation, configurable personas, and multi-model routing.
+Whesper is a Python-first CLI companion focused on natural conversation, configurable personas, memory, and multi-model routing.
 
-The current repository ships a local CLI experience first, so the core dialogue loop can be tested quickly before moving to richer surfaces such as a web app.
+The project is local-first: you can run it with Ollama on your machine, with Kimi, or with a local chat model plus Kimi as a search fallback.
 
-## Current Scope
+## What It Can Do
 
-- Interactive CLI chat experience
-- Configurable persona and system prompt
-- Multi-model routing with provider abstraction
-- Local Ollama support
-- Remote Kimi support
-- Session persistence and command-driven model switching
-- Local memory capture and recall for user facts and preferences
-
-## Features
-
-- Claude Code-inspired terminal UX with history, completion, and slash commands
-- Streaming responses with a lightweight `thinking...` state
-- Per-session model selection via `/model`
-- Local memory extraction from user messages plus `/memory`, `/remember`, `/forget`
-- Config-driven provider setup through `TOML`
-- Python-first implementation built around a small, inspectable codebase
+- Interactive CLI chat with streaming responses
+- Session persistence, session switching, rename, retry, and transcript history
+- Per-session model pinning with `/model` and route-mode override with `/mode`
+- Local memory capture and recall with `/memory`, `/remember`, and `/forget`
+- Search / live-data assisted turns for things like weather, news, docs, and URLs
+- Config-driven providers through `TOML`
+- Local Ollama support and optional Moonshot/Kimi support
 
 ## Quick Start
 
-1. Create a virtual environment and install the package:
+### Recommended: one-command bootstrap
+
+Whesper ships with a bootstrap script that creates a virtual environment, installs the package, and writes a usable `whesper.toml`.
+
+```bash
+./scripts/bootstrap.sh
+```
+
+The script will choose a runnable setup automatically:
+
+- If you already have a local Ollama model, it writes a local-first config
+- If no local model is found but `WHESPER_KIMI_API_KEY` is set, it writes a Kimi-only config
+- If neither is available, it stops with clear next steps instead of generating a broken config
+
+Useful environment variables:
+
+```bash
+WHESPER_LOCAL_MODEL="qwen3.5:14b" ./scripts/bootstrap.sh
+WHESPER_KIMI_API_KEY="your-api-key" ./scripts/bootstrap.sh
+```
+
+After bootstrap:
+
+```bash
+.venv/bin/python -m whesper --config whesper.toml chat
+```
+
+### Manual setup
+
+If you prefer to configure things yourself:
+
+1. Create a virtual environment and install:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -e .
 ```
 
-2. Create your local config from the example:
+2. Create your local config:
 
 ```bash
 cp whesper.example.toml whesper.toml
 ```
 
-3. Export your Kimi API key if you want to use the Kimi model:
+3. Update `whesper.toml`:
 
-```bash
-export WHESPER_KIMI_API_KEY="your-api-key"
-```
+- Set `[models.local_chat].model` to a real Ollama model name if you want local chat
+- Export `WHESPER_KIMI_API_KEY` if you want to use Kimi
+- If you are running fully local, set `search_model = "local_chat"` under `[scheduler]`
 
 4. Start the CLI:
 
@@ -58,6 +80,8 @@ export WHESPER_KIMI_API_KEY="your-api-key"
 - `/model auto`
 - `/mode auto`
 - `/mode reasoning`
+- `/search latest AI news`
+- `/trace`
 - `/status`
 - `/info`
 - `/retry`
@@ -74,32 +98,45 @@ export WHESPER_KIMI_API_KEY="your-api-key"
 
 ## Configuration
 
-The repository includes a tracked example config:
+Tracked example config:
 
 - [whesper.example.toml](whesper.example.toml)
 
-Your real local config should live in:
+Real local config:
 
 - `whesper.toml`
 
 `whesper.toml` is ignored by git so local secrets and internal endpoints stay out of version control.
 
-## Providers
+Default model aliases in the example config:
 
-- `local_chat` is configured for an Ollama-compatible local or private endpoint
-- `kimi-k2.5` is configured for Moonshot/Kimi via `WHESPER_KIMI_API_KEY`
+- `local_chat`: local Ollama chat model
+- `kimi-k2.5`: Moonshot/Kimi via `WHESPER_KIMI_API_KEY`
+
+Optional live-data endpoint sections are also supported in config:
+
+- `live_context.status_api.*`
+- `live_context.custom_api.*`
+
+Leave them empty if you want a narrow default setup.
+
+## Runtime Notes
+
+- Python `3.12+` is required
+- Ollama is optional, but recommended for local-first usage
+- Kimi is optional, but useful as a remote fallback
+- Session and memory data are stored under `.whesper/`
+- `whesper.toml` is local-only and should not be committed
 
 ## Project Status
 
-Whesper is currently in an MVP / prototype phase. The main focus right now is:
+Whesper is still in an MVP / prototype phase. The current focus is:
 
-- making the conversation loop solid
-- improving CLI usability
-- validating multi-model behavior before expanding into a web application
+- making the conversation loop and tool path solid
+- improving CLI usability and deployment ergonomics
+- validating local-first and hybrid model routing before expanding beyond CLI
 
 ## Development
-
-This README is intentionally written as a project-facing overview for GitHub readers.
 
 Local development notes can live in an ignored file such as:
 

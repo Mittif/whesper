@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from whesper.client import (
+    _extract_reasoning_content,
     _extract_stream_text,
     _extract_tool_calls,
     _extract_tool_calls_from_text,
@@ -85,6 +86,27 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0].name, "web_search")
         self.assertIn("Brent WTI 2025", tool_calls[0].arguments_json)
+
+    def test_extract_reasoning_content_from_openai_response(self) -> None:
+        provider = ProviderConfig(
+            name="kimi",
+            kind="openai_compatible",
+            base_url="https://api.moonshot.cn/v1",
+        )
+        raw = {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "reasoning_content": "先搜索，再总结。",
+                    }
+                }
+            ]
+        }
+
+        reasoning_content = _extract_reasoning_content(provider, raw)
+
+        self.assertEqual(reasoning_content, "先搜索，再总结。")
 
 
 if __name__ == "__main__":
