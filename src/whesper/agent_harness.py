@@ -15,6 +15,7 @@ from whesper.tools import ToolExecutionError
 class HarnessRunResult:
     completion: AgentCompletion
     used_tools: bool = False
+    final_messages: list[dict[str, object]] | None = None
     steps: list[AgentStep] = field(default_factory=list)
 
 
@@ -211,6 +212,7 @@ class AgentHarness:
             return HarnessRunResult(
                 completion=completion,
                 used_tools=state.used_tools,
+                final_messages=list(state.working_messages) if state.used_tools else None,
                 steps=state.steps,
             )
 

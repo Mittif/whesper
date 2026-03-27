@@ -242,7 +242,16 @@ class ToolCallingClientWithLeakyContent:
         return CompletionResult(content="最终答复", raw_response={})
 
     def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
-        raise AssertionError("streaming should not be called in this test")
+        self.stream_requests.append(
+            {"messages": messages, "tools": tools, "tool_choice": tool_choice}
+        )
+        assistant_tool_message = messages[-2]
+        if assistant_tool_message["role"] != "assistant":
+            raise AssertionError("assistant tool call message missing in stream request")
+        if assistant_tool_message.get("content", "unexpected") is not None:
+            raise AssertionError("tool call assistant content should stay hidden in stream request")
+        yield "最终"
+        yield "答复"
 
 
 class MultiRoundPlanningClient:
@@ -382,6 +391,7 @@ class KimiOrphanToolMessageClient:
 class MultiStepToolLoopClient:
     def __init__(self) -> None:
         self.completion_requests: list[dict[str, object]] = []
+        self.stream_calls = 0
 
     def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
         self.completion_requests.append(
@@ -416,7 +426,8 @@ class MultiStepToolLoopClient:
         return CompletionResult(content="综合来看，油价受供应和库存预期共同影响。", raw_response={})
 
     def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
-        raise AssertionError("streaming should not be called in this test")
+        self.stream_calls += 1
+        yield "综合来看，油价受供应和库存预期共同影响。"
 
 
 class WeatherToolChainClient:
@@ -773,13 +784,13 @@ class ChatTests(unittest.TestCase):
             on_chunk=chunks.append,
         )
 
-        self.assertEqual(chunks, ["我查到了最新结果"])
+        self.assertEqual(chunks, ["我查到了", "最新结果"])
         self.assertEqual(result.assistant_message.content, "我查到了最新结果")
         self.assertEqual(len(client.completion_requests), 2)
         self.assertTrue(client.completion_requests[0]["tools"])
         self.assertEqual(client.completion_requests[0]["tool_choice"], "required")
-        self.assertEqual(len(client.stream_requests), 0)
-        final_messages = client.completion_requests[1]["messages"]
+        self.assertEqual(len(client.stream_requests), 1)
+        final_messages = client.stream_requests[0]["messages"]
         self.assertEqual(final_messages[-2]["role"], "assistant")
         self.assertEqual(final_messages[-2]["tool_calls"][0]["function"]["name"], "web_search")
         self.assertEqual(final_messages[-1]["role"], "tool")
@@ -1121,10 +1132,10 @@ class ChatTests(unittest.TestCase):
             on_chunk=chunks.append,
         )
 
-        self.assertEqual(chunks, ["最终答复"])
+        self.assertEqual(chunks, ["最终", "答复"])
         self.assertEqual(result.assistant_message.content, "最终答复")
         self.assertEqual(session.messages[1].content, "")
-        self.assertEqual(len(client.stream_requests), 0)
+        self.assertEqual(len(client.stream_requests), 1)
 
     def test_send_stream_continues_past_interim_planning_text_before_final_answer(self) -> None:
         config = make_config()
@@ -1175,7 +1186,7 @@ class ChatTests(unittest.TestCase):
             "今天原油价格小幅上涨，主要受供应收紧预期影响。",
         )
         self.assertEqual(len(client.completion_requests), 3)
-        self.assertEqual(client.stream_calls, 0)
+        self.assertEqual(client.stream_calls, 1)
         self.assertEqual(session.messages[1].role, "assistant")
         self.assertEqual(session.messages[1].content, "")
         self.assertEqual(session.messages[2].role, "tool")
@@ -1298,6 +1309,7 @@ class ChatTests(unittest.TestCase):
                 ("final", None),
             ],
         )
+        self.assertEqual(client.stream_calls, 1)
 
     def test_send_supports_multi_step_weather_tool_chain(self) -> None:
         config = make_config()

@@ -23,7 +23,13 @@ from whesper.commands import (
 from whesper.config import AppConfig, ConfigError, load_config
 from whesper.memory import MemoryService, MemoryStore
 from whesper.router import select_model
-from whesper.session import ChatMessage, ConversationSession, SessionStore, utc_now_iso
+from whesper.session import (
+    ChatMessage,
+    ConversationSession,
+    SessionStore,
+    is_transcript_message,
+    utc_now_iso,
+)
 from whesper.trace import TraceStore
 
 
@@ -90,7 +96,12 @@ def print_history(
     *,
     output_stream: object = sys.stdout,
 ) -> None:
-    history = session.messages[-limit:]
+    history_source = session.transcript_messages
+    if not history_source:
+        history_source = [
+            message for message in session.messages if is_transcript_message(message)
+        ]
+    history = history_source[-limit:]
     if not history:
         print("Session is empty.", file=output_stream)
         return

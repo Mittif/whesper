@@ -16,6 +16,7 @@ from whesper.config import AppConfig, LiveContextEndpointConfig
 USER_AGENT = "Whesper/0.1"
 WEATHER_FORECAST_DAYS = 8
 WTTR_BASE_URL = "https://wttr.in"
+WTTR_FETCH_ATTEMPTS = 2
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
 CITY_PATTERN = re.compile(
     r"(?P<place>[A-Za-z][A-Za-z .'-]{1,40}|[\u4e00-\u9fff][\u4e00-\u9fffA-Za-z·\-\s]{0,20})"
@@ -1637,26 +1638,33 @@ def lookup_weather_for_place(fetch_json: JsonFetcher, timeout_seconds: int, plac
 
 
 def _geocode_place(fetch_json: JsonFetcher, timeout_seconds: int, place: str) -> dict[str, object]:
-    response = fetch_json(
-        "https://geocoding-api.open-meteo.com/v1/search?"
-        + parse.urlencode({"name": place, "count": 1, "language": "en", "format": "json"}),
-        timeout_seconds,
-    )
-    results = response.get("results")
-    if not isinstance(results, list) or not results:
-        raise RuntimeError(f"No geocoding result for {place!r}")
-    first = results[0]
-    name = str(first.get("name", place))
-    admin1 = str(first.get("admin1", ""))
-    country = str(first.get("country", ""))
-    label = ", ".join(part for part in (name, admin1, country) if part)
-    return {
-        "label": label or name,
-        "country": country or "Unknown",
-        "latitude": float(first["latitude"]),
-        "longitude": float(first["longitude"]),
-        "timezone": str(first.get("timezone", "UTC")),
-    }
+    attempted_languages: list[str] = []
+    for language in _geocoding_language_candidates(place):
+        response = fetch_json(
+            "https://geocoding-api.open-meteo.com/v1/search?"
+            + parse.urlencode(
+                {"name": place, "count": 1, "language": language, "format": "json"}
+            ),
+            timeout_seconds,
+        )
+        results = response.get("results")
+        attempted_languages.append(language)
+        if not isinstance(results, list) or not results:
+            continue
+        first = results[0]
+        name = str(first.get("name", place))
+        admin1 = str(first.get("admin1", ""))
+        country = str(first.get("country", ""))
+        label = ", ".join(part for part in (name, admin1, country) if part)
+        return {
+            "label": label or name,
+            "country": country or "Unknown",
+            "latitude": float(first["latitude"]),
+            "longitude": float(first["longitude"]),
+            "timezone": str(first.get("timezone", "UTC")),
+        }
+    tried = ", ".join(attempted_languages) or "none"
+    raise RuntimeError(f"No geocoding result for {place!r} across languages: {tried}")
 
 
 def _fetch_weather_report(
@@ -1669,10 +1677,121 @@ def _fetch_weather_report(
     location_label: str,
     public_ip: str | None = None,
 ) -> WeatherReport:
-    weather_url = _wttr_weather_url(latitude=latitude, longitude=longitude)
-    weather_response = fetch_json(weather_url, timeout_seconds)
+    wttr_error: Exception | None = None
+    try:
+        weather_response = _fetch_wttr_weather_response(
+            fetch_json,
+            timeout_seconds,
+            latitude=latitude,
+            longitude=longitude,
+            location_label=location_label,
+        )
+        return _weather_report_from_wttr_response(
+            weather_response,
+            latitude=latitude,
+            longitude=longitude,
+            timezone=timezone,
+            location_label=location_label,
+            public_ip=public_ip,
+        )
+    except Exception as exc:
+        wttr_error = exc
+
+    try:
+        return _fetch_open_meteo_weather_report(
+            fetch_json,
+            timeout_seconds,
+            latitude=latitude,
+            longitude=longitude,
+            timezone=timezone,
+            location_label=location_label,
+            public_ip=public_ip,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Weather lookup failed. "
+            f"wttr.in error: {wttr_error.__class__.__name__}: {wttr_error}. "
+            f"open-meteo fallback error: {exc.__class__.__name__}: {exc}"
+        ) from exc
+
+
+def _weather_report_from_wttr_response(
+    weather_response: dict[str, object],
+    *,
+    latitude: float,
+    longitude: float,
+    timezone: str,
+    location_label: str,
+    public_ip: str | None = None,
+) -> WeatherReport:
     current = _wttr_current_condition(weather_response)
     daily_forecasts = _wttr_daily_forecasts(weather_response)
+    return _weather_report_from_values(
+        latitude=latitude,
+        longitude=longitude,
+        timezone=timezone,
+        location_label=location_label,
+        current_condition=_wttr_desc(current.get("weatherDesc")) or "Unknown",
+        current_temperature_c=_wttr_float(current.get("temp_C")),
+        apparent_temperature_c=_wttr_float(current.get("FeelsLikeC")),
+        relative_humidity_percent=_wttr_float(current.get("humidity")),
+        wind_speed_kmh=_wttr_float(current.get("windspeedKmph")),
+        daily_forecasts=daily_forecasts,
+        public_ip=public_ip,
+    )
+
+
+def _fetch_open_meteo_weather_report(
+    fetch_json: JsonFetcher,
+    timeout_seconds: int,
+    *,
+    latitude: float,
+    longitude: float,
+    timezone: str,
+    location_label: str,
+    public_ip: str | None = None,
+) -> WeatherReport:
+    response = fetch_json(
+        _open_meteo_forecast_url(
+            latitude=latitude,
+            longitude=longitude,
+            timezone=timezone,
+        ),
+        timeout_seconds,
+    )
+    if not isinstance(response, dict):
+        raise RuntimeError("open-meteo forecast returned non-object JSON payload.")
+    current = _open_meteo_current(response)
+    daily_forecasts = _open_meteo_daily_forecasts(response)
+    return _weather_report_from_values(
+        latitude=latitude,
+        longitude=longitude,
+        timezone=timezone,
+        location_label=location_label,
+        current_condition=_weather_label(current["weather_code"]),
+        current_temperature_c=float(current["temperature_2m"]),
+        apparent_temperature_c=float(current["apparent_temperature"]),
+        relative_humidity_percent=float(current["relative_humidity_2m"]),
+        wind_speed_kmh=float(current["wind_speed_10m"]),
+        daily_forecasts=daily_forecasts,
+        public_ip=public_ip,
+    )
+
+
+def _weather_report_from_values(
+    *,
+    latitude: float,
+    longitude: float,
+    timezone: str,
+    location_label: str,
+    current_condition: str,
+    current_temperature_c: float,
+    apparent_temperature_c: float,
+    relative_humidity_percent: float,
+    wind_speed_kmh: float,
+    daily_forecasts: tuple[WeatherDailyForecast, ...],
+    public_ip: str | None = None,
+) -> WeatherReport:
     today_forecast = daily_forecasts[0] if daily_forecasts else None
     tomorrow_forecast = daily_forecasts[1] if len(daily_forecasts) > 1 else None
     return WeatherReport(
@@ -1681,11 +1800,11 @@ def _fetch_weather_report(
         latitude=latitude,
         longitude=longitude,
         timezone=timezone,
-        current_condition=_wttr_desc(current.get("weatherDesc")) or "Unknown",
-        current_temperature_c=_wttr_float(current.get("temp_C")),
-        apparent_temperature_c=_wttr_float(current.get("FeelsLikeC")),
-        relative_humidity_percent=_wttr_float(current.get("humidity")),
-        wind_speed_kmh=_wttr_float(current.get("windspeedKmph")),
+        current_condition=current_condition,
+        current_temperature_c=current_temperature_c,
+        apparent_temperature_c=apparent_temperature_c,
+        relative_humidity_percent=relative_humidity_percent,
+        wind_speed_kmh=wind_speed_kmh,
         today_condition=(
             today_forecast.condition
             if today_forecast is not None
@@ -1725,9 +1844,193 @@ def _fetch_weather_report(
     )
 
 
-def _wttr_weather_url(*, latitude: float, longitude: float) -> str:
+def _fetch_wttr_weather_response(
+    fetch_json: JsonFetcher,
+    timeout_seconds: int,
+    *,
+    latitude: float,
+    longitude: float,
+    location_label: str,
+) -> dict[str, object]:
+    errors: list[str] = []
+    for _ in range(WTTR_FETCH_ATTEMPTS):
+        for url in _wttr_weather_urls(
+            latitude=latitude,
+            longitude=longitude,
+            location_label=location_label,
+        ):
+            try:
+                weather_response = fetch_json(url, timeout_seconds)
+            except Exception as exc:
+                errors.append(f"{url}: {exc.__class__.__name__}: {exc}")
+                continue
+            if not isinstance(weather_response, dict):
+                errors.append(f"{url}: returned non-object JSON payload")
+                continue
+            try:
+                _wttr_current_condition(weather_response)
+                _wttr_daily_forecasts(weather_response)
+            except Exception as exc:
+                errors.append(f"{url}: {exc}")
+                continue
+            return weather_response
+    detail = errors[-1] if errors else "unknown wttr.in error"
+    raise RuntimeError(
+        f"wttr.in weather lookup failed after {WTTR_FETCH_ATTEMPTS} attempts: {detail}"
+    )
+
+
+def _wttr_weather_urls(
+    *,
+    latitude: float,
+    longitude: float,
+    location_label: str,
+) -> tuple[str, ...]:
+    place = location_label.split(",", 1)[0].strip()
+    urls = [
+        _wttr_weather_url(latitude=latitude, longitude=longitude, metric=True),
+        _wttr_weather_url(latitude=latitude, longitude=longitude, metric=False),
+    ]
+    if place:
+        urls.extend(
+            (
+                _wttr_place_weather_url(place, metric=True),
+                _wttr_place_weather_url(place, metric=False),
+            )
+        )
+    return tuple(dict.fromkeys(urls))
+
+
+def _wttr_weather_url(*, latitude: float, longitude: float, metric: bool = True) -> str:
     coordinates = f"{_format_number(latitude)},{_format_number(longitude)}"
-    return f"{WTTR_BASE_URL}/{parse.quote(coordinates, safe=',')}?format=j1&m"
+    suffix = "?format=j1&m" if metric else "?format=j1"
+    return f"{WTTR_BASE_URL}/{parse.quote(coordinates, safe=',')}{suffix}"
+
+
+def _wttr_place_weather_url(place: str, *, metric: bool = True) -> str:
+    suffix = "?format=j1&m" if metric else "?format=j1"
+    return f"{WTTR_BASE_URL}/{parse.quote(place)}{suffix}"
+
+
+def _open_meteo_forecast_url(*, latitude: float, longitude: float, timezone: str) -> str:
+    return "https://api.open-meteo.com/v1/forecast?" + parse.urlencode(
+        {
+            "latitude": _format_number(latitude),
+            "longitude": _format_number(longitude),
+            "timezone": timezone,
+            "forecast_days": WEATHER_FORECAST_DAYS,
+            "temperature_unit": "celsius",
+            "wind_speed_unit": "kmh",
+            "current": ",".join(
+                (
+                    "temperature_2m",
+                    "apparent_temperature",
+                    "relative_humidity_2m",
+                    "wind_speed_10m",
+                    "weather_code",
+                )
+            ),
+            "daily": ",".join(
+                (
+                    "weather_code",
+                    "temperature_2m_max",
+                    "temperature_2m_min",
+                    "precipitation_probability_max",
+                )
+            ),
+        }
+    )
+
+
+def _open_meteo_current(response: dict[str, object]) -> dict[str, float | int]:
+    current = response.get("current")
+    if not isinstance(current, dict):
+        raise RuntimeError("open-meteo forecast did not include current weather data.")
+    parsed: dict[str, float | int] = {}
+    for key in (
+        "temperature_2m",
+        "apparent_temperature",
+        "relative_humidity_2m",
+        "wind_speed_10m",
+    ):
+        value = current.get(key)
+        if not isinstance(value, (int, float)):
+            raise RuntimeError(f"open-meteo forecast did not include {key}.")
+        parsed[key] = float(value)
+    weather_code = current.get("weather_code")
+    if not isinstance(weather_code, (int, float)):
+        raise RuntimeError("open-meteo forecast did not include weather_code.")
+    parsed["weather_code"] = int(weather_code)
+    return parsed
+
+
+def _open_meteo_daily_forecasts(response: dict[str, object]) -> tuple[WeatherDailyForecast, ...]:
+    daily = response.get("daily")
+    if not isinstance(daily, dict):
+        raise RuntimeError("open-meteo forecast did not include daily forecast data.")
+    dates = daily.get("time")
+    weather_codes = daily.get("weather_code")
+    highs = daily.get("temperature_2m_max")
+    lows = daily.get("temperature_2m_min")
+    precipitations = daily.get("precipitation_probability_max")
+    if not all(isinstance(values, list) for values in (dates, weather_codes, highs, lows, precipitations)):
+        raise RuntimeError("open-meteo forecast daily payload was incomplete.")
+
+    forecasts: list[WeatherDailyForecast] = []
+    forecast_count = min(len(dates), len(weather_codes), len(highs), len(lows), len(precipitations))
+    for index in range(forecast_count):
+        date_value = dates[index]
+        weather_code = weather_codes[index]
+        high = highs[index]
+        low = lows[index]
+        precipitation = precipitations[index]
+        if not isinstance(date_value, str):
+            continue
+        if not isinstance(weather_code, (int, float)):
+            continue
+        if not isinstance(high, (int, float)) or not isinstance(low, (int, float)):
+            continue
+        if not isinstance(precipitation, (int, float)):
+            continue
+        forecasts.append(
+            WeatherDailyForecast(
+                date=date_value,
+                condition=_weather_label(int(weather_code)),
+                high_c=float(high),
+                low_c=float(low),
+                precipitation_probability_max_percent=float(precipitation),
+            )
+        )
+    if not forecasts:
+        raise RuntimeError("open-meteo forecast daily payload did not contain usable forecast rows.")
+    return tuple(forecasts)
+
+
+def _geocoding_language_candidates(place: str) -> tuple[str, ...]:
+    candidates: list[str] = []
+    if re.search(r"[\u3040-\u30ff]", place):
+        candidates.append("ja")
+    if re.search(r"[\uac00-\ud7af]", place):
+        candidates.append("ko")
+    if re.search(r"[\u0600-\u06ff]", place):
+        candidates.append("ar")
+    if re.search(r"[\u0400-\u04ff]", place):
+        candidates.append("ru")
+    if re.search(r"[\u4e00-\u9fff]", place):
+        candidates.extend(("zh", "ja"))
+    if re.search(r"[A-Za-z]", place):
+        candidates.append("en")
+    if not candidates:
+        candidates.append("en")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates + ["en"]:
+        if candidate in seen:
+            continue
+        deduped.append(candidate)
+        seen.add(candidate)
+    return tuple(deduped)
 
 
 def _wttr_current_condition(weather_response: dict[str, object]) -> dict[str, object]:

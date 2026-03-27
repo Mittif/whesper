@@ -33,6 +33,37 @@ def wttr_weather_url(latitude: float, longitude: float) -> str:
     return f"https://wttr.in/{latitude},{longitude}?format=j1&m"
 
 
+def open_meteo_geocode_url(name: str, *, language: str = "en") -> str:
+    return (
+        "https://geocoding-api.open-meteo.com/v1/search?"
+        + parse.urlencode({"name": name, "count": 1, "language": language, "format": "json"})
+    )
+
+
+def open_meteo_forecast_url(latitude: float, longitude: float, *, timezone: str) -> str:
+    return (
+        "https://api.open-meteo.com/v1/forecast?"
+        + parse.urlencode(
+            {
+                "latitude": str(latitude),
+                "longitude": str(longitude),
+                "timezone": timezone,
+                "forecast_days": 8,
+                "temperature_unit": "celsius",
+                "wind_speed_unit": "kmh",
+                "current": (
+                    "temperature_2m,apparent_temperature,relative_humidity_2m,"
+                    "wind_speed_10m,weather_code"
+                ),
+                "daily": (
+                    "weather_code,temperature_2m_max,temperature_2m_min,"
+                    "precipitation_probability_max"
+                ),
+            }
+        )
+    )
+
+
 def wttr_day(
     date_value: str,
     *,
@@ -225,10 +256,7 @@ class LiveDataTests(unittest.TestCase):
         self.assertIn("exchange_rate: 7.2345", context)
 
     def test_city_weather_context_formats_requested_location_weather(self) -> None:
-        geocode_url = (
-            "https://geocoding-api.open-meteo.com/v1/search?"
-            + parse.urlencode({"name": "Tokyo", "count": 1, "language": "en", "format": "json"})
-        )
+        geocode_url = open_meteo_geocode_url("Tokyo")
         responses = {
             geocode_url: {
                 "results": [
@@ -276,10 +304,7 @@ class LiveDataTests(unittest.TestCase):
         self.assertIn("tomorrow_condition: Overcast", context)
 
     def test_lookup_weather_for_place_returns_report(self) -> None:
-        geocode_url = (
-            "https://geocoding-api.open-meteo.com/v1/search?"
-            + parse.urlencode({"name": "Tokyo", "count": 1, "language": "en", "format": "json"})
-        )
+        geocode_url = open_meteo_geocode_url("Tokyo")
         responses = {
             geocode_url: {
                 "results": [
@@ -324,11 +349,92 @@ class LiveDataTests(unittest.TestCase):
         self.assertEqual(report.timezone, "Asia/Tokyo")
         self.assertEqual(report.tomorrow_condition, "Overcast")
 
+    def test_lookup_weather_for_place_uses_language_specific_geocoding(self) -> None:
+        zh_geocode_url = open_meteo_geocode_url("東京", language="zh")
+        geocode_url = open_meteo_geocode_url("東京", language="ja")
+        responses = {
+            zh_geocode_url: {"generationtime_ms": 0.12},
+            geocode_url: {
+                "results": [
+                    {
+                        "name": "東京",
+                        "admin1": "東京都",
+                        "country": "日本",
+                        "latitude": 35.6895,
+                        "longitude": 139.6917,
+                        "timezone": "Asia/Tokyo",
+                    }
+                ]
+            },
+            wttr_weather_url(35.6895, 139.6917): wttr_response(
+                current_condition="Mainly clear",
+                current_temperature_c=18.2,
+                apparent_temperature_c=18.0,
+                relative_humidity_percent=70,
+                wind_speed_kmh=8.4,
+                daily_forecasts=[
+                    wttr_day(
+                        "2026-03-25",
+                        condition="Partly cloudy",
+                        high_c=22.5,
+                        low_c=14.3,
+                        precipitation_probability_max_percent=20,
+                    )
+                ],
+            ),
+        }
+
+        report = lookup_weather_for_place(lambda url, timeout: responses[url], 10, "東京")
+
+        self.assertEqual(report.location_label, "東京, 東京都, 日本")
+        self.assertEqual(report.timezone, "Asia/Tokyo")
+
+    def test_lookup_weather_for_place_falls_back_to_open_meteo_forecast_when_wttr_fails(self) -> None:
+        geocode_url = open_meteo_geocode_url("Shanghai")
+        forecast_url = open_meteo_forecast_url(31.2304, 121.4737, timezone="Asia/Shanghai")
+        responses = {
+            geocode_url: {
+                "results": [
+                    {
+                        "name": "Shanghai",
+                        "admin1": "Shanghai",
+                        "country": "China",
+                        "latitude": 31.2304,
+                        "longitude": 121.4737,
+                        "timezone": "Asia/Shanghai",
+                    }
+                ]
+            },
+            wttr_weather_url(31.2304, 121.4737): None,
+            "https://wttr.in/31.2304,121.4737?format=j1": None,
+            "https://wttr.in/Shanghai?format=j1&m": None,
+            "https://wttr.in/Shanghai?format=j1": None,
+            forecast_url: {
+                "current": {
+                    "temperature_2m": 23.4,
+                    "apparent_temperature": 24.0,
+                    "relative_humidity_2m": 61,
+                    "wind_speed_10m": 12.1,
+                    "weather_code": 2,
+                },
+                "daily": {
+                    "time": ["2026-03-25", "2026-03-26"],
+                    "weather_code": [3, 61],
+                    "temperature_2m_max": [27.2, 25.1],
+                    "temperature_2m_min": [19.8, 18.3],
+                    "precipitation_probability_max": [30, 70],
+                },
+            },
+        }
+
+        report = lookup_weather_for_place(lambda url, timeout: responses[url], 10, "Shanghai")
+
+        self.assertEqual(report.current_condition, "Partly cloudy")
+        self.assertEqual(report.today_condition, "Overcast")
+        self.assertEqual(report.tomorrow_condition, "Slight rain")
+
     def test_city_weather_context_handles_chinese_district_tomorrow_query(self) -> None:
-        geocode_url = (
-            "https://geocoding-api.open-meteo.com/v1/search?"
-            + parse.urlencode({"name": "嘉定区", "count": 1, "language": "en", "format": "json"})
-        )
+        geocode_url = open_meteo_geocode_url("嘉定区", language="zh")
         responses = {
             geocode_url: {
                 "results": [
@@ -378,10 +484,7 @@ class LiveDataTests(unittest.TestCase):
         self.assertIn("requested_date: 2026-03-26", context)
 
     def test_city_weather_context_handles_next_monday_query(self) -> None:
-        geocode_url = (
-            "https://geocoding-api.open-meteo.com/v1/search?"
-            + parse.urlencode({"name": "嘉定区", "count": 1, "language": "en", "format": "json"})
-        )
+        geocode_url = open_meteo_geocode_url("嘉定区", language="zh")
         responses = {
             geocode_url: {
                 "results": [
@@ -421,10 +524,7 @@ class LiveDataTests(unittest.TestCase):
         self.assertIn("requested_condition: Moderate rain", context)
 
     def test_city_weather_context_handles_weekend_query(self) -> None:
-        geocode_url = (
-            "https://geocoding-api.open-meteo.com/v1/search?"
-            + parse.urlencode({"name": "嘉定区", "count": 1, "language": "en", "format": "json"})
-        )
+        geocode_url = open_meteo_geocode_url("嘉定区", language="zh")
         responses = {
             geocode_url: {
                 "results": [

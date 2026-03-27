@@ -263,7 +263,7 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = SessionStore(tmpdir)
             session = store.load("main")
-            session.messages.extend(
+            session.transcript_messages.extend(
                 [
                     ChatMessage(
                         role="user",
@@ -300,6 +300,85 @@ class CliTests(unittest.TestCase):
         self.assertIn("default chat model", rendered)
         self.assertIn("hello there", rendered)
         self.assertIn("hi back", rendered)
+
+    def test_history_command_prefers_transcript_over_raw_tool_trace(self) -> None:
+        config = build_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            session = store.load("main")
+            session.messages.extend(
+                [
+                    ChatMessage(
+                        role="user",
+                        content="爱丁堡最近天气怎么样？",
+                        created_at="2026-03-27T00:00:00+00:00",
+                    ),
+                    ChatMessage(
+                        role="assistant",
+                        content="",
+                        created_at="2026-03-27T00:00:01+00:00",
+                        tool_calls=[
+                            {
+                                "id": "call_weather",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather_by_location",
+                                    "arguments": '{"location":"爱丁堡"}',
+                                },
+                            }
+                        ],
+                    ),
+                    ChatMessage(
+                        role="tool",
+                        content='{"ok": true, "location": "Edinburgh"}',
+                        created_at="2026-03-27T00:00:02+00:00",
+                        tool_call_id="call_weather",
+                    ),
+                    ChatMessage(
+                        role="assistant",
+                        content="爱丁堡今天多云，体感偏凉。",
+                        created_at="2026-03-27T00:00:03+00:00",
+                        model_alias="local_chat",
+                        route_reason="default chat model",
+                    ),
+                ]
+            )
+            session.transcript_messages.extend(
+                [
+                    ChatMessage(
+                        role="user",
+                        content="爱丁堡最近天气怎么样？",
+                        created_at="2026-03-27T00:00:00+00:00",
+                    ),
+                    ChatMessage(
+                        role="assistant",
+                        content="爱丁堡今天多云，体感偏凉。",
+                        created_at="2026-03-27T00:00:03+00:00",
+                        model_alias="local_chat",
+                        route_reason="default chat model",
+                    ),
+                ]
+            )
+            output = io.StringIO()
+
+            outcome = handle_command(
+                ParsedCommand(name="/history"),
+                config=config,
+                store=store,
+                chat_service=self.build_chat_service(config),
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertTrue(outcome.handled)
+        self.assertIn("History (2)", rendered)
+        self.assertIn("爱丁堡最近天气怎么样？", rendered)
+        self.assertIn("爱丁堡今天多云，体感偏凉。", rendered)
+        self.assertNotIn("Tool", rendered)
+        self.assertNotIn("call_weather", rendered)
+        self.assertNotIn('{"ok": true, "location": "Edinburgh"}', rendered)
 
     def test_history_command_handles_empty_session(self) -> None:
         config = build_config()

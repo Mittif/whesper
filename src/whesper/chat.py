@@ -241,6 +241,15 @@ class ChatService:
             tool_message_format=tool_message_format,
             on_step=on_step,
         )
+        if run_result.final_messages is not None:
+            return self._stream_final_answer(
+                session,
+                decision,
+                provider=provider_config,
+                model=model_config,
+                messages=run_result.final_messages,
+                on_chunk=on_chunk,
+            )
         completion = run_result.completion
         if on_chunk is not None and completion.content:
             on_chunk(completion.content)
