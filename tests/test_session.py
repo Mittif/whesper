@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 
+from whesper.agent_types import AskUserAction, AskUserOption
 from whesper.session import ChatMessage, SessionStore
 
 
@@ -84,6 +85,30 @@ class SessionStoreTests(unittest.TestCase):
             self.assertTrue(deleted)
             self.assertFalse(store.path_for("main").exists())
             self.assertFalse(store.transcript_path_for("main").exists())
+
+    def test_save_and_load_pending_ask_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            session = store.load("main")
+            session.pending_ask_user = AskUserAction(
+                prompt="你想查哪个城市？",
+                options=(
+                    AskUserOption(label="上海", value="上海"),
+                    AskUserOption(label="东京", value="东京", description="更快一点"),
+                ),
+                allow_free_text=True,
+                field_name="location",
+            )
+
+            store.save(session)
+            loaded = store.load("main")
+
+            self.assertIsNotNone(loaded.pending_ask_user)
+            assert loaded.pending_ask_user is not None
+            self.assertEqual(loaded.pending_ask_user.prompt, "你想查哪个城市？")
+            self.assertEqual(loaded.pending_ask_user.options[0].label, "上海")
+            self.assertEqual(loaded.pending_ask_user.options[1].description, "更快一点")
+            self.assertEqual(loaded.pending_ask_user.field_name, "location")
 
 
 if __name__ == "__main__":

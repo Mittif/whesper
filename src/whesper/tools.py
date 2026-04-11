@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import re
 from typing import Callable
+from urllib import parse as urlparse
+from urllib import request as urlrequest
+from zoneinfo import ZoneInfo
 
 from whesper.config import AppConfig
 from whesper.agent_types import ToolExecutionMeta, ToolInvocation
@@ -32,12 +36,15 @@ from whesper.live_data import (
     TransportStatusContextService,
     UrlSummaryContextService,
     _contains_any,
+    _extract_city_weather_place,
+    _extract_time_place,
     _extract_urls,
     _extract_weather_request_window,
     _looks_like_docs_url,
     _normalize_place_candidate,
     _weather_reference_date,
     lookup_ip_location,
+    lookup_local_area,
     lookup_public_ip,
     lookup_weather_for_ip,
     lookup_weather_for_place,
@@ -62,6 +69,7 @@ class ToolSpec:
     usage_guidance: str | None = None
     examples: tuple[tuple[str, str], ...] = ()
     should_offer: RequestMatcher | None = None
+    related_tools: tuple[str, ...] = ()
     execution_meta: ToolExecutionMeta = ToolExecutionMeta()
 
     def as_openai_tool(self) -> dict[str, object]:
@@ -89,7 +97,14 @@ class ToolRegistry:
 
     @classmethod
     def default(cls, config: AppConfig | None = None) -> "ToolRegistry":
-        search_service = SearchContextService()
+        search_settings = config.live_context.search_api if config is not None else None
+        search_service = SearchContextService(
+            api_key=search_settings.resolved_api_key() if search_settings is not None else None,
+            engine=search_settings.engine if search_settings is not None else "google",
+            timeout_seconds=(
+                int(search_settings.timeout_seconds) if search_settings is not None else 10
+            ),
+        )
         url_summary_service = UrlSummaryContextService(fetch_text=_tool_fetch_text)
         tech_docs_service = TechDocsContextService(fetch_text=_tool_fetch_text)
         exchange_service = ExchangeRateContextService(fetch_json=_tool_fetch_json)
@@ -99,56 +114,6 @@ class ToolRegistry:
         news_service = NewsContextService(fetch_text=_tool_fetch_text)
 
         specs: list[ToolSpec] = [
-            ToolSpec(
-                name="get_public_ip",
-                description=(
-                    "Get the user's current public IP address. Useful as a first step "
-                    "when you need to determine the user's approximate location."
-                ),
-                parameters_schema={
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
-                },
-                handler=_handle_get_public_ip,
-                usage_guidance=(
-                    "Use as the first step when you need the user's location but they "
-                    "haven't specified one. Follow up with get_ip_location to resolve "
-                    "the IP to a city/region."
-                ),
-                examples=(
-                    ('用户说: "我这里天气怎么样"（未指定地点）', "{}"),
-                ),
-                execution_meta=ToolExecutionMeta(timeout_seconds=5.0),
-            ),
-            ToolSpec(
-                name="get_ip_location",
-                description=(
-                    "Resolve a public IP address to a geographic location including "
-                    "city, region, country, coordinates, and timezone."
-                ),
-                parameters_schema={
-                    "type": "object",
-                    "properties": {
-                        "ip": {
-                            "type": "string",
-                            "description": "The public IP address to geolocate.",
-                        }
-                    },
-                    "required": ["ip"],
-                    "additionalProperties": False,
-                },
-                handler=_handle_get_ip_location,
-                usage_guidance=(
-                    "Use after get_public_ip to resolve an IP to a location. The result "
-                    "includes city, region, country, and timezone which can then be used "
-                    "with location-based tools like get_weather_by_location."
-                ),
-                examples=(
-                    ('已获取 IP "203.0.113.42"', '{"ip":"203.0.113.42"}'),
-                ),
-                execution_meta=ToolExecutionMeta(timeout_seconds=5.0),
-            ),
             ToolSpec(
                 name="web_search",
                 description=(
@@ -169,7 +134,9 @@ class ToolRegistry:
                 handler=lambda arguments: _handle_web_search(search_service, arguments),
                 usage_guidance=(
                     "Use when the user explicitly asks to search, wants recent information, "
-                    "or the answer is likely to have changed recently."
+                    "or needs broad web research beyond a single page or headline snapshot. "
+                    "If the request is specifically for concise current-news headlines on a topic, "
+                    "get_news is usually a better fit unless the user explicitly asked to search."
                 ),
                 examples=(
                     ('用户说: "/search openai release notes"', '{"query":"openai release notes"}'),
@@ -178,7 +145,10 @@ class ToolRegistry:
                 should_offer=lambda user_text, route_mode: (
                     route_mode == "search"
                     or user_text.strip().startswith("/search ")
-                    or _contains_any(user_text, SEARCH_KEYWORDS)
+                    or (
+                        _contains_any(user_text, SEARCH_KEYWORDS)
+                        and not _contains_any(user_text, NEWS_KEYWORDS)
+                    )
                 ),
             ),
             ToolSpec(
@@ -203,8 +173,10 @@ class ToolRegistry:
                     url_summary_service,
                 ),
                 usage_guidance=(
-                    "Use when the user includes a URL and wants you to inspect the page "
-                    "instead of guessing what it contains."
+                    "Use when the user includes a URL and wants you to inspect a general webpage, "
+                    "article, landing page, or non-doc page. If the URL or surrounding words indicate "
+                    "API docs, technical reference, guides, or README-like documentation, prefer "
+                    "read_tech_docs."
                 ),
                 examples=(
                     (
@@ -212,7 +184,11 @@ class ToolRegistry:
                         '{"url":"https://example.com/docs"}',
                     ),
                 ),
-                should_offer=lambda user_text, route_mode: bool(_extract_urls(user_text)),
+                should_offer=lambda user_text, route_mode: bool(_extract_urls(user_text))
+                and not (
+                    _contains_any(user_text, DOC_KEYWORDS)
+                    or any(_looks_like_docs_url(url) for url in _extract_urls(user_text))
+                ),
             ),
             ToolSpec(
                 name="read_tech_docs",
@@ -236,8 +212,9 @@ class ToolRegistry:
                     tech_docs_service,
                 ),
                 usage_guidance=(
-                    "Use when the user asks about documentation, API reference pages, guides, "
-                    "or README-like URLs."
+                    "Use when the user asks about documentation, API reference pages, SDK docs, "
+                    "guides, or README-like URLs. Prefer this over summarize_webpage when the URL "
+                    "or nearby words suggest docs or reference material."
                 ),
                 examples=(
                     (
@@ -250,6 +227,59 @@ class ToolRegistry:
                     _contains_any(user_text, DOC_KEYWORDS)
                     or any(_looks_like_docs_url(url) for url in _extract_urls(user_text))
                 ),
+                related_tools=("summarize_webpage",),
+            ),
+            ToolSpec(
+                name="get_local_area",
+                description=(
+                    "Get the user's current local area details, including location label, "
+                    "timezone, and coordinates, without exposing the raw IP address."
+                ),
+                parameters_schema={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                handler=_handle_get_local_area,
+                usage_guidance=(
+                    "Use when the user asks about their own current area, timezone, or coordinates. "
+                    "If the user is more likely referring to a previously mentioned non-local city "
+                    "or country, prefer lookup_place or lookup_time instead."
+                ),
+                examples=(
+                    ('用户说: "我这里是哪个时区？"', "{}"),
+                    ('用户说: "我这里的经纬度是多少"', "{}"),
+                    ('用户说: "Where am I roughly located right now?"', "{}"),
+                ),
+                should_offer=lambda user_text, route_mode: _matches_local_area_intent(user_text),
+                related_tools=("lookup_place", "lookup_time"),
+                execution_meta=ToolExecutionMeta(timeout_seconds=5.0),
+            ),
+            ToolSpec(
+                name="get_local_time",
+                description=(
+                    "Get the user's current local time and timezone without exposing the raw "
+                    "IP address."
+                ),
+                parameters_schema={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                handler=_handle_get_local_time,
+                usage_guidance=(
+                    "Use when the user asks for the time in their own current area. If the user "
+                    "names another place, or if words like 当地/here likely refer to a previously "
+                    "mentioned non-local place, use lookup_time instead."
+                ),
+                examples=(
+                    ('用户说: "我这里几点了？"', "{}"),
+                    ('用户说: "我这边现在时间"', "{}"),
+                    ('用户说: "what time is it here right now?"', "{}"),
+                ),
+                should_offer=lambda user_text, route_mode: _matches_local_time_intent(user_text),
+                related_tools=("lookup_time",),
+                execution_meta=ToolExecutionMeta(timeout_seconds=5.0),
             ),
             ToolSpec(
                 name="get_local_weather",
@@ -272,14 +302,16 @@ class ToolRegistry:
                 },
                 handler=_handle_get_local_weather,
                 usage_guidance=(
-                    "Use for the user's current local weather. Keep the user's time phrase raw; "
-                    "the code will resolve dates and forecast windows."
+                    "Use for the user's own current-area weather. If the user names another place, "
+                    "or if words like 当地/here likely refer to a previously mentioned non-local "
+                    "place, prefer get_weather_by_location instead. Keep the user's time phrase raw."
                 ),
                 examples=(
                     ('用户说: "我这里明天的天气"', '{"time_expression":"明天"}'),
                     ('用户说: "this weekend weather"', '{"time_expression":"this weekend"}'),
                 ),
                 should_offer=lambda user_text, route_mode: _matches_local_weather_intent(user_text),
+                related_tools=("get_weather_by_location",),
             ),
             ToolSpec(
                 name="get_weather_by_location",
@@ -309,8 +341,9 @@ class ToolRegistry:
                 },
                 handler=_handle_get_weather_by_location,
                 usage_guidance=(
-                    "Use for weather in a named place. Put only the place in location, and put "
-                    "the time phrase in time_expression instead of mixing them together."
+                    "Use for weather in a named place, or when the current turn likely refers back "
+                    "to a previously mentioned non-local place. Put only the place in location, and "
+                    "put the time phrase in time_expression instead of mixing them together."
                 ),
                 examples=(
                     ('用户说: "嘉定区明天的天气"', '{"location":"嘉定区","time_expression":"明天"}'),
@@ -320,7 +353,8 @@ class ToolRegistry:
                     ),
                 ),
                 should_offer=lambda user_text, route_mode: (
-                    should_fetch_weather(user_text) and not _matches_local_weather_intent(user_text)
+                    should_fetch_weather(user_text)
+                    and _matches_weather_by_location_intent(user_text)
                 ),
             ),
             ToolSpec(
@@ -384,12 +418,16 @@ class ToolRegistry:
                     geocoding_service,
                 ),
                 usage_guidance=(
-                    "Use for map, coordinate, latitude, longitude, or address-style questions."
+                    "Use for map, coordinate, latitude, longitude, or address-style questions about "
+                    "a named or previously mentioned non-local place."
                 ),
                 examples=(
                     ('用户说: "Hangzhou coordinates"', '{"query":"Hangzhou coordinates"}'),
                 ),
-                should_offer=lambda user_text, route_mode: _contains_any(user_text, MAP_KEYWORDS),
+                should_offer=lambda user_text, route_mode: (
+                    _contains_any(user_text, MAP_KEYWORDS)
+                    and not _matches_local_area_intent(user_text)
+                ),
             ),
             ToolSpec(
                 name="lookup_time",
@@ -405,14 +443,21 @@ class ToolRegistry:
                     time_service,
                 ),
                 usage_guidance=(
-                    "Use for local time, timezone, time difference, and holiday calendar questions. "
-                    "Pass the original request text."
+                    "Use for local time, timezone, time difference, and holiday calendar questions "
+                    "about a named place, or when context suggests words like 当地/here refer to a "
+                    "previously mentioned non-local place. Pass the original request text."
                 ),
                 examples=(
                     ('用户说: "current time in Singapore"', '{"query":"current time in Singapore"}'),
                     ('用户说: "2026 Japan holidays"', '{"query":"2026 Japan holidays"}'),
                 ),
-                should_offer=lambda user_text, route_mode: _contains_any(user_text, TIME_KEYWORDS),
+                should_offer=lambda user_text, route_mode: (
+                    (
+                        _contains_any(user_text, ("holiday", "holidays", "节假日", "假期"))
+                        or _extract_time_place(user_text) is not None
+                    )
+                    and _contains_any(user_text, TIME_KEYWORDS)
+                ),
             ),
             ToolSpec(
                 name="get_news",
@@ -428,14 +473,207 @@ class ToolRegistry:
                     news_service,
                 ),
                 usage_guidance=(
-                    "Use for headlines and current-news requests. Pass the user's original news topic."
+                    "Use for headlines and current-news requests. Prefer this for concise news "
+                    "snapshots on a topic; use web_search for broader research or when the user "
+                    "explicitly asks to search."
                 ),
                 examples=(
                     ('用户说: "AI 新闻"', '{"query":"AI 新闻"}'),
                 ),
                 should_offer=lambda user_text, route_mode: _contains_any(user_text, NEWS_KEYWORDS),
+                related_tools=("web_search",),
             ),
         ]
+
+        if config is not None and config.hardware.led.enabled:
+            led_settings = config.hardware.led
+            specs.append(
+                ToolSpec(
+                    name="control_led",
+                    description=(
+                        "Control the configured test RGB LED device over HTTP. Use it to "
+                        "set a color, toggle blinking, or read the current LED status."
+                    ),
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "description": (
+                                    "One of: set_color, set_blink, or status. For combined "
+                                    "requests like setting a color and blinking, call the tool "
+                                    "multiple times."
+                                ),
+                            },
+                            "color": {
+                                "type": "string",
+                                "description": (
+                                    "Optional color name or hex value for set_color, such as "
+                                    "red, 蓝色, 暖白, or #ff8800."
+                                ),
+                            },
+                            "r": {
+                                "type": "integer",
+                                "description": "Red channel 0-255 for set_color.",
+                            },
+                            "g": {
+                                "type": "integer",
+                                "description": "Green channel 0-255 for set_color.",
+                            },
+                            "b": {
+                                "type": "integer",
+                                "description": "Blue channel 0-255 for set_color.",
+                            },
+                            "blink": {
+                                "type": "boolean",
+                                "description": (
+                                    "True to enable blinking or false to disable it when "
+                                    "action is set_blink."
+                                ),
+                            },
+                        },
+                        "required": ["action"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: _handle_control_led(
+                        arguments,
+                        base_url=led_settings.base_url,
+                        timeout_seconds=led_settings.timeout_seconds,
+                    ),
+                    usage_guidance=(
+                        "Use only when the user clearly asks to inspect or change the test LED. "
+                        "This tool performs a real device action. Prefer color names or hex for "
+                        "simple requests, and use multiple calls for compound actions."
+                    ),
+                    examples=(
+                        ('用户说: "把测试灯调成红色"', '{"action":"set_color","color":"红色"}'),
+                        ('用户说: "让 LED 开始闪烁"', '{"action":"set_blink","blink":true}'),
+                        ('用户说: "看看灯现在是什么颜色"', '{"action":"status"}'),
+                    ),
+                    should_offer=lambda user_text, route_mode: _matches_led_control_intent(
+                        user_text
+                    ),
+                    execution_meta=ToolExecutionMeta(
+                        parallel_safe=False,
+                        side_effectful=True,
+                        retryable=False,
+                        timeout_seconds=float(led_settings.timeout_seconds),
+                    ),
+                )
+            )
+
+        if config is not None and config.hardware.cup.enabled:
+            cup_settings = config.hardware.cup
+            specs.append(
+                ToolSpec(
+                    name="control_cup",
+                    description=(
+                        "Control the configured CUP client API over HTTP. Use it to inspect "
+                        "status, change motor speed, stop the motor, adjust LED mood cues, "
+                        "or apply higher-level intensity scenes."
+                    ),
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "description": (
+                                    "One of: status, set_motor, stop, set_led, "
+                                    "apply_scene, or nudge_intensity."
+                                ),
+                            },
+                            "target_velocity": {
+                                "type": "number",
+                                "description": (
+                                    "Target motor velocity for set_motor in the device's "
+                                    "native units."
+                                ),
+                            },
+                            "enabled": {
+                                "type": "boolean",
+                                "description": (
+                                    "Whether the motor should be enabled for set_motor."
+                                ),
+                            },
+                            "color": {
+                                "type": "string",
+                                "description": (
+                                    "Optional LED color for set_led, such as warmwhite, "
+                                    "red, 粉色, or #ff6600."
+                                ),
+                            },
+                            "blink_hz": {
+                                "type": "number",
+                                "description": (
+                                    "Optional LED blink frequency in Hz for set_led."
+                                ),
+                            },
+                            "blink_mode": {
+                                "type": "integer",
+                                "description": (
+                                    "Optional LED blink mode for set_led: 0 steady, "
+                                    "1 slow square, 2 fast square, 3 breathe."
+                                ),
+                            },
+                            "scene": {
+                                "type": "string",
+                                "description": (
+                                    "Scene name for apply_scene, such as gentle, steady, "
+                                    "intense, or cooldown."
+                                ),
+                            },
+                            "direction": {
+                                "type": "string",
+                                "description": (
+                                    "Direction for nudge_intensity: up to intensify or "
+                                    "down to soften."
+                                ),
+                            },
+                            "step": {
+                                "type": "number",
+                                "description": (
+                                    "Optional intensity delta for nudge_intensity."
+                                ),
+                            },
+                        },
+                        "required": ["action"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: _handle_control_cup(
+                        arguments,
+                        base_url=cup_settings.base_url,
+                        api_token=cup_settings.resolved_api_token(),
+                        timeout_seconds=cup_settings.timeout_seconds,
+                    ),
+                    usage_guidance=(
+                        "Use only when the user clearly asks to inspect or change the CUP "
+                        "hardware, or when there is obvious ongoing CUP-control context. "
+                        "Prefer nudge_intensity for requests like '再刺激一点' or '温柔一点', "
+                        "apply_scene for broad mode changes, and stop for any pause or "
+                        "safety-oriented request."
+                    ),
+                    examples=(
+                        ('用户说: "看看飞机杯现在的状态"', '{"action":"status"}'),
+                        (
+                            '用户说: "把 CUP 转快一点"',
+                            '{"action":"nudge_intensity","direction":"up"}',
+                        ),
+                        (
+                            '用户说: "切到温柔一点的模式"',
+                            '{"action":"apply_scene","scene":"gentle"}',
+                        ),
+                    ),
+                    should_offer=lambda user_text, route_mode: _matches_cup_control_intent(
+                        user_text
+                    ),
+                    execution_meta=ToolExecutionMeta(
+                        parallel_safe=False,
+                        side_effectful=True,
+                        retryable=False,
+                        timeout_seconds=float(cup_settings.timeout_seconds),
+                    ),
+                )
+            )
 
         if config is not None and config.shell_sandbox.enabled:
             shell_executor = ShellSandboxExecutor(
@@ -573,6 +811,20 @@ class ToolRegistry:
             if spec.execution_meta.visible_to_model
         ]
 
+    def openai_tools_for_request(
+        self,
+        user_text: str,
+        *,
+        route_mode: str,
+    ) -> list[dict[str, object]]:
+        return [
+            spec.as_openai_tool()
+            for spec in self._visible_specs_for_request(
+                user_text,
+                route_mode=route_mode,
+            )
+        ]
+
     def tool_prompt(self) -> str:
         visible_specs = [
             spec for spec in self.specs if spec.execution_meta.visible_to_model
@@ -583,12 +835,16 @@ class ToolRegistry:
             f"- available_tools: {tool_names}",
             "- Use tools when you need fresh factual data, external pages, or project-specific live endpoints.",
             "- Prefer high-level tools that accept raw user phrases. Keep time expressions and user wording natural unless a tool explicitly needs normalization.",
+            "- Use conversation context to resolve references like '当地', '这里', 'here', 'that city', or a previously shared URL/topic. If two related tools are available, choose the one whose description best matches the user's intent and referenced entity.",
             "- Do not invent arguments that the user did not imply. If a location, URL, or code is missing, ask naturally instead of guessing.",
+            "- Only use side-effectful tools when the user clearly asked you to inspect or change the external device or system.",
             "- After receiving tool results, answer naturally and briefly.",
         ]
         for spec in visible_specs:
             lines.append(f"- tool: {spec.name}")
             lines.append(f"  description: {spec.description}")
+            if spec.execution_meta.side_effectful:
+                lines.append("  requires_clear_user_intent: yes")
             if spec.usage_guidance:
                 lines.append(f"  use_when: {spec.usage_guidance}")
             for argument_line in _tool_argument_lines(spec):
@@ -598,29 +854,58 @@ class ToolRegistry:
         return "\n".join(lines)
 
     def should_offer_tools(self, user_text: str, *, route_mode: str) -> bool:
-        visible_specs = [
-            spec for spec in self.specs if spec.execution_meta.visible_to_model
-        ]
-        if any(
-            spec.should_offer is not None and spec.should_offer(user_text, route_mode)
-            for spec in visible_specs
-        ):
-            return True
-        if not any(spec.should_offer is not None for spec in visible_specs):
-            text = user_text.strip()
-            if route_mode == "search":
-                return True
-            if text.startswith("/search "):
-                return True
-            return should_fetch_weather(text)
-        return False
+        return bool(
+            self._visible_specs_for_request(user_text, route_mode=route_mode)
+        )
 
-    def default_tool_choice(self, *, route_mode: str) -> str | None:
+    def default_tool_choice(self, *, user_text: str, route_mode: str) -> str | None:
         if route_mode == "search":
             return "required"
+        for spec in self.specs:
+            if not spec.execution_meta.visible_to_model or not spec.execution_meta.side_effectful:
+                continue
+            if spec.should_offer is not None and spec.should_offer(user_text, route_mode):
+                return "required"
         return None
 
+    def _visible_specs_for_request(
+        self,
+        user_text: str,
+        *,
+        route_mode: str,
+    ) -> tuple[ToolSpec, ...]:
+        visible_specs = tuple(
+            spec for spec in self.specs if spec.execution_meta.visible_to_model
+        )
+        matched_specs = tuple(
+            spec
+            for spec in visible_specs
+            if spec.should_offer is not None and spec.should_offer(user_text, route_mode)
+        )
+        if matched_specs:
+            selected_names = {spec.name for spec in matched_specs}
+            for spec in matched_specs:
+                selected_names.update(spec.related_tools)
+            return tuple(
+                spec for spec in visible_specs if spec.name in selected_names
+            )
+        if not any(spec.should_offer is not None for spec in visible_specs):
+            return visible_specs
+        return ()
+
     def execute(self, tool_call: ToolInvocation) -> ToolExecutionResult:
+        if tool_call.name == "$web_search":
+            try:
+                parsed_arguments = tool_call.arguments()
+            except Exception as exc:
+                raise ToolExecutionError(
+                    "Tool '$web_search' received invalid JSON arguments."
+                ) from exc
+            return ToolExecutionResult(
+                tool_call_id=tool_call.tool_call_id,
+                name=tool_call.name,
+                content=json.dumps(parsed_arguments, ensure_ascii=False),
+            )
         try:
             spec = self._by_name[tool_call.name]
         except KeyError as exc:
@@ -672,6 +957,42 @@ def _handle_get_public_ip(arguments: dict[str, object]) -> dict[str, object]:
     return {"public_ip": public_ip}
 
 
+def _handle_get_local_area(arguments: dict[str, object]) -> dict[str, object]:
+    if arguments:
+        raise ToolExecutionError("get_local_area does not accept arguments.")
+
+    location = lookup_local_area(_tool_fetch_json, _TOOL_TIMEOUT_SECONDS)
+    return {
+        "location": location.label,
+        "city": location.city,
+        "region": location.region,
+        "country": location.country,
+        "latitude": location.latitude,
+        "longitude": location.longitude,
+        "timezone": location.timezone,
+    }
+
+
+def _handle_get_local_time(arguments: dict[str, object]) -> dict[str, object]:
+    if arguments:
+        raise ToolExecutionError("get_local_time does not accept arguments.")
+
+    location = lookup_local_area(_tool_fetch_json, _TOOL_TIMEOUT_SECONDS)
+    try:
+        now = datetime.now(ZoneInfo(location.timezone))
+    except Exception as exc:
+        raise ToolExecutionError(
+            f"get_local_time could not resolve timezone {location.timezone!r}."
+        ) from exc
+    return {
+        "location": location.label,
+        "timezone": location.timezone,
+        "local_datetime": now.isoformat(),
+        "local_date": now.date().isoformat(),
+        "local_time": now.strftime("%H:%M:%S"),
+    }
+
+
 def _handle_get_ip_location(arguments: dict[str, object]) -> dict[str, object]:
     public_ip = arguments.get("ip")
     if not isinstance(public_ip, str) or not public_ip.strip():
@@ -714,6 +1035,202 @@ def _handle_get_local_weather(arguments: dict[str, object]) -> dict[str, object]
     report = lookup_weather_for_ip(_tool_fetch_json, _TOOL_TIMEOUT_SECONDS)
     query = _weather_query_for_local(time_expression)
     return _weather_payload_from_report(report, request_query=query)
+
+
+def _handle_control_led(
+    arguments: dict[str, object],
+    *,
+    base_url: str,
+    timeout_seconds: int,
+) -> dict[str, object]:
+    action, implied_blink = _resolve_led_action(
+        _require_string_argument(arguments, "action", tool_name="control_led")
+    )
+    if action == "status":
+        response = _tool_fetch_json(_led_api_url(base_url, "/status"), timeout_seconds)
+        return _led_payload_from_response(base_url, action=action, response=response)
+
+    if action == "set_color":
+        red, green, blue = _resolve_led_rgb(arguments)
+        response = _tool_fetch_json(
+            _led_api_url(
+                base_url,
+                "/led",
+                {"r": red, "g": green, "b": blue},
+            ),
+            timeout_seconds,
+        )
+        payload = _led_payload_from_response(base_url, action=action, response=response)
+        payload["requested_color_hex"] = _rgb_to_hex(red, green, blue)
+        return payload
+
+    blink = (
+        implied_blink
+        if implied_blink is not None
+        else _require_boolish_argument(arguments, "blink", tool_name="control_led")
+    )
+    response = _tool_fetch_json(
+        _led_api_url(base_url, "/blink", {"v": 1 if blink else 0}),
+        timeout_seconds,
+    )
+    payload = _led_payload_from_response(base_url, action="set_blink", response=response)
+    payload["blink"] = _coerce_boolish(response.get("blink"), fallback=blink)
+    return payload
+
+
+def _handle_control_cup(
+    arguments: dict[str, object],
+    *,
+    base_url: str,
+    api_token: str | None,
+    timeout_seconds: int,
+) -> dict[str, object]:
+    request_trace: list[dict[str, object]] = []
+
+    def cup_request(
+        path: str,
+        *,
+        method: str = "GET",
+        payload: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        url = _cup_api_url(base_url, path)
+        trace_item: dict[str, object] = {
+            "method": method.upper(),
+            "url": url,
+        }
+        if payload is not None:
+            trace_item["payload"] = payload
+        request_trace.append(trace_item)
+        try:
+            return _tool_http_json_request(
+                url,
+                timeout_seconds,
+                method=method,
+                payload=payload,
+                headers=_cup_api_headers(api_token),
+            )
+        except Exception as exc:
+            raise ToolExecutionError(
+                f"HTTP {method.upper()} {url} failed: {exc.__class__.__name__}: {exc}"
+            ) from exc
+
+    action = _resolve_cup_action(
+        _require_string_argument(arguments, "action", tool_name="control_cup")
+    )
+    if action == "status":
+        system_response = cup_request("/api/status")
+        motor_response = cup_request("/api/motor")
+        return {
+            "ok": True,
+            "device": base_url,
+            "action": "status",
+            "system": _unwrap_device_response(system_response),
+            "motor": _unwrap_device_response(motor_response),
+            "request_trace": request_trace,
+        }
+
+    if action == "set_motor":
+        body: dict[str, object] = {}
+        target_velocity = _optional_number_argument(arguments, "target_velocity")
+        enabled = _optional_boolish_argument(arguments, "enabled")
+        if target_velocity is not None:
+            body["target_velocity"] = round(target_velocity, 3)
+        if enabled is not None:
+            body["enabled"] = enabled
+        if not body:
+            raise ToolExecutionError(
+                "control_cup set_motor requires 'target_velocity', 'enabled', or both."
+            )
+        response = cup_request("/api/motor", method="POST", payload=body)
+        payload = _device_action_payload(
+            base_url,
+            action="set_motor",
+            requested=body,
+            response=response,
+        )
+        payload["request_trace"] = request_trace
+        return payload
+
+    if action == "stop":
+        response = cup_request("/api/motor/stop", method="POST", payload={})
+        payload = _device_action_payload(
+            base_url,
+            action="stop",
+            requested={"target_velocity": 0.0, "enabled": False},
+            response=response,
+        )
+        payload["stopped"] = True
+        payload["request_trace"] = request_trace
+        return payload
+
+    if action == "set_led":
+        body = _cup_led_body_from_arguments(arguments)
+        response = cup_request("/api/led", method="POST", payload=body)
+        payload = _device_action_payload(
+            base_url,
+            action="set_led",
+            requested=body,
+            response=response,
+        )
+        payload["request_trace"] = request_trace
+        return payload
+
+    if action == "apply_scene":
+        scene_name, scene_payload = _resolve_cup_scene(
+            _require_string_argument(arguments, "scene", tool_name="control_cup")
+        )
+        led_body = dict(scene_payload["led"])
+        motor_body = dict(scene_payload["motor"])
+        led_response = cup_request("/api/led", method="POST", payload=led_body)
+        if not motor_body.get("enabled", True):
+            motor_response = cup_request("/api/motor/stop", method="POST", payload={})
+        else:
+            motor_response = cup_request("/api/motor", method="POST", payload=motor_body)
+        return {
+            "ok": True,
+            "device": base_url,
+            "action": "apply_scene",
+            "scene": scene_name,
+            "motor": motor_body,
+            "led": led_body,
+            "motor_result": _unwrap_device_response(motor_response),
+            "led_result": _unwrap_device_response(led_response),
+            "request_trace": request_trace,
+        }
+
+    direction = _resolve_cup_direction(
+        _require_string_argument(arguments, "direction", tool_name="control_cup")
+    )
+    current_response = cup_request("/api/motor")
+    current_target = _cup_current_target_velocity(_unwrap_device_response(current_response))
+    requested_step = _optional_number_argument(arguments, "step")
+    step = abs(requested_step) if requested_step is not None else 15.0
+    next_target = current_target + step if direction == "up" else current_target - step
+    next_target = max(0.0, min(_CUP_MAX_TARGET_VELOCITY, next_target))
+    led_body = _cup_led_profile_for_velocity(next_target)
+    led_response = cup_request("/api/led", method="POST", payload=led_body)
+    if next_target <= 0.0:
+        motor_response = cup_request("/api/motor/stop", method="POST", payload={})
+        motor_body: dict[str, object] = {"target_velocity": 0.0, "enabled": False}
+    else:
+        motor_body = {
+            "target_velocity": round(next_target, 3),
+            "enabled": True,
+        }
+        motor_response = cup_request("/api/motor", method="POST", payload=motor_body)
+    return {
+        "ok": True,
+        "device": base_url,
+        "action": "nudge_intensity",
+        "direction": direction,
+        "previous_target_velocity": round(current_target, 3),
+        "target_velocity": round(next_target, 3),
+        "motor": motor_body,
+        "led": led_body,
+        "motor_result": _unwrap_device_response(motor_response),
+        "led_result": _unwrap_device_response(led_response),
+        "request_trace": request_trace,
+    }
 
 
 def _handle_run_shell_command(
@@ -769,10 +1286,155 @@ def _handle_url_context_tool(
 
 
 def _matches_local_weather_intent(user_text: str) -> bool:
+    if not should_fetch_weather(user_text):
+        return False
+    place = _extract_city_weather_place(user_text)
+    return place is None or _is_local_reference_phrase(place)
+
+
+def _matches_weather_by_location_intent(user_text: str) -> bool:
+    if not should_fetch_weather(user_text):
+        return False
+    place = _extract_city_weather_place(user_text)
+    return place is not None and not _is_local_reference_phrase(place)
+
+
+def _matches_local_area_intent(user_text: str) -> bool:
     lowered = user_text.casefold()
-    return should_fetch_weather(user_text) and any(
-        keyword.casefold() in lowered for keyword in LOCAL_TIME_KEYWORDS
+    if should_fetch_weather(user_text):
+        return False
+    explicit_phrases = (
+        "where am i",
+        "where i am",
+        "where i'm",
+        "my location",
+        "my coordinates",
+        "my coordinate",
+        "my latitude",
+        "my longitude",
+        "my timezone",
+        "local timezone",
+        "当前位置",
+        "我在哪",
+        "我在哪里",
+        "我这里是哪里",
+        "我的位置",
+        "我的坐标",
+        "我的经纬度",
+        "我的时区",
+        "本地时区",
+        "当地时区",
+        "我这里的坐标",
+        "我这里的经纬度",
+        "我这里的时区",
     )
+    if any(phrase in lowered for phrase in explicit_phrases):
+        return True
+    local_reference = any(keyword.casefold() in lowered for keyword in LOCAL_TIME_KEYWORDS)
+    location_request = any(
+        keyword in lowered
+        for keyword in (
+            "location",
+            "coordinates",
+            "coordinate",
+            "latitude",
+            "longitude",
+            "timezone",
+            "时区",
+            "坐标",
+            "经纬度",
+            "位置",
+            "在哪",
+            "哪里",
+        )
+    )
+    return local_reference and location_request
+
+
+def _matches_local_time_intent(user_text: str) -> bool:
+    lowered = user_text.casefold()
+    if should_fetch_weather(user_text):
+        return False
+    if _contains_any(user_text, ("holiday", "holidays", "节假日", "假期")):
+        return False
+    extracted_place = _extract_time_place(user_text)
+    if extracted_place is not None:
+        return _is_local_reference_phrase(extracted_place)
+    explicit_phrases = (
+        "what time is it here",
+        "what time is it where i am",
+        "time here",
+        "我这里几点",
+        "我这里现在几点",
+        "我这边几点",
+        "我这边现在几点",
+        "我这里现在时间",
+        "我这边现在时间",
+    )
+    if any(phrase in lowered for phrase in explicit_phrases):
+        return True
+    if any(
+        phrase in lowered
+        for phrase in (
+            "here",
+            "where i am",
+            "where i'm",
+            "my location",
+            "my area",
+            "我这里",
+            "我这边",
+            "这里",
+            "这边",
+            "当前位置",
+        )
+    ):
+        return any(
+            keyword in lowered
+            for keyword in (
+                "current time",
+                "what time",
+                "local time",
+                "time now",
+                "几点",
+                "时间",
+            )
+        )
+    stripped = re.sub(r"\s+", " ", lowered).strip(" ?？!！.,，。")
+    return stripped in {
+        "what time is it",
+        "current time",
+        "local time",
+        "time now",
+        "现在几点",
+        "几点了",
+        "本地时间",
+        "当地时间",
+        "当前时间",
+        "现在时间",
+    }
+
+
+def _is_local_reference_phrase(value: str) -> bool:
+    normalized = re.sub(r"\s+", " ", value.casefold()).strip(" ?？!！.,，。")
+    return normalized in {
+        "here",
+        "where i am",
+        "where i'm",
+        "my location",
+        "my area",
+        "local",
+        "local area",
+        "local timezone",
+        "current location",
+        "current area",
+        "我这里",
+        "我这边",
+        "这里",
+        "这边",
+        "当前位置",
+        "本地",
+        "当地",
+    }
 
 
 def _matches_shell_command_intent(user_text: str) -> bool:
@@ -794,6 +1456,176 @@ def _matches_shell_command_intent(user_text: str) -> bool:
         "执行命令",
     )
     return any(keyword in lowered for keyword in keywords)
+
+
+_LED_DEVICE_KEYWORDS = ("led", "灯", "灯光", "彩灯", "氛围灯", "rgb")
+_LED_COLOR_ACTION_KEYWORDS = (
+    "color",
+    "颜色",
+    "red",
+    "green",
+    "blue",
+    "white",
+    "yellow",
+    "orange",
+    "purple",
+    "pink",
+    "红",
+    "绿",
+    "蓝",
+    "白",
+    "黄",
+    "橙",
+    "紫",
+    "粉",
+    "blink",
+    "闪",
+    "状态",
+    "status",
+    "关灯",
+    "熄灭",
+)
+_LED_SCENE_KEYWORDS = (
+    "mood",
+    "romantic",
+    "cozy",
+    "ambient",
+    "模式",
+    "氛围",
+    "浪漫",
+    "柔和",
+    "冷色",
+    "暖色",
+    "冷一点",
+    "暖一点",
+    "烛光",
+    "派对",
+    "放松",
+)
+_LED_CONTROL_VERBS = (
+    "set",
+    "switch",
+    "change",
+    "adjust",
+    "tune",
+    "make",
+    "turn",
+    "调",
+    "调整",
+    "切换",
+    "换",
+    "改",
+    "设置",
+    "设成",
+    "调成",
+    "改成",
+    "变成",
+    "弄成",
+    "开",
+    "关",
+)
+
+
+def _matches_led_control_intent(user_text: str) -> bool:
+    lowered = user_text.casefold()
+    return any(keyword in lowered for keyword in _LED_DEVICE_KEYWORDS) and any(
+        keyword in lowered
+        for keyword in (
+            *_LED_COLOR_ACTION_KEYWORDS,
+            *_LED_SCENE_KEYWORDS,
+            *_LED_CONTROL_VERBS,
+        )
+    )
+
+
+def _matches_led_scene_followup(user_text: str) -> bool:
+    lowered = user_text.casefold()
+    return any(
+        keyword in lowered
+        for keyword in (
+            *_LED_COLOR_ACTION_KEYWORDS,
+            *_LED_SCENE_KEYWORDS,
+            *_LED_CONTROL_VERBS,
+        )
+    )
+
+
+_CUP_DEVICE_KEYWORDS = (
+    "cup",
+    "飞机杯",
+    "飞机杯硬件",
+    "masturbator",
+    "马达",
+    "电机",
+    "motor",
+    "转速",
+    "震动",
+    "振动",
+)
+_CUP_CONTROL_KEYWORDS = (
+    "status",
+    "状态",
+    "启动",
+    "开始",
+    "停止",
+    "停下",
+    "停一下",
+    "暂停",
+    "恢复",
+    "快一点",
+    "慢一点",
+    "强一点",
+    "弱一点",
+    "刺激一点",
+    "温柔一点",
+    "柔和一点",
+    "加速",
+    "减速",
+    "intensity",
+    "speed",
+    "faster",
+    "slower",
+    "motor",
+    "led",
+    "灯光",
+    "颜色",
+)
+_CUP_SCENE_KEYWORDS = (
+    "gentle",
+    "steady",
+    "intense",
+    "cooldown",
+    "轻柔",
+    "温柔",
+    "稳一点",
+    "刺激",
+    "猛烈",
+    "缓一缓",
+    "冷静一下",
+)
+
+
+def _matches_cup_control_intent(user_text: str) -> bool:
+    lowered = user_text.casefold()
+    return any(keyword in lowered for keyword in _CUP_DEVICE_KEYWORDS) and any(
+        keyword in lowered
+        for keyword in (
+            *_CUP_CONTROL_KEYWORDS,
+            *_CUP_SCENE_KEYWORDS,
+            *_LED_CONTROL_VERBS,
+        )
+    )
+
+
+def _matches_cup_scene_followup(user_text: str) -> bool:
+    lowered = user_text.casefold()
+    return any(
+        keyword in lowered
+        for keyword in (
+            *_CUP_CONTROL_KEYWORDS,
+            *_CUP_SCENE_KEYWORDS,
+        )
+    )
 
 
 def _query_tool_schema(description: str) -> dict[str, object]:
@@ -850,6 +1682,407 @@ def _optional_string_argument(arguments: dict[str, object], key: str) -> str | N
         raise ToolExecutionError(f"'{key}' must be a string when provided.")
     normalized = value.strip()
     return normalized or None
+
+
+def _optional_number_argument(arguments: dict[str, object], key: str) -> float | None:
+    value = arguments.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ToolExecutionError(f"'{key}' must be a number when provided.")
+    return float(value)
+
+
+def _optional_integer_argument(arguments: dict[str, object], key: str) -> int | None:
+    value = arguments.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ToolExecutionError(f"'{key}' must be an integer when provided.")
+    return value
+
+
+def _optional_boolish_argument(arguments: dict[str, object], key: str) -> bool | None:
+    value = arguments.get(key)
+    if value is None:
+        return None
+    coerced = _coerce_boolish(value)
+    if coerced is None:
+        raise ToolExecutionError(f"'{key}' must be a boolean when provided.")
+    return coerced
+
+
+_LED_COLOR_ALIASES: dict[str, tuple[int, int, int]] = {
+    "red": (255, 0, 0),
+    "红": (255, 0, 0),
+    "红色": (255, 0, 0),
+    "green": (0, 255, 0),
+    "lime": (0, 255, 0),
+    "绿": (0, 255, 0),
+    "绿色": (0, 255, 0),
+    "blue": (0, 0, 255),
+    "蓝": (0, 0, 255),
+    "蓝色": (0, 0, 255),
+    "yellow": (255, 255, 0),
+    "黄": (255, 255, 0),
+    "黄色": (255, 255, 0),
+    "orange": (255, 165, 0),
+    "橙": (255, 165, 0),
+    "橙色": (255, 165, 0),
+    "purple": (128, 0, 128),
+    "violet": (128, 0, 128),
+    "紫": (128, 0, 128),
+    "紫色": (128, 0, 128),
+    "pink": (255, 105, 180),
+    "粉": (255, 105, 180),
+    "粉色": (255, 105, 180),
+    "cyan": (0, 255, 255),
+    "青": (0, 255, 255),
+    "青色": (0, 255, 255),
+    "white": (255, 255, 255),
+    "白": (255, 255, 255),
+    "白色": (255, 255, 255),
+    "warmwhite": (255, 180, 96),
+    "暖白": (255, 180, 96),
+    "暖白色": (255, 180, 96),
+    "black": (0, 0, 0),
+    "off": (0, 0, 0),
+    "关闭": (0, 0, 0),
+    "关灯": (0, 0, 0),
+    "熄灭": (0, 0, 0),
+    "黑": (0, 0, 0),
+    "黑色": (0, 0, 0),
+}
+
+_CUP_MAX_TARGET_VELOCITY = 140.0
+_CUP_SCENES: dict[str, dict[str, object]] = {
+    "gentle": {
+        "aliases": ("gentle", "soft", "轻柔", "温柔", "柔和"),
+        "motor": {"target_velocity": 40.0, "enabled": True},
+        "led": {"color": "#ffb36b", "blink_hz": 0.45, "blink_mode": 3},
+    },
+    "steady": {
+        "aliases": ("steady", "normal", "稳一点", "平稳", "常规"),
+        "motor": {"target_velocity": 70.0, "enabled": True},
+        "led": {"color": "#40c4ff", "blink_hz": 0.9, "blink_mode": 1},
+    },
+    "intense": {
+        "aliases": ("intense", "strong", "刺激", "猛烈", "更猛"),
+        "motor": {"target_velocity": 110.0, "enabled": True},
+        "led": {"color": "#ff3b30", "blink_hz": 2.0, "blink_mode": 2},
+    },
+    "cooldown": {
+        "aliases": ("cooldown", "calm", "缓一缓", "冷静一下", "放松"),
+        "motor": {"target_velocity": 20.0, "enabled": True},
+        "led": {"color": "#7fd8ff", "blink_hz": 0.35, "blink_mode": 3},
+    },
+}
+
+
+def _resolve_led_action(action: str) -> tuple[str, bool | None]:
+    key = _normalize_control_token(action)
+    if key in {"status", "getstatus", "readstatus", "querystatus", "状态"}:
+        return "status", None
+    if key in {"setcolor", "color", "setrgb", "rgb", "颜色"}:
+        return "set_color", None
+    if key in {"setblink", "blink", "闪烁"}:
+        return "set_blink", None
+    if key in {"blinkon", "enableblink", "startblink", "打开闪烁", "开启闪烁"}:
+        return "set_blink", True
+    if key in {"blinkoff", "disableblink", "stopblink", "关闭闪烁", "停止闪烁"}:
+        return "set_blink", False
+    raise ToolExecutionError(
+        "control_led action must be one of set_color, set_blink, or status."
+    )
+
+
+def _resolve_cup_action(action: str) -> str:
+    key = _normalize_control_token(action)
+    if key in {"status", "getstatus", "readstatus", "querystatus", "状态"}:
+        return "status"
+    if key in {"setmotor", "motor", "speed", "velocity", "setspeed", "setvelocity"}:
+        return "set_motor"
+    if key in {"stop", "pause", "停止", "停下", "停一下", "暂停"}:
+        return "stop"
+    if key in {"setled", "led", "light", "灯光", "颜色"}:
+        return "set_led"
+    if key in {"applyscene", "scene", "mode", "preset", "场景", "模式"}:
+        return "apply_scene"
+    if key in {"nudgeintensity", "intensity", "adjust", "tune", "调整强度", "强弱"}:
+        return "nudge_intensity"
+    raise ToolExecutionError(
+        "control_cup action must be one of status, set_motor, stop, set_led, "
+        "apply_scene, or nudge_intensity."
+    )
+
+
+def _resolve_cup_scene(scene: str) -> tuple[str, dict[str, dict[str, object]]]:
+    key = _normalize_control_token(scene)
+    for scene_name, payload in _CUP_SCENES.items():
+        aliases = payload.get("aliases", ())
+        if not isinstance(aliases, tuple):
+            continue
+        if any(_normalize_control_token(alias) == key for alias in aliases):
+            return (
+                scene_name,
+                {
+                    "motor": dict(payload["motor"]),
+                    "led": dict(payload["led"]),
+                },
+            )
+    available = ", ".join(sorted(_CUP_SCENES.keys()))
+    raise ToolExecutionError(
+        f"control_cup apply_scene scene must be one of: {available}."
+    )
+
+
+def _resolve_cup_direction(direction: str) -> str:
+    key = _normalize_control_token(direction)
+    if key in {"up", "increase", "more", "higher", "faster", "stronger", "更强", "更快", "增加"}:
+        return "up"
+    if key in {"down", "decrease", "less", "lower", "slower", "softer", "更慢", "减弱", "降低"}:
+        return "down"
+    raise ToolExecutionError(
+        "control_cup nudge_intensity direction must be 'up' or 'down'."
+    )
+
+
+def _resolve_led_rgb(arguments: dict[str, object]) -> tuple[int, int, int]:
+    color = _optional_string_argument(arguments, "color")
+    explicit_rgb_present = any(key in arguments for key in ("r", "g", "b"))
+    if color is not None and explicit_rgb_present:
+        raise ToolExecutionError(
+            "control_led set_color accepts either 'color' or explicit r/g/b values, not both."
+        )
+    if color is not None:
+        parsed = _parse_led_color(color)
+        if parsed is None:
+            raise ToolExecutionError(
+                "control_led could not parse the requested color. Use a common color name, "
+                "a #RRGGBB hex value, or explicit r/g/b values."
+            )
+        return parsed
+    return (
+        _require_byte_argument(arguments, "r", tool_name="control_led"),
+        _require_byte_argument(arguments, "g", tool_name="control_led"),
+        _require_byte_argument(arguments, "b", tool_name="control_led"),
+    )
+
+
+def _parse_led_color(color: str) -> tuple[int, int, int] | None:
+    normalized = color.strip()
+    if not normalized:
+        return None
+    hex_match = re.fullmatch(r"#?([0-9a-fA-F]{6})", normalized)
+    if hex_match:
+        value = hex_match.group(1)
+        return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+    rgb_match = re.fullmatch(
+        r"rgb\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if rgb_match:
+        red, green, blue = (int(part) for part in rgb_match.groups())
+        if all(0 <= value <= 255 for value in (red, green, blue)):
+            return red, green, blue
+        return None
+    return _LED_COLOR_ALIASES.get(_normalize_control_token(normalized))
+
+
+def _normalize_control_token(value: str) -> str:
+    return (
+        value.strip()
+        .casefold()
+        .replace(" ", "")
+        .replace("-", "")
+        .replace("_", "")
+    )
+
+
+def _require_byte_argument(
+    arguments: dict[str, object],
+    key: str,
+    *,
+    tool_name: str,
+) -> int:
+    value = arguments.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ToolExecutionError(f"{tool_name} requires integer '{key}' values between 0 and 255.")
+    if value < 0 or value > 255:
+        raise ToolExecutionError(f"{tool_name} requires integer '{key}' values between 0 and 255.")
+    return value
+
+
+def _require_boolish_argument(
+    arguments: dict[str, object],
+    key: str,
+    *,
+    tool_name: str,
+) -> bool:
+    value = arguments.get(key)
+    coerced = _coerce_boolish(value)
+    if coerced is None:
+        raise ToolExecutionError(f"{tool_name} requires a boolean '{key}' value.")
+    return coerced
+
+
+def _coerce_boolish(value: object, *, fallback: bool | None = None) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        key = _normalize_control_token(value)
+        if key in {"1", "true", "on", "enable", "enabled", "yes", "start"}:
+            return True
+        if key in {"0", "false", "off", "disable", "disabled", "no", "stop"}:
+            return False
+    return fallback
+
+
+def _led_api_url(base_url: str, path: str, params: dict[str, object] | None = None) -> str:
+    endpoint = f"{base_url.rstrip('/')}{path}"
+    if not params:
+        return endpoint
+    return f"{endpoint}?{urlparse.urlencode(params)}"
+
+
+def _led_payload_from_response(
+    base_url: str,
+    *,
+    action: str,
+    response: dict[str, object],
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "ok": True,
+        "device": base_url,
+        "action": action,
+    }
+    red = _coerce_led_channel(response.get("r"))
+    green = _coerce_led_channel(response.get("g"))
+    blue = _coerce_led_channel(response.get("b"))
+    if None not in {red, green, blue}:
+        payload["r"] = red
+        payload["g"] = green
+        payload["b"] = blue
+        payload["color_hex"] = _rgb_to_hex(red, green, blue)
+    blink = _coerce_boolish(response.get("blink"))
+    if blink is not None:
+        payload["blink"] = blink
+    return payload
+
+
+def _coerce_led_channel(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= 255 else None
+    if isinstance(value, str) and value.isdigit():
+        numeric = int(value)
+        return numeric if 0 <= numeric <= 255 else None
+    return None
+
+
+def _rgb_to_hex(red: int, green: int, blue: int) -> str:
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def _cup_led_body_from_arguments(arguments: dict[str, object]) -> dict[str, object]:
+    body: dict[str, object] = {}
+    color = _optional_string_argument(arguments, "color")
+    if color is not None:
+        parsed = _parse_led_color(color)
+        if parsed is None:
+            raise ToolExecutionError(
+                "control_cup set_led could not parse the requested color."
+            )
+        body["color"] = _rgb_to_hex(*parsed)
+    blink_hz = _optional_number_argument(arguments, "blink_hz")
+    if blink_hz is not None:
+        if blink_hz < 0:
+            raise ToolExecutionError("control_cup set_led requires 'blink_hz' >= 0.")
+        body["blink_hz"] = round(blink_hz, 3)
+    blink_mode = _optional_integer_argument(arguments, "blink_mode")
+    if blink_mode is not None:
+        if blink_mode not in {0, 1, 2, 3}:
+            raise ToolExecutionError("control_cup set_led requires blink_mode between 0 and 3.")
+        body["blink_mode"] = blink_mode
+    if not body:
+        raise ToolExecutionError(
+            "control_cup set_led requires at least one of 'color', 'blink_hz', or 'blink_mode'."
+        )
+    return body
+
+
+def _cup_led_profile_for_velocity(target_velocity: float) -> dict[str, object]:
+    if target_velocity <= 0:
+        return {"color": "#7fd8ff", "blink_hz": 0.25, "blink_mode": 3}
+    if target_velocity < 50:
+        return {"color": "#ffb36b", "blink_hz": 0.45, "blink_mode": 3}
+    if target_velocity < 90:
+        return {"color": "#40c4ff", "blink_hz": 0.9, "blink_mode": 1}
+    return {"color": "#ff3b30", "blink_hz": 2.0, "blink_mode": 2}
+
+
+def _cup_current_target_velocity(payload: object) -> float:
+    if not isinstance(payload, dict):
+        return 0.0
+    target = _coerce_number(payload.get("target"))
+    if target is not None:
+        return target
+    velocity = _coerce_number(payload.get("vel"))
+    return velocity or 0.0
+
+
+def _cup_api_url(base_url: str, path: str) -> str:
+    normalized_base = base_url.rstrip("/")
+    normalized_path = path if path.startswith("/") else f"/{path}"
+    if normalized_base.endswith("/api") and normalized_path.startswith("/api/"):
+        normalized_path = normalized_path.removeprefix("/api")
+    elif normalized_base.endswith("/api") and normalized_path == "/api":
+        normalized_path = ""
+    return f"{normalized_base}{normalized_path}"
+
+
+def _cup_api_headers(api_token: str | None) -> dict[str, str]:
+    headers = {
+        "Accept": "application/json",
+    }
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+    return headers
+
+
+def _unwrap_device_response(response: dict[str, object]) -> dict[str, object]:
+    if not isinstance(response, dict):
+        raise ToolExecutionError("Device API returned a non-object payload.")
+    ok = response.get("ok")
+    if ok is False:
+        error = response.get("error")
+        raise ToolExecutionError(
+            f"Device API error: {error}" if isinstance(error, str) and error else "Device API error."
+        )
+    data = response.get("data")
+    if isinstance(data, dict):
+        return data
+    return response
+
+
+def _device_action_payload(
+    base_url: str,
+    *,
+    action: str,
+    requested: dict[str, object],
+    response: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "ok": True,
+        "device": base_url,
+        "action": action,
+        "requested": requested,
+        "result": _unwrap_device_response(response),
+    }
 
 
 def _weather_query_for_local(time_expression: str | None) -> str:
@@ -954,6 +2187,46 @@ def _forecast_payload(
 
 
 _TOOL_TIMEOUT_SECONDS = 10
+
+
+def _coerce_number(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _tool_http_json_request(
+    url: str,
+    timeout_seconds: int,
+    *,
+    method: str = "GET",
+    payload: dict[str, object] | None = None,
+    headers: dict[str, str] | None = None,
+) -> dict[str, object]:
+    merged_headers = {
+        "User-Agent": "Whesper/1.0",
+        "Accept": "application/json",
+    }
+    if payload is not None:
+        merged_headers["Content-Type"] = "application/json"
+    if headers:
+        merged_headers.update(headers)
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    request = urlrequest.Request(
+        url,
+        data=body,
+        headers=merged_headers,
+        method=method.upper(),
+    )
+    with urlrequest.urlopen(request, timeout=timeout_seconds) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 def _tool_fetch_json(url: str, timeout_seconds: int) -> dict:

@@ -22,6 +22,7 @@ class StubMessageBuilder:
         user_text: str,
         route_mode: str,
         planning_prompt: str | None = None,
+        include_live_context: bool = True,
     ) -> list[dict[str, object]]:
         messages: list[dict[str, object]] = [
             {"role": "system", "content": model_system_prompt or "system"}
@@ -94,6 +95,30 @@ class StubCompletionRequester:
         return AgentCompletion(content="final answer", raw_response={})
 
 
+class AskUserCompletionRequester:
+    def __call__(
+        self,
+        *,
+        session_id: str,
+        decision: RouteDecision,
+        provider,
+        model,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None = None,
+        tool_choice: str | dict[str, object] | None = None,
+        streamed: bool,
+        structured_tool_arguments: bool = False,
+    ) -> AgentCompletion:
+        return AgentCompletion(
+            content=(
+                '<ask_user>{"prompt":"你想查哪个城市？","options":'
+                '[{"label":"上海","value":"上海"},{"label":"东京","value":"东京"}],'
+                '"allow_free_text":true,"field_name":"location"}</ask_user>'
+            ),
+            raw_response={},
+        )
+
+
 class AgentHarnessTests(unittest.TestCase):
     def test_harness_runs_multi_step_loop_without_chat_service(self) -> None:
         session = ConversationSession(
@@ -135,7 +160,9 @@ class AgentHarnessTests(unittest.TestCase):
             tool_executor=ToolExecutor(tool_registry),
             completion_requester=requester,
             tool_call_payload_builder=protocol_adapter.tool_call_payload,
-            tool_choice_builder=lambda tools, *, route_mode: "required" if tools else None,
+            tool_choice_builder=(
+                lambda session, user_text, tools, *, route_mode: "required" if tools else None
+            ),
             reasoning_content_resolver=lambda decision, completion: completion.reasoning_content,
             trace_emitter=lambda **kwargs: trace_events.append(kwargs),
             max_rounds=4,
@@ -163,3 +190,55 @@ class AgentHarnessTests(unittest.TestCase):
         self.assertEqual(len(requester.calls), 2)
         self.assertTrue(any(event["kind"] == "tool_calls" for event in trace_events))
         self.assertTrue(any(event["kind"] == "tool_result" for event in trace_events))
+
+    def test_harness_returns_ask_user_action(self) -> None:
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            messages=[
+                ChatMessage(
+                    role="user",
+                    content="帮我查天气",
+                    created_at="2026-01-01T00:00:00+00:00",
+                )
+            ],
+        )
+        tool_registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="get_weather_by_location",
+                    description="Get weather",
+                    parameters_schema={"type": "object"},
+                    handler=lambda arguments: {"ok": True},
+                ),
+            )
+        )
+        protocol_adapter = DefaultToolProtocolAdapter()
+        harness = AgentHarness(
+            message_builder=StubMessageBuilder(),
+            tool_executor=ToolExecutor(tool_registry),
+            completion_requester=AskUserCompletionRequester(),
+            tool_call_payload_builder=protocol_adapter.tool_call_payload,
+            tool_choice_builder=lambda session, user_text, tools, *, route_mode: None,
+            reasoning_content_resolver=lambda decision, completion: completion.reasoning_content,
+            max_rounds=2,
+        )
+
+        result = harness.run_until_final(
+            session,
+            RouteDecision(model_alias="chat", mode="chat", reason="default chat model"),
+            provider=SimpleNamespace(name="stub-provider"),
+            model=SimpleNamespace(name="stub-model"),
+            model_system_prompt="system",
+            user_text="帮我查天气",
+            route_mode="chat",
+            tool_message_format=ToolMessageFormat(),
+            tools=tool_registry.openai_tools(),
+        )
+
+        self.assertIsNotNone(result.ask_user)
+        assert result.ask_user is not None
+        self.assertEqual(result.ask_user.prompt, "你想查哪个城市？")
+        self.assertEqual(result.ask_user.options[0].label, "上海")
+        self.assertEqual([step.kind for step in result.steps], ["ask_user"])

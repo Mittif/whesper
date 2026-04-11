@@ -12,9 +12,9 @@ from whesper.cli import (
     run_streaming_turn,
 )
 from whesper.chat import ChatService, ChatTurnResult
-from whesper.client import CompletionResult
+from whesper.client import CompletionResult, ToolCall
 from whesper.commands import ParsedCommand
-from whesper.tools import ToolRegistry
+from whesper.tools import ToolRegistry, ToolSpec
 from whesper.config import (
     AppConfig,
     AppSettings,
@@ -29,6 +29,7 @@ from whesper.memory import MemoryStore
 from whesper.router import RouteDecision
 from whesper.session import ChatMessage, ConversationSession, SessionStore
 from whesper.trace import TraceStore, make_trace_event
+from whesper.agent_types import ToolExecutionMeta
 
 
 class FakeStreamingClient:
@@ -57,12 +58,51 @@ class DebugClient:
         return CompletionResult(content="debug answer", raw_response={})
 
 
+class ToolTraceClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def create_chat_completion_stream(self, provider, model, messages):
+        raise AssertionError("streaming should not be called in this test")
+
+    def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
+        self.calls += 1
+        if self.calls == 1:
+            return CompletionResult(
+                content="",
+                raw_response={},
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="call_cup_1",
+                        name="control_cup",
+                        arguments_json='{"action":"nudge_intensity","direction":"up"}',
+                    ),
+                ),
+            )
+        return CompletionResult(content="已经继续增强了一点。", raw_response={})
+
+
 class InterruptingToolProbeClient:
     def create_chat_completion_stream(self, provider, model, messages):
         raise AssertionError("streaming should not be called in this test")
 
     def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
         raise KeyboardInterrupt()
+
+
+class AskUserCliClient:
+    def create_chat_completion_stream(self, provider, model, messages):
+        raise AssertionError("streaming should not be called in this test")
+
+    def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
+        return CompletionResult(
+            content=(
+                '<ask_user>{"prompt":"你想查哪个城市？","options":'
+                '[{"label":"上海","value":"上海"},{"label":"东京","value":"东京","description":"更快一点"}],'
+                '"allow_free_text":true,"field_name":"location"}</ask_user>'
+            ),
+            raw_response={},
+        )
 
 
 def build_config() -> AppConfig:
@@ -106,7 +146,6 @@ class CliTests(unittest.TestCase):
         return ChatService(config, client=DebugClient(), trace_store=trace_store, tool_registry=ToolRegistry(specs=()))
 
     def build_interrupting_tool_probe_service(self, config: AppConfig) -> ChatService:
-        from whesper.tools import ToolSpec
         registry = ToolRegistry(
             specs=(
                 ToolSpec(
@@ -123,6 +162,54 @@ class CliTests(unittest.TestCase):
             )
         )
         return ChatService(config, client=InterruptingToolProbeClient(), tool_registry=registry)
+
+    def build_cup_chat_service(
+        self,
+        config: AppConfig,
+        *,
+        client=None,
+        trace_store: TraceStore | None = None,
+        seen_arguments: list[dict[str, object]] | None = None,
+    ) -> ChatService:
+        def handler(arguments: dict[str, object]) -> dict[str, object]:
+            if seen_arguments is not None:
+                seen_arguments.append(arguments)
+            return {
+                "ok": True,
+                "action": arguments.get("action"),
+                "echo": arguments,
+                "request_trace": [
+                    {"method": "GET", "url": "http://localhost:3001/api/motor"},
+                    {
+                        "method": "POST",
+                        "url": "http://localhost:3001/api/motor",
+                        "payload": arguments,
+                    },
+                ],
+            }
+
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="control_cup",
+                    description="Control the CUP hardware",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"action": {"type": "string"}},
+                        "required": ["action"],
+                        "additionalProperties": False,
+                    },
+                    handler=handler,
+                    execution_meta=ToolExecutionMeta(side_effectful=True),
+                ),
+            )
+        )
+        return ChatService(
+            config,
+            client=client or DebugClient(),
+            trace_store=trace_store,
+            tool_registry=registry,
+        )
 
     def test_invalid_model_alias_is_handled_without_crash(self) -> None:
         config = build_config()
@@ -257,6 +344,128 @@ class CliTests(unittest.TestCase):
         self.assertTrue(outcome.handled)
         self.assertIn("alias: local_chat", rendered)
         self.assertIn("model id: qwen", rendered)
+
+    def test_cup_status_command_executes_control_tool(self) -> None:
+        config = build_config()
+        seen_arguments: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            session = store.load("main")
+            output = io.StringIO()
+
+            outcome = handle_command(
+                ParsedCommand(name="/cup-status"),
+                config=config,
+                store=store,
+                chat_service=self.build_cup_chat_service(config, seen_arguments=seen_arguments),
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertTrue(outcome.handled)
+        self.assertEqual(seen_arguments, [{"action": "status"}])
+        self.assertIn("CUP Status", rendered)
+        self.assertIn('"action": "status"', rendered)
+
+    def test_cup_speed_command_sets_motor_velocity(self) -> None:
+        config = build_config()
+        seen_arguments: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            session = store.load("main")
+            output = io.StringIO()
+
+            outcome = handle_command(
+                ParsedCommand(name="/cup-speed", arg="88"),
+                config=config,
+                store=store,
+                chat_service=self.build_cup_chat_service(config, seen_arguments=seen_arguments),
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertTrue(outcome.handled)
+        self.assertEqual(
+            seen_arguments,
+            [{"action": "set_motor", "target_velocity": 88.0, "enabled": True}],
+        )
+        self.assertIn("CUP Speed", rendered)
+        self.assertIn('"target_velocity": 88.0', rendered)
+
+    def test_cup_led_command_sets_color_and_blink(self) -> None:
+        config = build_config()
+        seen_arguments: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            session = store.load("main")
+            output = io.StringIO()
+
+            outcome = handle_command(
+                ParsedCommand(name="/cup-led", arg="#ff69b4 1.5 3"),
+                config=config,
+                store=store,
+                chat_service=self.build_cup_chat_service(config, seen_arguments=seen_arguments),
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertTrue(outcome.handled)
+        self.assertEqual(
+            seen_arguments,
+            [{"action": "set_led", "color": "#ff69b4", "blink_hz": 1.5, "blink_mode": 3}],
+        )
+        self.assertIn("CUP LED", rendered)
+        self.assertIn('"blink_mode": 3', rendered)
+
+    def test_cup_scene_command_validates_scene_name(self) -> None:
+        config = build_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            session = store.load("main")
+            output = io.StringIO()
+
+            outcome = handle_command(
+                ParsedCommand(name="/cup-scene", arg="turbo"),
+                config=config,
+                store=store,
+                chat_service=self.build_cup_chat_service(config),
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertTrue(outcome.handled)
+        self.assertIn("scene must be one of", rendered)
+        self.assertIn("Usage: /cup-scene <gentle|steady|intense|cooldown>", rendered)
+
+    def test_cup_command_reports_missing_tool(self) -> None:
+        config = build_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            session = store.load("main")
+            output = io.StringIO()
+
+            outcome = handle_command(
+                ParsedCommand(name="/cup-status"),
+                config=config,
+                store=store,
+                chat_service=self.build_chat_service(config),
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertTrue(outcome.handled)
+        self.assertIn("control_cup tool is not available", rendered)
+        self.assertIn("local client API", rendered)
 
     def test_history_command_renders_colored_cards_for_roles(self) -> None:
         config = build_config()
@@ -503,6 +712,37 @@ class CliTests(unittest.TestCase):
         self.assertIn("Final Reply", rendered)
         self.assertIn("debug answer", rendered)
 
+    def test_trace_command_with_tool_call_renders_request_trace(self) -> None:
+        config = build_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            trace_store = TraceStore(tmpdir)
+            session = store.load("main")
+            output = io.StringIO()
+
+            outcome = handle_command(
+                ParsedCommand(name="/trace", arg="我想要再刺激一点"),
+                config=config,
+                store=store,
+                chat_service=self.build_cup_chat_service(
+                    config,
+                    client=ToolTraceClient(),
+                    trace_store=trace_store,
+                ),
+                trace_store=trace_store,
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertTrue(outcome.handled)
+        self.assertIn("Execution Timeline", rendered)
+        self.assertIn("Tool Request Trace", rendered)
+        self.assertIn("control_cup", rendered)
+        self.assertIn("http://localhost:3001/api/motor", rendered)
+        self.assertIn("已经继续增强了一点", rendered)
+
     def test_retry_command_replaces_last_assistant_reply(self) -> None:
         config = build_config()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -599,6 +839,51 @@ class CliTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertIn("Request interrupted before the provider finished responding.", rendered)
         self.assertEqual(session.messages[-1].role, "user")
+
+    def test_run_streaming_turn_renders_ask_user_quick_options(self) -> None:
+        config = build_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            session = store.load("main")
+            output = io.StringIO()
+            from whesper.tools import ToolSpec
+
+            service = ChatService(
+                config,
+                client=AskUserCliClient(),
+                tool_registry=ToolRegistry(
+                    specs=(
+                        ToolSpec(
+                            name="get_weather_by_location",
+                            description="Get weather",
+                            parameters_schema={
+                                "type": "object",
+                                "properties": {"location": {"type": "string"}},
+                                "required": ["location"],
+                                "additionalProperties": False,
+                            },
+                            handler=lambda arguments: {"ok": True},
+                        ),
+                    )
+                ),
+            )
+
+            run_streaming_turn(
+                service,
+                store,
+                session,
+                user_text="帮我查天气",
+                mode_override="chat",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertIn("你想查哪个城市？", rendered)
+        self.assertIn("Quick options:", rendered)
+        self.assertIn("1. 上海", rendered)
+        self.assertIn("2. 东京", rendered)
+        self.assertIn("Enter a number or type your own answer to continue.", rendered)
+        self.assertIsNotNone(session.pending_ask_user)
 
     def test_copy_last_prints_last_assistant_reply(self) -> None:
         config = build_config()

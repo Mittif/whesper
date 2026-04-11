@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from whesper.agent_harness import AgentHarness, AGENTIC_PLANNING_PROMPT, StepCallback
+from whesper.agent_harness import (
+    AGENTIC_PLANNING_PROMPT,
+    AgentHarness,
+    StepCallback,
+    parse_ask_user_action,
+)
+from whesper.agent_types import AskUserAction
 from whesper.client import CompletionResult, OpenAICompatibleClient, ProviderError, ToolCall
 from whesper.config import AppConfig
 from whesper.live_data import LiveContextService
@@ -14,13 +20,20 @@ from whesper.session import ChatMessage, ConversationSession, utc_now_iso
 from whesper.tool_executor import ToolExecutor
 from whesper.tool_protocol import DefaultToolProtocolAdapter, ToolMessageFormat
 from whesper.trace import TraceStore, make_trace_event
-from whesper.tools import ToolRegistry
+from whesper.tools import (
+    ToolRegistry,
+    _matches_cup_control_intent,
+    _matches_cup_scene_followup,
+    _matches_led_control_intent,
+    _matches_led_scene_followup,
+)
 
 
 @dataclass(slots=True)
 class ChatTurnResult:
     decision: RouteDecision
     assistant_message: ChatMessage
+    ask_user: AskUserAction | None = None
 
 
 class GenerationInterrupted(RuntimeError):
@@ -76,12 +89,14 @@ class ChatService:
         mode_override: str = "auto",
         on_step: StepCallback | None = None,
     ) -> ChatTurnResult:
-        self._append_user_message(session, user_text)
+        resolved_user_text = self._resolve_pending_ask_response(session, user_text)
+        self._append_user_message(session, resolved_user_text)
+        session.pending_ask_user = None
         if self.memory_service is not None:
-            self.memory_service.capture_user_message(session.session_id, user_text)
+            self.memory_service.capture_user_message(session.session_id, resolved_user_text)
         return self._complete_turn(
             session,
-            user_text,
+            resolved_user_text,
             mode_override=mode_override,
             on_step=on_step,
         )
@@ -95,12 +110,14 @@ class ChatService:
         on_chunk: Callable[[str], None] | None = None,
         on_step: StepCallback | None = None,
     ) -> ChatTurnResult:
-        self._append_user_message(session, user_text)
+        resolved_user_text = self._resolve_pending_ask_response(session, user_text)
+        self._append_user_message(session, resolved_user_text)
+        session.pending_ask_user = None
         if self.memory_service is not None:
-            self.memory_service.capture_user_message(session.session_id, user_text)
+            self.memory_service.capture_user_message(session.session_id, resolved_user_text)
         return self._complete_turn_stream(
             session,
-            user_text,
+            resolved_user_text,
             mode_override=mode_override,
             on_chunk=on_chunk,
             on_step=on_step,
@@ -150,6 +167,13 @@ class ChatService:
         model_config = self.config.get_model(decision.model_alias)
         provider_config = self.config.get_provider(model_config.provider)
         tool_message_format = self._tool_message_format(model_config, provider_config)
+        tools = self._tools_for_request(
+            session=session,
+            provider=provider_config,
+            model=model_config,
+            user_text=user_text,
+            route_mode=decision.mode,
+        )
 
         messages = self._build_messages(
             session,
@@ -157,8 +181,8 @@ class ChatService:
             tool_message_format=tool_message_format,
             user_text=user_text,
             route_mode=decision.mode,
+            include_live_context=tools is None,
         )
-        tools = self._tools_for_request(provider_name=provider_config.name, user_text=user_text, route_mode=decision.mode)
         if tools is not None:
             run_result = self.harness.run_until_final(
                 session,
@@ -173,6 +197,7 @@ class ChatService:
                 on_step=on_step,
             )
             completion = run_result.completion
+            ask_user = run_result.ask_user
         else:
             completion = self._client_create_chat_completion(
                 session_id=session.session_id,
@@ -182,10 +207,12 @@ class ChatService:
                 messages=messages,
                 streamed=False,
             )
+            ask_user = parse_ask_user_action(completion.content)
         return self._append_assistant_message(
             session,
             decision,
-            completion.content,
+            ask_user.prompt if ask_user is not None else completion.content,
+            ask_user=ask_user,
         )
 
     def _complete_turn_stream(
@@ -208,17 +235,20 @@ class ChatService:
         model_config = self.config.get_model(decision.model_alias)
         provider_config = self.config.get_provider(model_config.provider)
         tool_message_format = self._tool_message_format(model_config, provider_config)
+        tools = self._tools_for_request(
+            session=session,
+            provider=provider_config,
+            model=model_config,
+            user_text=user_text,
+            route_mode=decision.mode,
+        )
         messages = self._build_messages(
             session,
             model_config.system_prompt,
             tool_message_format=tool_message_format,
             user_text=user_text,
             route_mode=decision.mode,
-        )
-        tools = self._tools_for_request(
-            provider_name=provider_config.name,
-            user_text=user_text,
-            route_mode=decision.mode,
+            include_live_context=tools is None,
         )
         if tools is None:
             return self._stream_final_answer(
@@ -251,6 +281,16 @@ class ChatService:
                 on_chunk=on_chunk,
             )
         completion = run_result.completion
+        ask_user = run_result.ask_user
+        if ask_user is not None:
+            if on_chunk is not None and ask_user.prompt:
+                on_chunk(ask_user.prompt)
+            return self._append_assistant_message(
+                session,
+                decision,
+                ask_user.prompt,
+                ask_user=ask_user,
+            )
         if on_chunk is not None and completion.content:
             on_chunk(completion.content)
         return self._append_assistant_message(session, decision, completion.content)
@@ -269,6 +309,21 @@ class ChatService:
             session.updated_at = session.messages[-1].created_at
             return
         session.updated_at = session.created_at
+
+    def _resolve_pending_ask_response(
+        self,
+        session: ConversationSession,
+        user_text: str,
+    ) -> str:
+        pending = session.pending_ask_user
+        if pending is None:
+            return user_text
+        normalized = user_text.strip()
+        if normalized.isdigit():
+            index = int(normalized) - 1
+            if 0 <= index < len(pending.options):
+                return pending.options[index].value
+        return user_text
 
     def _append_user_message(self, session: ConversationSession, user_text: str) -> ChatMessage:
         user_message = ChatMessage(
@@ -295,6 +350,7 @@ class ChatService:
         user_text: str,
         route_mode: str,
         include_planning_prompt: bool = True,
+        include_live_context: bool = True,
     ) -> list[dict[str, object]]:
         planning_prompt = AGENTIC_PLANNING_PROMPT if include_planning_prompt else None
         return self.message_builder.build_messages(
@@ -304,6 +360,7 @@ class ChatService:
             user_text=user_text,
             route_mode=route_mode,
             planning_prompt=planning_prompt,
+            include_live_context=include_live_context,
         )
 
     def _tool_call_payload(self, tool_call: ToolCall) -> dict[str, object]:
@@ -321,6 +378,7 @@ class ChatService:
         tool_choice: str | dict[str, object] | None = None,
         streamed: bool,
         structured_tool_arguments: bool = False,
+        allow_disable_thinking: bool = True,
     ) -> CompletionResult:
         messages = self.tool_protocol_adapter.messages_with_normalized_tool_call_ids(messages)
         self._append_trace(
@@ -339,6 +397,8 @@ class ChatService:
                 request_kwargs["tools"] = tools
             if tool_choice is not None:
                 request_kwargs["tool_choice"] = tool_choice
+            if allow_disable_thinking and self._should_disable_thinking_for_request(provider, model, tools):
+                request_kwargs["disable_thinking"] = True
             completion = self.client.create_chat_completion(
                 provider=provider,
                 model=model,
@@ -359,6 +419,32 @@ class ChatService:
             return completion
         except TypeError as exc:
             message = str(exc)
+            if (
+                request_kwargs.get("disable_thinking")
+                and "unexpected keyword argument 'disable_thinking'" in message
+            ):
+                self._append_trace(
+                    kind="fallback",
+                    session_id=session_id,
+                    decision=decision,
+                    provider_name=provider.name,
+                    streamed=streamed,
+                    tools_enabled=tools is not None,
+                    tool_choice=self._stringify_tool_choice(tool_choice),
+                    note="client does not accept disable_thinking; retrying without it",
+                )
+                return self._client_create_chat_completion(
+                    session_id=session_id,
+                    decision=decision,
+                    provider=provider,
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    streamed=streamed,
+                    structured_tool_arguments=structured_tool_arguments,
+                    allow_disable_thinking=False,
+                )
             if tool_choice is not None and "unexpected keyword argument 'tool_choice'" in message:
                 self._append_trace(
                     kind="fallback",
@@ -481,29 +567,174 @@ class ChatService:
     def _tools_for_request(
         self,
         *,
-        provider_name: str,
+        session: ConversationSession | None = None,
+        provider,
+        model,
         user_text: str,
         route_mode: str,
     ) -> list[dict[str, object]] | None:
-        if provider_name in self._tool_unsupported_providers:
+        if provider.name in self._tool_unsupported_providers:
             return None
-        tools = self.tool_registry.openai_tools()
+        tools = list(
+            self.tool_registry.openai_tools_for_request(
+                user_text,
+                route_mode=route_mode,
+            )
+        )
+        if not tools and session is not None:
+            tools = self._hardware_followup_tools_for_request(session, user_text)
+        if self._supports_kimi_builtin_web_search(provider, model):
+            tools = [
+                tool
+                for tool in tools
+                if not (
+                    isinstance(tool, dict)
+                    and isinstance(tool.get("function"), dict)
+                    and tool["function"].get("name") == "web_search"
+                )
+            ]
+            tools.append(self._kimi_web_search_tool())
         if not tools:
             return None
-        # Always offer tools so the model can do multi-step agentic
-        # decomposition for any query. The model decides whether to
-        # actually call them based on the system prompt and user intent.
         return tools
+
+    def _hardware_followup_tools_for_request(
+        self,
+        session: ConversationSession,
+        user_text: str,
+    ) -> list[dict[str, object]]:
+        tool_names: list[str] = []
+        if self._should_require_led_followup_tool_choice(session, user_text):
+            tool_names.append("control_led")
+        if self._should_require_cup_followup_tool_choice(session, user_text):
+            tool_names.append("control_cup")
+        if not tool_names:
+            return []
+        allowed_names = set(tool_names)
+        return [
+            tool
+            for tool in self.tool_registry.openai_tools()
+            if isinstance(tool, dict)
+            and isinstance(tool.get("function"), dict)
+            and tool["function"].get("name") in allowed_names
+        ]
 
     def _tool_choice_for_request(
         self,
+        session: ConversationSession,
+        user_text: str,
         tools: list[dict[str, object]] | None,
         *,
         route_mode: str,
     ) -> str | dict[str, object] | None:
         if tools is None:
             return None
-        return self.tool_registry.default_tool_choice(route_mode=route_mode)
+        default_choice = self.tool_registry.default_tool_choice(
+            user_text=user_text,
+            route_mode=route_mode,
+        )
+        if default_choice is not None:
+            return default_choice
+        if self._should_require_hardware_followup_tool_choice(session, user_text):
+            return "required"
+        return None
+
+    def _should_require_hardware_followup_tool_choice(
+        self,
+        session: ConversationSession,
+        user_text: str,
+    ) -> bool:
+        return self._should_require_led_followup_tool_choice(
+            session, user_text
+        ) or self._should_require_cup_followup_tool_choice(session, user_text)
+
+    def _should_require_led_followup_tool_choice(
+        self,
+        session: ConversationSession,
+        user_text: str,
+    ) -> bool:
+        if _matches_led_control_intent(user_text):
+            return True
+        if not _matches_led_scene_followup(user_text):
+            return False
+        recent_messages = session.messages[-6:]
+        context_keywords = ("led", "灯", "灯光", "氛围灯", "彩灯", "浪漫模式", "闪烁")
+        for message in reversed(recent_messages):
+            if message.role == "tool" and message.name == "control_led":
+                return True
+            if message.role not in {"user", "assistant"}:
+                continue
+            normalized = (message.content or "").casefold()
+            if not normalized:
+                continue
+            if _matches_led_control_intent(message.content):
+                return True
+            if any(keyword in normalized for keyword in context_keywords):
+                return True
+        return False
+
+    def _should_require_cup_followup_tool_choice(
+        self,
+        session: ConversationSession,
+        user_text: str,
+    ) -> bool:
+        if _matches_cup_control_intent(user_text):
+            return True
+        if not _matches_cup_scene_followup(user_text):
+            return False
+        recent_messages = session.messages[-6:]
+        context_keywords = ("cup", "飞机杯", "motor", "转速", "震动", "振动", "马达", "电机")
+        for message in reversed(recent_messages):
+            if message.role == "tool" and message.name == "control_cup":
+                return True
+            if message.role not in {"user", "assistant"}:
+                continue
+            normalized = (message.content or "").casefold()
+            if not normalized:
+                continue
+            if _matches_cup_control_intent(message.content):
+                return True
+            if any(keyword in normalized for keyword in context_keywords):
+                return True
+        return False
+
+    def _supports_kimi_builtin_web_search(self, provider, model) -> bool:
+        if getattr(provider, "kind", "") != "openai_compatible":
+            return False
+        candidates = (
+            getattr(provider, "name", ""),
+            getattr(model, "name", ""),
+            getattr(model, "model", ""),
+        )
+        lowered = " ".join(str(item).casefold() for item in candidates if item)
+        return "kimi" in lowered and "k2.5" in lowered
+
+    @staticmethod
+    def _kimi_web_search_tool() -> dict[str, object]:
+        return {
+            "type": "builtin_function",
+            "function": {
+                "name": "$web_search",
+            },
+        }
+
+    def _should_disable_thinking_for_request(
+        self,
+        provider,
+        model,
+        tools: list[dict[str, object]] | None,
+    ) -> bool:
+        if not self._supports_kimi_builtin_web_search(provider, model):
+            return False
+        if not tools:
+            return False
+        return any(
+            isinstance(tool, dict)
+            and tool.get("type") == "builtin_function"
+            and isinstance(tool.get("function"), dict)
+            and tool["function"].get("name") == "$web_search"
+            for tool in tools
+        )
 
     def _append_trace(
         self,
@@ -726,6 +957,8 @@ class ChatService:
         session: ConversationSession,
         decision: RouteDecision,
         content: str,
+        *,
+        ask_user: AskUserAction | None = None,
     ) -> ChatTurnResult:
         assistant_message = ChatMessage(
             role="assistant",
@@ -744,8 +977,10 @@ class ChatService:
                 route_reason=decision.reason,
             )
         )
+        session.pending_ask_user = ask_user
 
         return ChatTurnResult(
             decision=decision,
             assistant_message=assistant_message,
+            ask_user=ask_user,
         )

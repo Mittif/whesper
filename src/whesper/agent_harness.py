@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
+import re
 from typing import Callable
 
-from whesper.agent_types import AgentCompletion, AgentStep, ToolInvocation
+from whesper.agent_types import (
+    AgentCompletion,
+    AgentStep,
+    AskUserAction,
+    AskUserOption,
+    ToolInvocation,
+)
 from whesper.message_builder import SessionMessageBuilder
 from whesper.router import RouteDecision
 from whesper.session import ChatMessage, ConversationSession, utc_now_iso
@@ -16,6 +24,7 @@ class HarnessRunResult:
     completion: AgentCompletion
     used_tools: bool = False
     final_messages: list[dict[str, object]] | None = None
+    ask_user: AskUserAction | None = None
     steps: list[AgentStep] = field(default_factory=list)
 
 
@@ -61,10 +70,23 @@ When the user's request requires external data or multiple pieces of information
 4. After gathering all needed data, synthesize a concise final answer.
 
 Examples of multi-step workflows:
-- "最近天气怎么样" -> get_public_ip -> get_ip_location(ip) -> get_weather_by_location(city) -> answer
+- "最近天气怎么样" -> get_local_weather -> answer
 - "帮我查一下美元兑日元汇率和东京天气" -> lookup_exchange_rate + get_weather_by_location in sequence -> answer
 
 Always proceed to the next tool call directly. Do NOT narrate your plan or say "让我查一下" without actually calling a tool."""
+
+ASK_USER_FORMAT_PROMPT = """\
+
+## Asking The User To Continue
+
+If you need the user to choose or provide a missing value before you can continue:
+- Do not ask in plain prose.
+- Output exactly one <ask_user>...</ask_user> block and nothing else.
+- Inside the block, emit valid JSON with this shape:
+  {"prompt":"short question","options":[{"label":"short option","value":"text to continue with","description":"optional short hint"}],"allow_free_text":true,"field_name":"optional field name"}
+- Keep options short and actionable. Use 2-4 options when they would help.
+- Set allow_free_text to true unless the user must choose one of the options exactly.
+"""
 
 INTERNAL_CONTINUE_PROMPT = (
     "Continue the same turn internally. Do not narrate that you will search or check. "
@@ -87,6 +109,71 @@ INTERIM_TOOL_RESPONSE_MARKERS = (
     "let me search",
     "one moment",
 )
+
+_ASK_USER_TAG_PATTERN = re.compile(r"<ask_user>\s*(\{.*?\})\s*</ask_user>", re.DOTALL)
+
+
+def parse_ask_user_action(content: str) -> AskUserAction | None:
+    stripped = content.strip()
+    if not stripped:
+        return None
+
+    payload_text: str | None = None
+    tagged_match = _ASK_USER_TAG_PATTERN.fullmatch(stripped)
+    if tagged_match is not None:
+        payload_text = tagged_match.group(1)
+    elif stripped.startswith("{") and stripped.endswith("}"):
+        payload_text = stripped
+
+    if payload_text is None:
+        return None
+
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("type") not in {None, "ask_user"}:
+        return None
+
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+
+    options_raw = payload.get("options", [])
+    options: list[AskUserOption] = []
+    if isinstance(options_raw, list):
+        for item in options_raw:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label")
+            if not isinstance(label, str) or not label.strip():
+                continue
+            value = item.get("value")
+            if not isinstance(value, str) or not value.strip():
+                value = label
+            description = item.get("description")
+            options.append(
+                AskUserOption(
+                    label=label.strip(),
+                    value=value.strip(),
+                    description=(
+                        str(description).strip()
+                        if description is not None and str(description).strip()
+                        else None
+                    ),
+                )
+            )
+
+    allow_free_text = payload.get("allow_free_text", True)
+    field_name = payload.get("field_name")
+    return AskUserAction(
+        prompt=prompt.strip(),
+        options=tuple(options),
+        allow_free_text=bool(allow_free_text),
+        field_name=str(field_name).strip() if isinstance(field_name, str) and field_name.strip() else None,
+    )
 
 
 class AgentHarness:
@@ -132,9 +219,15 @@ class AgentHarness:
                 tool_message_format=tool_message_format,
                 user_text=user_text,
                 route_mode=route_mode,
-                planning_prompt=AGENTIC_PLANNING_PROMPT,
+                planning_prompt=f"{AGENTIC_PLANNING_PROMPT}\n\n{ASK_USER_FORMAT_PROMPT}",
+                include_live_context=False,
             ),
-            tool_choice=self.tool_choice_builder(tools, route_mode=route_mode),
+            tool_choice=self.tool_choice_builder(
+                session,
+                user_text,
+                tools,
+                route_mode=route_mode,
+            ),
         )
 
         for round_index in range(self.max_rounds):
@@ -168,6 +261,34 @@ class AgentHarness:
                 if should_stop:
                     break
                 continue
+
+            ask_user = parse_ask_user_action(completion.content)
+            if ask_user is not None:
+                self._emit_trace(
+                    kind="ask_user",
+                    session_id=session.session_id,
+                    decision=decision,
+                    provider_name=provider.name,
+                    streamed=False,
+                    tools_enabled=True,
+                    tool_choice=self._stringify_tool_choice(state.tool_choice),
+                    preview=ask_user.prompt,
+                )
+                self._record_step(
+                    state,
+                    AgentStep(
+                        round_index=round_index,
+                        kind="ask_user",
+                        summary=ask_user.prompt,
+                    ),
+                    on_step=on_step,
+                )
+                return HarnessRunResult(
+                    completion=completion,
+                    used_tools=state.used_tools,
+                    ask_user=ask_user,
+                    steps=state.steps,
+                )
 
             if self.should_continue_tool_loop(
                 completion.content,
@@ -357,7 +478,8 @@ class AgentHarness:
             tool_message_format=tool_message_format,
             user_text=user_text,
             route_mode=route_mode,
-            planning_prompt=AGENTIC_PLANNING_PROMPT,
+            planning_prompt=f"{AGENTIC_PLANNING_PROMPT}\n\n{ASK_USER_FORMAT_PROMPT}",
+            include_live_context=False,
         )
         if has_error:
             state.working_messages = [

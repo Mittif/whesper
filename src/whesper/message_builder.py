@@ -33,6 +33,7 @@ class SessionMessageBuilder:
         user_text: str,
         route_mode: str,
         planning_prompt: str | None = None,
+        include_live_context: bool = True,
     ) -> list[dict[str, object]]:
         prompts = [self.config.persona.system_prompt.strip()]
         if model_system_prompt:
@@ -46,7 +47,7 @@ class SessionMessageBuilder:
             memory_prompt = self.memory_service.build_prompt_context(user_text)
             if memory_prompt:
                 prompts.append(memory_prompt)
-        if self.live_context_service is not None:
+        if include_live_context and self.live_context_service is not None:
             live_context_prompt = self.live_context_service.build_prompt_context(
                 user_text,
                 route_mode=route_mode,

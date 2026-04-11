@@ -19,18 +19,41 @@ CompletionResult = AgentCompletion
 DEFAULT_TOOL_PROTOCOL_ADAPTER = DefaultToolProtocolAdapter()
 
 
+def _is_kimi_k25(provider: ProviderConfig, model: ModelConfig) -> bool:
+    candidates = (provider.name, model.name, model.model)
+    lowered = " ".join(str(item).casefold() for item in candidates if item)
+    return provider.kind == "openai_compatible" and "kimi" in lowered and "k2.5" in lowered
+
+
+def _effective_temperature(
+    provider: ProviderConfig,
+    model: ModelConfig,
+    *,
+    disable_thinking: bool,
+) -> float:
+    if _is_kimi_k25(provider, model):
+        return 0.6 if disable_thinking else 1.0
+    return model.temperature
+
+
 def _build_openai_payload(
+    provider: ProviderConfig,
     model: ModelConfig,
     messages: list[dict[str, object]],
     *,
     stream: bool,
     tools: list[dict[str, object]] | None = None,
     tool_choice: str | dict[str, object] | None = None,
+    disable_thinking: bool = False,
 ) -> bytes:
     payload: dict[str, object] = {
         "model": model.model,
         "messages": messages,
-        "temperature": model.temperature,
+        "temperature": _effective_temperature(
+            provider,
+            model,
+            disable_thinking=disable_thinking,
+        ),
         "stream": stream,
     }
     if tools:
@@ -41,7 +64,9 @@ def _build_openai_payload(
         payload["max_tokens"] = model.max_tokens
     if model.top_p is not None:
         payload["top_p"] = model.top_p
-    if model.think is not None:
+    if disable_thinking:
+        payload["thinking"] = {"type": "disabled"}
+    elif model.think is not None:
         payload["think"] = model.think
     return json.dumps(payload).encode("utf-8")
 
@@ -93,6 +118,7 @@ def _request_payload(
     stream: bool,
     tools: list[dict[str, object]] | None = None,
     tool_choice: str | dict[str, object] | None = None,
+    disable_thinking: bool = False,
 ) -> bytes:
     if provider.kind == "ollama_native":
         return _build_ollama_payload(
@@ -103,11 +129,13 @@ def _request_payload(
             tool_choice=tool_choice,
         )
     return _build_openai_payload(
+        provider,
         model,
         messages,
         stream=stream,
         tools=tools,
         tool_choice=tool_choice,
+        disable_thinking=disable_thinking,
     )
 
 
@@ -229,6 +257,7 @@ class OpenAICompatibleClient:
         *,
         tools: list[dict[str, object]] | None = None,
         tool_choice: str | dict[str, object] | None = None,
+        disable_thinking: bool = False,
     ) -> CompletionResult:
         req = request.Request(
             _completion_endpoint(provider),
@@ -239,6 +268,7 @@ class OpenAICompatibleClient:
                 stream=False,
                 tools=tools,
                 tool_choice=tool_choice,
+                disable_thinking=disable_thinking,
             ),
             headers=_request_headers(provider),
             method="POST",

@@ -226,12 +226,17 @@ MAP_KEYWORDS = (
 TIME_KEYWORDS = (
     "time in",
     "current time",
+    "local time",
     "what time",
     "timezone",
     "time difference",
     "holiday",
     "holidays",
     "几点",
+    "当前时间",
+    "本地时间",
+    "当地时间",
+    "现在时间",
     "时区",
     "时差",
     "节假日",
@@ -689,14 +694,43 @@ def _extract_map_place(user_text: str) -> str | None:
 def _extract_time_place(user_text: str) -> str | None:
     for pattern in (
         r"(?:time in|what time is it in|timezone of|time difference between)\s+(?P<place>[A-Za-z][A-Za-z .'-]{1,40})",
-        r"(?P<place>[\u4e00-\u9fffA-Za-z·\-\s]{1,20})(?:几点|时间|时区|时差)",
+        r"(?P<place>[A-Za-z][A-Za-z .'-]{1,40})\s+(?:current time|local time|time now|timezone)",
+        r"(?P<place>[\u4e00-\u9fffA-Za-z·\-\s]{1,20})(?:当前时间|本地时间|当地时间|几点|时间|时区|时差)",
     ):
         match = re.search(pattern, user_text, re.IGNORECASE)
         if match:
-            candidate = _normalize_place_candidate(match.group("place"))
+            candidate = _normalize_time_place_candidate(match.group("place"))
             if candidate:
                 return candidate
     return None
+
+
+def _normalize_time_place_candidate(candidate: str) -> str | None:
+    cleaned = candidate.strip(" ,.?，。！？")
+    cleaned = _strip_place_query_prefixes(cleaned)
+    cleaned = re.sub(r"^(in|for|at)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.removeprefix("在").removeprefix("去")
+    for keyword in (
+        "current",
+        "local",
+        "now",
+        "right now",
+        "当前",
+        "本地",
+        "当地",
+        "现在",
+    ):
+        cleaned = re.sub(re.escape(keyword), " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*的\s*", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.?，。！？")
+    if not cleaned:
+        return None
+    lowered = cleaned.casefold()
+    if lowered.startswith(STOPWORD_LOCATION_PREFIXES):
+        return None
+    if lowered in STOPWORD_LOCATIONS:
+        return None
+    return cleaned
 
 
 def _extract_country_code(user_text: str) -> str | None:
@@ -826,7 +860,11 @@ class LiveContextService:
                 GeocodingContextService(),
                 TimeContextService(),
                 NewsContextService(),
-                SearchContextService(),
+                SearchContextService(
+                    api_key=config.live_context.search_api.resolved_api_key(),
+                    engine=config.live_context.search_api.engine,
+                    timeout_seconds=config.live_context.search_api.timeout_seconds,
+                ),
                 TransportStatusContextService(config.live_context.status_api),
                 CustomApiContextService(config.live_context.custom_api),
             )
@@ -855,6 +893,7 @@ def _default_config() -> AppConfig:
         LiveContextSettings,
         PersonaConfig,
         SchedulerConfig,
+        ShellSandboxSettings,
     )
 
     return _AppConfig(
@@ -862,6 +901,7 @@ def _default_config() -> AppConfig:
         persona=PersonaConfig(),
         scheduler=SchedulerConfig(chat_model="chat"),
         live_context=LiveContextSettings(),
+        shell_sandbox=ShellSandboxSettings(),
         providers={},
         models={},
         source_path=Path("whesper.toml"),
@@ -974,9 +1014,9 @@ class LocalWeatherContextService:
             )
 
         return _weather_context_lines(
-            "Live weather data for the user's current IP-based location:",
+            "Live weather data for the user's current local area:",
             report,
-            include_ip=True,
+            include_ip=False,
             user_text=user_text,
         )
 
@@ -1293,7 +1333,9 @@ class NewsContextService:
 class SearchContextService:
     fetch_json: JsonFetcher = _default_fetch_json
     timeout_seconds: int = 10
-    max_related_topics: int = 3
+    api_key: str | None = None
+    engine: str = "google"
+    max_results: int = 3
 
     def build_prompt_context(self, user_text: str, *, route_mode: str = "chat") -> str | None:
         normalized_query = user_text.strip()
@@ -1304,14 +1346,22 @@ class SearchContextService:
         if not should_search or not normalized_query or _extract_urls(normalized_query):
             return None
 
+        if not self.api_key:
+            return (
+                "Live search lookup status:\n"
+                f"- query: {normalized_query}\n"
+                "- failed: missing SerpAPI API key\n"
+                "- instruction: If live search is unavailable, say so briefly instead of pretending you searched."
+            )
+
         search_url = (
-            "https://api.duckduckgo.com/?"
+            "https://serpapi.com/search?"
             + parse.urlencode(
                 {
+                    "engine": self.engine,
                     "q": normalized_query,
-                    "format": "json",
-                    "no_html": "1",
-                    "skip_disambig": "1",
+                    "api_key": self.api_key,
+                    "num": self.max_results,
                 }
             )
         )
@@ -1329,45 +1379,69 @@ class SearchContextService:
             "Live search snapshot:",
             f"- query: {normalized_query}",
         ]
-        heading = _collapse_whitespace(str(response.get("Heading", "")))
-        abstract_text = _collapse_whitespace(str(response.get("AbstractText", "")))
-        abstract_url = _collapse_whitespace(str(response.get("AbstractURL", "")))
-        if heading:
-            lines.append(f"- heading: {heading}")
-        if abstract_text:
-            lines.append(f"- abstract: {abstract_text}")
-        if abstract_url:
-            lines.append(f"- source_url: {abstract_url}")
+        answer_box = response.get("answer_box")
+        if isinstance(answer_box, dict):
+            answer = _collapse_whitespace(
+                str(
+                    answer_box.get("answer")
+                    or answer_box.get("snippet")
+                    or answer_box.get("title")
+                    or ""
+                )
+            )
+            answer_link = _collapse_whitespace(str(answer_box.get("link", "")))
+            if answer:
+                lines.append(f"- answer_box: {answer}")
+            if answer_link:
+                lines.append(f"- answer_box_link: {answer_link}")
 
-        related_topics = self._extract_related_topics(response.get("RelatedTopics", []))
-        for index, topic in enumerate(related_topics, start=1):
-            lines.append(f"- related_{index}: {topic}")
+        knowledge_graph = response.get("knowledge_graph")
+        if isinstance(knowledge_graph, dict):
+            title = _collapse_whitespace(str(knowledge_graph.get("title", "")))
+            description = _collapse_whitespace(str(knowledge_graph.get("description", "")))
+            website = _collapse_whitespace(str(knowledge_graph.get("website", "")))
+            if title:
+                lines.append(f"- knowledge_title: {title}")
+            if description:
+                lines.append(f"- knowledge_description: {description}")
+            if website:
+                lines.append(f"- knowledge_website: {website}")
+
+        organic_results = self._extract_organic_results(response.get("organic_results"))
+        for index, item in enumerate(organic_results, start=1):
+            lines.append(f"- result_{index}_title: {item['title']}")
+            if item["snippet"]:
+                lines.append(f"- result_{index}_snippet: {item['snippet']}")
+            if item["link"]:
+                lines.append(f"- result_{index}_link: {item['link']}")
         if len(lines) == 2:
-            lines.append("- note: No concise instant-answer result was available for this query.")
+            lines.append("- note: No concise organic results were available for this query.")
         lines.append(
             "- instruction: If you use this search snapshot, make it clear it is a lightweight live lookup rather than a full web crawl."
         )
         return "\n".join(lines)
 
-    def _extract_related_topics(self, raw_topics: object) -> list[str]:
-        if not isinstance(raw_topics, list):
+    def _extract_organic_results(self, raw_results: object) -> list[dict[str, str]]:
+        if not isinstance(raw_results, list):
             return []
-        results: list[str] = []
-
-        def visit(items: list[object]) -> None:
-            for item in items:
-                if len(results) >= self.max_related_topics:
-                    return
-                if not isinstance(item, dict):
-                    continue
-                if isinstance(item.get("Text"), str) and item["Text"].strip():
-                    results.append(_collapse_whitespace(item["Text"]))
-                    continue
-                nested = item.get("Topics")
-                if isinstance(nested, list):
-                    visit(nested)
-
-        visit(raw_topics)
+        results: list[dict[str, str]] = []
+        for item in raw_results:
+            if len(results) >= self.max_results:
+                break
+            if not isinstance(item, dict):
+                continue
+            title = _collapse_whitespace(str(item.get("title", "")))
+            snippet = _collapse_whitespace(str(item.get("snippet", "")))
+            link = _collapse_whitespace(str(item.get("link", "")))
+            if not title and not snippet and not link:
+                continue
+            results.append(
+                {
+                    "title": title,
+                    "snippet": snippet,
+                    "link": link,
+                }
+            )
         return results
 
 
@@ -1611,9 +1685,13 @@ def lookup_ip_location(
     )
 
 
-def lookup_weather_for_ip(fetch_json: JsonFetcher, timeout_seconds: int) -> WeatherReport:
+def lookup_local_area(fetch_json: JsonFetcher, timeout_seconds: int) -> IpLocation:
     public_ip = lookup_public_ip(fetch_json, timeout_seconds)
-    location = lookup_ip_location(fetch_json, timeout_seconds, public_ip)
+    return lookup_ip_location(fetch_json, timeout_seconds, public_ip)
+
+
+def lookup_weather_for_ip(fetch_json: JsonFetcher, timeout_seconds: int) -> WeatherReport:
+    location = lookup_local_area(fetch_json, timeout_seconds)
     return _fetch_weather_report(
         fetch_json,
         timeout_seconds,
@@ -1621,7 +1699,7 @@ def lookup_weather_for_ip(fetch_json: JsonFetcher, timeout_seconds: int) -> Weat
         longitude=location.longitude,
         timezone=location.timezone,
         location_label=location.label,
-        public_ip=public_ip,
+        public_ip=location.public_ip,
     )
 
 

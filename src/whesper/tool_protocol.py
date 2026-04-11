@@ -52,7 +52,7 @@ class DefaultToolProtocolAdapter:
     def tool_call_payload(self, tool_call: ToolInvocation) -> dict[str, object]:
         return {
             "id": tool_call.tool_call_id,
-            "type": "function",
+            "type": tool_call.tool_type,
             "function": {
                 "name": tool_call.name,
                 "arguments": tool_call.arguments_json,
@@ -137,6 +137,7 @@ class DefaultToolProtocolAdapter:
                     tool_call_id=f"text-tool-call-{index}",
                     name=name,
                     arguments_json=json.dumps(arguments, ensure_ascii=False),
+                    tool_type="function",
                 )
             )
         return tuple(tool_calls)
@@ -252,6 +253,7 @@ class DefaultToolProtocolAdapter:
                 continue
             name = function.get("name")
             arguments = function.get("arguments", "{}")
+            tool_type = item.get("type", "function")
             if not isinstance(name, str):
                 continue
             if isinstance(arguments, dict):
@@ -263,6 +265,7 @@ class DefaultToolProtocolAdapter:
                     tool_call_id=str(item.get("id") or f"tool-call-{index}"),
                     name=name,
                     arguments_json=arguments_json,
+                    tool_type=str(tool_type) if tool_type is not None else "function",
                 )
             )
         return tuple(tool_calls)

@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 import json
 from pathlib import Path
 
+from whesper.agent_types import AskUserAction, AskUserOption
+
 
 def utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
@@ -79,6 +81,7 @@ class ConversationSession:
     pinned_model: str = "auto"
     messages: list[ChatMessage] = field(default_factory=list)
     transcript_messages: list[ChatMessage] = field(default_factory=list)
+    pending_ask_user: AskUserAction | None = None
 
     def append(self, message: ChatMessage) -> None:
         self.messages.append(message)
@@ -87,6 +90,46 @@ class ConversationSession:
     def append_transcript(self, message: ChatMessage) -> None:
         self.transcript_messages.append(message)
         self.updated_at = message.created_at
+
+
+def _ask_user_from_dict(item: dict[str, object] | None) -> AskUserAction | None:
+    if not isinstance(item, dict):
+        return None
+    prompt = item.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+    options_raw = item.get("options")
+    options: list[AskUserOption] = []
+    if isinstance(options_raw, list):
+        for option_item in options_raw:
+            if not isinstance(option_item, dict):
+                continue
+            label = option_item.get("label")
+            value = option_item.get("value")
+            if not isinstance(label, str) or not label.strip():
+                continue
+            if not isinstance(value, str) or not value.strip():
+                value = label
+            description = option_item.get("description")
+            options.append(
+                AskUserOption(
+                    label=label.strip(),
+                    value=value.strip(),
+                    description=(
+                        str(description).strip()
+                        if description is not None and str(description).strip()
+                        else None
+                    ),
+                )
+            )
+    allow_free_text = item.get("allow_free_text", True)
+    field_name = item.get("field_name")
+    return AskUserAction(
+        prompt=prompt.strip(),
+        options=tuple(options),
+        allow_free_text=bool(allow_free_text),
+        field_name=str(field_name).strip() if isinstance(field_name, str) and field_name.strip() else None,
+    )
 
 
 class SessionStore:
@@ -157,6 +200,7 @@ class SessionStore:
             pinned_model=str(raw.get("pinned_model", "auto")),
             messages=messages,
             transcript_messages=transcript_messages,
+            pending_ask_user=_ask_user_from_dict(raw.get("pending_ask_user")),
         )
 
     def save(self, session: ConversationSession) -> None:
@@ -168,6 +212,11 @@ class SessionStore:
             "updated_at": session.updated_at,
             "pinned_model": session.pinned_model,
             "messages": [asdict(message) for message in session.messages],
+            "pending_ask_user": (
+                asdict(session.pending_ask_user)
+                if session.pending_ask_user is not None
+                else None
+            ),
         }
         transcript_payload = {
             "session_id": session.session_id,
