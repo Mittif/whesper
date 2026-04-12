@@ -6,4 +6,5 @@ __pycache__/
 .venv/
 whesper.toml
 DEVELOPMENT_NOTES.local.md
+hardware.md
 src/whesper.egg-info/
