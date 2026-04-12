@@ -40,6 +40,25 @@ reasoning_keywords = ["分析", "总结", "比较", "计划", "设计", "为什�
 # response_format = "json"
 # instruction = "Use this internal device payload only when it directly answers the user's request."
 # api_key_env = "WHESPER_DEVICE_STATUS_API_KEY"
+#
+# [live_context.search_api]
+# provider = "serpapi"
+# api_key_env = "WHESPER_SERPAPI_API_KEY"
+# engine = "google"
+# timeout_seconds = 10
+
+# Optional hardware device controls.
+#
+# [hardware.led]
+# enabled = true
+# base_url = "http://led.local"
+# timeout_seconds = 5
+#
+# [hardware.cup]
+# enabled = true
+# base_url = "http://localhost:3001"
+# api_token_env = "WHESPER_CUP_API_TOKEN"
+# timeout_seconds = 5
 
 [providers.ollama_local]
 kind = "ollama_native"

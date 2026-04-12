@@ -5,12 +5,15 @@ import copy
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import shlex
 import threading
 import time
 import sys
 from typing import Callable
 
 from whesper.agent_types import AgentStep
+from whesper.agent_types import AskUserAction
+from whesper.agent_types import ToolInvocation
 from whesper.chat import ChatService, ChatTurnResult, GenerationInterrupted
 from whesper.client import ProviderError
 from whesper.commands import (
@@ -31,9 +34,20 @@ from whesper.session import (
     utc_now_iso,
 )
 from whesper.trace import TraceStore
+from whesper.tools import ToolExecutionError
 
 
 DEFAULT_CONFIG_PATH = "whesper.toml"
+CUP_DEBUG_SCENES = ("gentle", "steady", "intense", "cooldown")
+CUP_DEBUG_DIRECTIONS = ("up", "down")
+CUP_COMMAND_USAGE: dict[str, str] = {
+    "/cup-status": "/cup-status",
+    "/cup-speed": "/cup-speed <velocity>",
+    "/cup-stop": "/cup-stop",
+    "/cup-scene": "/cup-scene <gentle|steady|intense|cooldown>",
+    "/cup-intensity": "/cup-intensity <up|down> [step]",
+    "/cup-led": "/cup-led <color> [blink_hz] [blink_mode]",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -202,6 +216,44 @@ def print_trace(
         print(file=output_stream)
 
 
+def _parse_tool_message_payload(content: str) -> dict[str, object] | None:
+    stripped = content.strip()
+    if not stripped:
+        return None
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def collect_tool_debug_entries(messages: list[ChatMessage]) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    for message in messages:
+        if message.role != "tool":
+            continue
+        entry: dict[str, object] = {
+            "tool": message.name or "unknown",
+        }
+        payload = _parse_tool_message_payload(message.content)
+        if payload is not None:
+            action = payload.get("action")
+            if isinstance(action, str) and action:
+                entry["action"] = action
+            request_trace = payload.get("request_trace")
+            if isinstance(request_trace, list) and request_trace:
+                entry["request_trace"] = request_trace
+            else:
+                entry["result"] = payload
+        elif message.content.strip():
+            entry["raw_result"] = message.content.strip()
+        if len(entry) > 1:
+            entries.append(entry)
+    return entries
+
+
 def clone_session(
     session: ConversationSession,
     *,
@@ -303,19 +355,24 @@ def run_trace_debug_turn(
     model_config = chat_service.config.get_model(decision.model_alias)
     provider_config = chat_service.config.get_provider(model_config.provider)
     tool_message_format = chat_service._tool_message_format(model_config, provider_config)
+    tools = chat_service._tools_for_request(
+        session=shadow_session,
+        provider=provider_config,
+        model=model_config,
+        user_text=user_text,
+        route_mode=decision.mode,
+    )
     messages = chat_service._build_messages(
         shadow_session,
         model_config.system_prompt,
         tool_message_format=tool_message_format,
         user_text=user_text,
         route_mode=decision.mode,
-    )
-    tools = chat_service._tools_for_request(
-        provider_name=provider_config.name,
-        user_text=user_text,
-        route_mode=decision.mode,
+        include_live_context=tools is None,
     )
     tool_choice = chat_service._tool_choice_for_request(
+        shadow_session,
+        user_text,
         tools,
         route_mode=decision.mode,
     )
@@ -361,6 +418,13 @@ def run_trace_debug_turn(
         title="Execution Timeline",
         output_stream=output_stream,
     )
+    tool_debug_entries = collect_tool_debug_entries(shadow_session.messages)
+    if tool_debug_entries:
+        print_command_payload(
+            "Tool Request Trace",
+            {"entries": tool_debug_entries},
+            output_stream=output_stream,
+        )
     print(divider("Final Reply", color=SLATE), file=output_stream)
     print(file=output_stream)
     print(colorize(result.assistant_message.content or "(empty reply)", MINT), file=output_stream)
@@ -441,9 +505,40 @@ def describe_agent_step(step: AgentStep) -> str:
         return "whesper> replanning"
     if step.kind == "error_recovery":
         return "whesper> recovering"
+    if step.kind == "ask_user":
+        return "whesper> waiting for your input"
     if step.kind == "final":
         return "whesper> answering"
     return "whesper> thinking"
+
+
+def render_ask_user_prompt(
+    ask_user: AskUserAction,
+    *,
+    output_stream: object = sys.stdout,
+) -> None:
+    if ask_user.options:
+        print_cli_hint("Quick options:", output_stream=output_stream)
+        for index, option in enumerate(ask_user.options, start=1):
+            print(
+                colorize(f"  {index}. {option.label}", CYAN),
+                file=output_stream,
+            )
+            if option.description:
+                print_cli_hint(
+                    f"     {option.description}",
+                    output_stream=output_stream,
+                )
+    if ask_user.allow_free_text:
+        print_cli_hint(
+            "Enter a number or type your own answer to continue.",
+            output_stream=output_stream,
+        )
+    elif ask_user.options:
+        print_cli_hint(
+            "Enter one of the option numbers to continue.",
+            output_stream=output_stream,
+        )
 
 
 def clear_screen(*, output_stream: object = sys.stdout) -> None:
@@ -523,6 +618,195 @@ def print_model_info(
     print(f"think: {model_config.think if model_config.think is not None else 'default'}", file=output_stream)
     print(f"tags: {tags}", file=output_stream)
     print(f"route reason: {decision.reason}", file=output_stream)
+
+
+def print_command_payload(
+    title: str,
+    payload: dict[str, object],
+    *,
+    output_stream: object = sys.stdout,
+) -> None:
+    print(divider(title, color=SLATE), file=output_stream)
+    print(file=output_stream)
+    print(
+        colorize(
+            json.dumps(trim_debug_value(payload), ensure_ascii=False, indent=2),
+            MINT,
+        ),
+        file=output_stream,
+    )
+    print(file=output_stream)
+
+
+def parse_slash_arg_tokens(arg: str | None) -> list[str]:
+    if not arg:
+        return []
+    try:
+        return shlex.split(arg)
+    except ValueError as exc:
+        raise ValueError(f"Invalid command arguments: {exc}") from exc
+
+
+def control_cup_tool_available(chat_service: ChatService) -> bool:
+    return any(spec.name == "control_cup" for spec in chat_service.tool_registry.specs)
+
+
+def execute_control_cup_tool(
+    chat_service: ChatService,
+    arguments: dict[str, object],
+) -> dict[str, object]:
+    if not control_cup_tool_available(chat_service):
+        raise ToolExecutionError(
+            "control_cup tool is not available. Enable [hardware.cup] in your config first."
+        )
+    result = chat_service.tool_executor.execute(
+        ToolInvocation(
+            tool_call_id=f"cli-control-cup-{time.time_ns()}",
+            name="control_cup",
+            arguments_json=json.dumps(arguments, ensure_ascii=False),
+        )
+    )
+    try:
+        payload = json.loads(result.content)
+    except json.JSONDecodeError as exc:
+        raise ToolExecutionError("control_cup returned invalid JSON.") from exc
+    if not isinstance(payload, dict):
+        raise ToolExecutionError("control_cup returned a non-object payload.")
+    return payload
+
+
+def _parse_required_float(token: str, *, field_name: str) -> float:
+    try:
+        return float(token)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be a number.") from exc
+
+
+def _parse_required_int(token: str, *, field_name: str) -> int:
+    try:
+        return int(token)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be an integer.") from exc
+
+
+def handle_cup_debug_command(
+    parsed: ParsedCommand,
+    *,
+    chat_service: ChatService,
+    output_stream: object = sys.stdout,
+) -> bool:
+    if parsed.name not in CUP_COMMAND_USAGE:
+        return False
+
+    def usage() -> None:
+        print_cli_hint(f"Usage: {CUP_COMMAND_USAGE[parsed.name]}", output_stream=output_stream)
+
+    try:
+        tokens = parse_slash_arg_tokens(parsed.arg)
+        if parsed.name == "/cup-status":
+            if tokens:
+                raise ValueError("/cup-status does not accept extra arguments.")
+            payload = execute_control_cup_tool(chat_service, {"action": "status"})
+            print_command_payload("CUP Status", payload, output_stream=output_stream)
+            return True
+
+        if parsed.name == "/cup-stop":
+            if tokens:
+                raise ValueError("/cup-stop does not accept extra arguments.")
+            payload = execute_control_cup_tool(chat_service, {"action": "stop"})
+            print_command_payload("CUP Stop", payload, output_stream=output_stream)
+            return True
+
+        if parsed.name == "/cup-speed":
+            if len(tokens) != 1:
+                raise ValueError("Missing CUP velocity.")
+            velocity = _parse_required_float(tokens[0], field_name="velocity")
+            if velocity < 0:
+                raise ValueError("velocity must be >= 0.")
+            if velocity == 0:
+                payload = execute_control_cup_tool(chat_service, {"action": "stop"})
+                print_command_payload("CUP Stop", payload, output_stream=output_stream)
+                return True
+            payload = execute_control_cup_tool(
+                chat_service,
+                {
+                    "action": "set_motor",
+                    "target_velocity": velocity,
+                    "enabled": True,
+                },
+            )
+            print_command_payload("CUP Speed", payload, output_stream=output_stream)
+            return True
+
+        if parsed.name == "/cup-scene":
+            if len(tokens) != 1:
+                raise ValueError("Missing CUP scene.")
+            scene = tokens[0].strip()
+            if scene not in CUP_DEBUG_SCENES:
+                raise ValueError(
+                    f"scene must be one of: {', '.join(CUP_DEBUG_SCENES)}."
+                )
+            payload = execute_control_cup_tool(
+                chat_service,
+                {"action": "apply_scene", "scene": scene},
+            )
+            print_command_payload("CUP Scene", payload, output_stream=output_stream)
+            return True
+
+        if parsed.name == "/cup-intensity":
+            if not tokens or len(tokens) > 2:
+                raise ValueError("Missing CUP intensity direction.")
+            direction = tokens[0].strip()
+            if direction not in CUP_DEBUG_DIRECTIONS:
+                raise ValueError(
+                    f"direction must be one of: {', '.join(CUP_DEBUG_DIRECTIONS)}."
+                )
+            arguments: dict[str, object] = {
+                "action": "nudge_intensity",
+                "direction": direction,
+            }
+            if len(tokens) == 2:
+                step = _parse_required_float(tokens[1], field_name="step")
+                if step <= 0:
+                    raise ValueError("step must be > 0.")
+                arguments["step"] = step
+            payload = execute_control_cup_tool(chat_service, arguments)
+            print_command_payload("CUP Intensity", payload, output_stream=output_stream)
+            return True
+
+        if parsed.name == "/cup-led":
+            if not tokens or len(tokens) > 3:
+                raise ValueError("Missing CUP LED color.")
+            arguments = {
+                "action": "set_led",
+                "color": tokens[0].strip(),
+            }
+            if len(tokens) >= 2:
+                blink_hz = _parse_required_float(tokens[1], field_name="blink_hz")
+                if blink_hz < 0:
+                    raise ValueError("blink_hz must be >= 0.")
+                arguments["blink_hz"] = blink_hz
+            if len(tokens) == 3:
+                blink_mode = _parse_required_int(tokens[2], field_name="blink_mode")
+                if blink_mode not in {0, 1, 2, 3}:
+                    raise ValueError("blink_mode must be one of: 0, 1, 2, 3.")
+                arguments["blink_mode"] = blink_mode
+            payload = execute_control_cup_tool(chat_service, arguments)
+            print_command_payload("CUP LED", payload, output_stream=output_stream)
+            return True
+    except ValueError as exc:
+        print_cli_error(str(exc), output_stream=output_stream)
+        usage()
+        return True
+    except ToolExecutionError as exc:
+        print_cli_error(str(exc), output_stream=output_stream)
+        print_cli_hint(
+            "Tip: check [hardware.cup] base_url/token and make sure the local client API is running.",
+            output_stream=output_stream,
+        )
+        return True
+
+    return False
 
 
 def build_footer_meta(
@@ -673,6 +957,9 @@ def run_streaming_turn(
                 first_token_seconds = indicator.first_token_at - indicator.started_at
         print(file=output_stream)
         if result is not None:
+            if result.ask_user is not None:
+                render_ask_user_prompt(result.ask_user, output_stream=output_stream)
+                print(file=output_stream)
             render_footer_meta(
                 chat_service.config,
                 result,
@@ -857,6 +1144,12 @@ def handle_command(
                 print_cli_error("No assistant reply is available yet.", output_stream=output_stream)
                 return CommandOutcome(True, session, mode_override)
             print(last_assistant, file=output_stream)
+            return CommandOutcome(True, session, mode_override)
+        if handle_cup_debug_command(
+            parsed,
+            chat_service=chat_service,
+            output_stream=output_stream,
+        ):
             return CommandOutcome(True, session, mode_override)
         if parsed.name in {"/model", "/use"}:
             alias = parsed.arg or "auto"
@@ -1102,6 +1395,7 @@ def interactive_chat(
     )
 
     def toolbar() -> FormattedText:
+        awaiting_followup = " yes " if session.pending_ask_user is not None else " no "
         return FormattedText(
             [
                 ("class:status", f" session {session.session_id} "),
@@ -1109,6 +1403,8 @@ def interactive_chat(
                 ("class:status", f" model {session.pinned_model} "),
                 ("class:hint", "  "),
                 ("class:status", f" route {mode_override} "),
+                ("class:hint", "  "),
+                ("class:status", f" follow-up{awaiting_followup}"),
                 ("class:hint", "  Tab complete  Ctrl+R history  / commands "),
             ]
         )
@@ -1120,11 +1416,17 @@ def interactive_chat(
         "Type /help for commands"
     )
     print()
+    if session.pending_ask_user is not None:
+        print_cli_hint("Pending follow-up:", output_stream=sys.stdout)
+        print(colorize(session.pending_ask_user.prompt, MINT), file=sys.stdout)
+        render_ask_user_prompt(session.pending_ask_user, output_stream=sys.stdout)
+        print()
 
     while True:
         try:
+            prompt_label = "answer" if session.pending_ask_user is not None else "you"
             user_text = prompt_session.prompt(
-                HTML("<prompt>you</prompt> <brand>></brand> "),
+                HTML(f"<prompt>{prompt_label}</prompt> <brand>></brand> "),
                 bottom_toolbar=toolbar,
                 style=style,
             ).strip()

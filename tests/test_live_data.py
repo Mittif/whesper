@@ -172,7 +172,8 @@ class LiveDataTests(unittest.TestCase):
         context = service.build_prompt_context("今天天气怎么样？")
 
         assert context is not None
-        self.assertIn("public_ip: 203.0.113.10", context)
+        self.assertNotIn("public_ip:", context)
+        self.assertIn("Live weather data for the user's current local area:", context)
         self.assertIn("location: Shanghai, Shanghai, China", context)
         self.assertIn("current_condition: Partly cloudy", context)
         self.assertIn("today_condition: Overcast", context)
@@ -656,6 +657,61 @@ class LiveDataTests(unittest.TestCase):
         self.assertIn("timezone: Asia/Singapore", context)
         self.assertIn("local_time:", context)
 
+    def test_time_context_formats_local_time_for_place_prefixed_current_time_query(self) -> None:
+        expected_url = (
+            "https://geocoding-api.open-meteo.com/v1/search?"
+            + parse.urlencode({"name": "Tokyo", "count": 1, "language": "en", "format": "json"})
+        )
+        service = TimeContextService(
+            fetch_json=lambda url, timeout: {
+                "results": [
+                    {
+                        "name": "Tokyo",
+                        "admin1": "Tokyo",
+                        "country": "Japan",
+                        "latitude": 35.6895,
+                        "longitude": 139.6917,
+                        "timezone": "Asia/Tokyo",
+                    }
+                ]
+            }
+            if url == expected_url
+            else (_ for _ in ()).throw(AssertionError(f"unexpected url: {url}")),
+        )
+
+        context = service.build_prompt_context("Tokyo current time")
+
+        assert context is not None
+        self.assertIn("location: Tokyo, Tokyo, Japan", context)
+        self.assertIn("timezone: Asia/Tokyo", context)
+
+    def test_time_context_formats_local_time_for_chinese_remote_current_time_query(self) -> None:
+        expected_url = (
+            "https://geocoding-api.open-meteo.com/v1/search?"
+            + parse.urlencode({"name": "新加坡", "count": 1, "language": "zh", "format": "json"})
+        )
+        service = TimeContextService(
+            fetch_json=lambda url, timeout: {
+                "results": [
+                    {
+                        "name": "新加坡",
+                        "country": "Singapore",
+                        "latitude": 1.2897,
+                        "longitude": 103.8501,
+                        "timezone": "Asia/Singapore",
+                    }
+                ]
+            }
+            if url == expected_url
+            else (_ for _ in ()).throw(AssertionError(f"unexpected url: {url}")),
+        )
+
+        context = service.build_prompt_context("新加坡当前时间")
+
+        assert context is not None
+        self.assertIn("location: 新加坡, Singapore", context)
+        self.assertIn("timezone: Asia/Singapore", context)
+
     def test_time_context_formats_holiday_snapshot(self) -> None:
         expected_url = "https://date.nager.at/api/v3/PublicHolidays/2026/JP"
         service = TimeContextService(
@@ -725,26 +781,36 @@ class LiveDataTests(unittest.TestCase):
         self.assertIn("page_1_title: Example Page", context)
         self.assertIn("page_1_description: A useful example page.", context)
 
-    def test_search_context_uses_duckduckgo_snapshot_in_search_mode(self) -> None:
+    def test_search_context_uses_serpapi_snapshot_in_search_mode(self) -> None:
         expected_url = (
-            "https://api.duckduckgo.com/?"
+            "https://serpapi.com/search?"
             + parse.urlencode(
                 {
+                    "engine": "google",
                     "q": "openai release notes",
-                    "format": "json",
-                    "no_html": "1",
-                    "skip_disambig": "1",
+                    "api_key": "serp-key",
+                    "num": 3,
                 }
             )
         )
         service = SearchContextService(
+            api_key="serp-key",
             fetch_json=lambda url, timeout: {
-                "Heading": "OpenAI",
-                "AbstractText": "OpenAI develops artificial intelligence systems.",
-                "AbstractURL": "https://openai.com/",
-                "RelatedTopics": [
-                    {"Text": "OpenAI API documentation"},
-                    {"Topics": [{"Text": "OpenAI release history"}]},
+                "answer_box": {
+                    "answer": "OpenAI 发布了新的 release notes。",
+                    "link": "https://openai.com/",
+                },
+                "organic_results": [
+                    {
+                        "title": "OpenAI API release notes",
+                        "snippet": "Latest platform changes and release notes.",
+                        "link": "https://platform.openai.com/docs/release-notes",
+                    },
+                    {
+                        "title": "OpenAI changelog",
+                        "snippet": "Model updates and API changes.",
+                        "link": "https://openai.com/changelog",
+                    },
                 ],
             }
             if url == expected_url
@@ -754,9 +820,10 @@ class LiveDataTests(unittest.TestCase):
         context = service.build_prompt_context("openai release notes", route_mode="search")
 
         assert context is not None
-        self.assertIn("heading: OpenAI", context)
-        self.assertIn("source_url: https://openai.com/", context)
-        self.assertIn("related_1: OpenAI API documentation", context)
+        self.assertIn("answer_box: OpenAI 发布了新的 release notes。", context)
+        self.assertIn("answer_box_link: https://openai.com/", context)
+        self.assertIn("result_1_title: OpenAI API release notes", context)
+        self.assertIn("result_2_link: https://openai.com/changelog", context)
 
     def test_tech_docs_context_extracts_headings(self) -> None:
         service = TechDocsContextService(

@@ -83,7 +83,24 @@ class LiveContextEndpointConfig:
 
 
 @dataclass(slots=True)
+class SearchApiSettings:
+    provider: str = "serpapi"
+    api_key: str | None = None
+    api_key_env: str | None = "WHESPER_SERPAPI_API_KEY"
+    engine: str = "google"
+    timeout_seconds: int = 10
+
+    def resolved_api_key(self) -> str | None:
+        if self.api_key is not None:
+            return self.api_key
+        if self.api_key_env:
+            return os.getenv(self.api_key_env)
+        return None
+
+
+@dataclass(slots=True)
 class LiveContextSettings:
+    search_api: SearchApiSettings = field(default_factory=SearchApiSettings)
     custom_api: dict[str, LiveContextEndpointConfig] = field(default_factory=dict)
     status_api: dict[str, LiveContextEndpointConfig] = field(default_factory=dict)
 
@@ -98,6 +115,39 @@ class ShellSandboxSettings:
 
 
 @dataclass(slots=True)
+class LedHardwareSettings:
+    enabled: bool = False
+    base_url: str = "http://led.local"
+    timeout_seconds: int = 5
+
+
+@dataclass(slots=True)
+class CupHardwareSettings:
+    enabled: bool = False
+    base_url: str = "http://localhost:3001"
+    api_token: str | None = None
+    api_token_env: str | None = "WHESPER_CUP_API_TOKEN"
+    timeout_seconds: int = 5
+
+    def resolved_api_token(self) -> str | None:
+        if self.api_token is not None:
+            token = self.api_token.strip()
+            return token or None
+        if self.api_token_env:
+            token = os.getenv(self.api_token_env)
+            if token is not None:
+                normalized = token.strip()
+                return normalized or None
+        return None
+
+
+@dataclass(slots=True)
+class HardwareSettings:
+    led: LedHardwareSettings = field(default_factory=LedHardwareSettings)
+    cup: CupHardwareSettings = field(default_factory=CupHardwareSettings)
+
+
+@dataclass(slots=True)
 class AppConfig:
     app: AppSettings
     persona: PersonaConfig
@@ -107,6 +157,7 @@ class AppConfig:
     providers: dict[str, ProviderConfig]
     models: dict[str, ModelConfig]
     source_path: Path
+    hardware: HardwareSettings = field(default_factory=HardwareSettings)
 
     def get_provider(self, name: str) -> ProviderConfig:
         try:
@@ -238,6 +289,74 @@ def _parse_live_context_endpoints(raw: Any, section_name: str) -> dict[str, Live
     return endpoints
 
 
+def _parse_search_api_settings(raw: Any) -> SearchApiSettings:
+    if raw is None:
+        return SearchApiSettings()
+    if not isinstance(raw, dict):
+        raise ConfigError("Invalid [live_context.search_api] section in config.")
+
+    provider = str(raw.get("provider", "serpapi")).strip()
+    if provider != "serpapi":
+        raise ConfigError("live_context.search_api.provider currently only supports 'serpapi'.")
+
+    engine = str(raw.get("engine", "google")).strip()
+    if not engine:
+        raise ConfigError("live_context.search_api.engine must be a non-empty string.")
+
+    api_key = raw.get("api_key")
+    api_key_env = raw.get("api_key_env", "WHESPER_SERPAPI_API_KEY")
+    return SearchApiSettings(
+        provider=provider,
+        api_key=str(api_key).strip() if api_key is not None else None,
+        api_key_env=str(api_key_env).strip() if api_key_env is not None else None,
+        engine=engine,
+        timeout_seconds=int(raw.get("timeout_seconds", 10)),
+    )
+
+
+def _parse_led_hardware_settings(raw: Any) -> LedHardwareSettings:
+    if raw is None:
+        return LedHardwareSettings()
+    if not isinstance(raw, dict):
+        raise ConfigError("Invalid [hardware.led] section in config.")
+
+    base_url = str(raw.get("base_url", "http://led.local")).strip().rstrip("/")
+    if not base_url:
+        raise ConfigError("hardware.led.base_url must be a non-empty string.")
+
+    return LedHardwareSettings(
+        enabled=bool(raw.get("enabled", False)),
+        base_url=base_url,
+        timeout_seconds=int(raw.get("timeout_seconds", 5)),
+    )
+
+
+def _parse_cup_hardware_settings(raw: Any) -> CupHardwareSettings:
+    if raw is None:
+        return CupHardwareSettings()
+    if not isinstance(raw, dict):
+        raise ConfigError("Invalid [hardware.cup] section in config.")
+
+    base_url = str(raw.get("base_url", "http://localhost:3001")).strip().rstrip("/")
+    if not base_url:
+        raise ConfigError("hardware.cup.base_url must be a non-empty string.")
+
+    api_token = raw.get("api_token")
+    api_token_env = raw.get("api_token_env", "WHESPER_CUP_API_TOKEN")
+    normalized_api_token = str(api_token).strip() if api_token is not None else None
+    normalized_api_token_env = (
+        str(api_token_env).strip() if api_token_env is not None else None
+    )
+
+    return CupHardwareSettings(
+        enabled=bool(raw.get("enabled", False)),
+        base_url=base_url,
+        api_token=normalized_api_token or None,
+        api_token_env=normalized_api_token_env or None,
+        timeout_seconds=int(raw.get("timeout_seconds", 5)),
+    )
+
+
 def load_config(path: str | Path) -> AppConfig:
     config_path = Path(path).expanduser().resolve()
     with config_path.open("rb") as fh:
@@ -247,6 +366,7 @@ def load_config(path: str | Path) -> AppConfig:
     persona_raw = raw.get("persona", {})
     live_context_raw = raw.get("live_context", {})
     shell_sandbox_raw = raw.get("shell_sandbox", {})
+    hardware_raw = raw.get("hardware", {})
     scheduler_raw = _require_table(raw, "scheduler")
     providers_raw = _require_table(raw, "providers")
     models_raw = _require_table(raw, "models")
@@ -279,7 +399,12 @@ def load_config(path: str | Path) -> AppConfig:
         raise ConfigError("Invalid [live_context] section in config.")
     if shell_sandbox_raw and not isinstance(shell_sandbox_raw, dict):
         raise ConfigError("Invalid [shell_sandbox] section in config.")
+    if hardware_raw and not isinstance(hardware_raw, dict):
+        raise ConfigError("Invalid [hardware] section in config.")
     live_context = LiveContextSettings(
+        search_api=_parse_search_api_settings(
+            live_context_raw.get("search_api") if isinstance(live_context_raw, dict) else None
+        ),
         custom_api=_parse_live_context_endpoints(
             live_context_raw.get("custom_api") if isinstance(live_context_raw, dict) else None,
             "custom_api",
@@ -306,6 +431,14 @@ def load_config(path: str | Path) -> AppConfig:
             shell_sandbox_raw.get("allowed_command_prefixes")
             if isinstance(shell_sandbox_raw, dict)
             else None
+        ),
+    )
+    hardware = HardwareSettings(
+        led=_parse_led_hardware_settings(
+            hardware_raw.get("led") if isinstance(hardware_raw, dict) else None
+        ),
+        cup=_parse_cup_hardware_settings(
+            hardware_raw.get("cup") if isinstance(hardware_raw, dict) else None
         ),
     )
 
@@ -359,6 +492,7 @@ def load_config(path: str | Path) -> AppConfig:
         providers=providers,
         models=models,
         source_path=config_path,
+        hardware=hardware,
     )
 
     if scheduler.chat_model not in models:

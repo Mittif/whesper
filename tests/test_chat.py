@@ -10,7 +10,13 @@ from whesper.config import load_config
 from whesper.live_data import LiveContextService
 from whesper.memory import MemoryService, MemoryStore
 from whesper.session import ChatMessage, ConversationSession
-from whesper.tools import ToolRegistry, ToolSpec
+from whesper.tools import (
+    ToolRegistry,
+    ToolSpec,
+    _matches_cup_control_intent,
+    _matches_led_control_intent,
+)
+from whesper.agent_types import ToolExecutionMeta
 
 
 class FakeStreamingClient:
@@ -93,6 +99,20 @@ class ToolCallingClient:
         yield "最新结果"
 
 
+class ToolChoiceCapturingClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
+        self.calls.append(
+            {"messages": messages, "tools": tools, "tool_choice": tool_choice}
+        )
+        return CompletionResult(content="direct answer", raw_response={})
+
+    def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
+        raise AssertionError("streaming should not be called in this test")
+
+
 class ToolUnsupportedClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -166,6 +186,115 @@ class DirectAnswerToolClient:
     def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
         self.stream_calls += 1
         yield "unexpected stream"
+
+
+class AskUserToolClient:
+    def __init__(self) -> None:
+        self.completion_requests: list[dict[str, object]] = []
+
+    def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
+        self.completion_requests.append(
+            {"messages": messages, "tools": tools, "tool_choice": tool_choice}
+        )
+        return CompletionResult(
+            content=(
+                '<ask_user>{"prompt":"你想查哪个城市？","options":'
+                '[{"label":"上海","value":"上海"},{"label":"东京","value":"东京"}],'
+                '"allow_free_text":true,"field_name":"location"}</ask_user>'
+            ),
+            raw_response={},
+        )
+
+    def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
+        raise AssertionError("streaming should not be called in this test")
+
+
+class AskUserFollowupClient:
+    def __init__(self) -> None:
+        self.completion_requests: list[dict[str, object]] = []
+
+    def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
+        self.completion_requests.append(
+            {"messages": messages, "tools": tools, "tool_choice": tool_choice}
+        )
+        last_user_message = next(
+            message["content"]
+            for message in reversed(messages)
+            if message["role"] == "user"
+        )
+        if len(self.completion_requests) == 1:
+            return CompletionResult(
+                content=(
+                    '<ask_user>{"prompt":"你想查哪个城市？","options":'
+                    '[{"label":"上海","value":"上海"},{"label":"东京","value":"东京"}],'
+                    '"allow_free_text":true,"field_name":"location"}</ask_user>'
+                ),
+                raw_response={},
+            )
+        return CompletionResult(content=f"收到地点：{last_user_message}", raw_response={})
+
+    def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
+        raise AssertionError("streaming should not be called in this test")
+
+
+class KimiBuiltinWebSearchClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def create_chat_completion(
+        self,
+        provider,
+        model,
+        messages,
+        *,
+        tools=None,
+        tool_choice=None,
+        disable_thinking=False,
+    ):
+        self.calls.append(
+            {
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "disable_thinking": disable_thinking,
+            }
+        )
+        if len(self.calls) == 1:
+            builtin_tool = next(
+                tool
+                for tool in tools or ()
+                if tool.get("type") == "builtin_function"
+            )
+            if builtin_tool["function"]["name"] != "$web_search":
+                raise AssertionError("missing kimi builtin web search tool declaration")
+            if disable_thinking is not True:
+                raise AssertionError("kimi builtin web search should disable thinking")
+            return CompletionResult(
+                content="",
+                raw_response={},
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="call_web_1",
+                        name="$web_search",
+                        arguments_json='{"query":"最新 AI 新闻"}',
+                        tool_type="builtin_function",
+                    ),
+                ),
+            )
+
+        assistant_tool_message = messages[-2]
+        tool_message = messages[-1]
+        self.last_followup_messages = messages
+        if assistant_tool_message["tool_calls"][0]["type"] != "builtin_function":
+            raise AssertionError("builtin function tool type should be preserved")
+        if tool_message["role"] != "tool":
+            raise AssertionError("tool message missing")
+        if tool_message["content"] != '{"query": "最新 AI 新闻"}':
+            raise AssertionError("builtin web search tool result should echo arguments")
+        return CompletionResult(content="这是联网搜索结果摘要。", raw_response={})
+
+    def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
+        raise AssertionError("streaming should not be called in this test")
 
 
 class StrictToolPayloadClient:
@@ -525,6 +654,50 @@ def make_ollama_native_config():
     return load_config(temp_path)
 
 
+def make_led_registry() -> ToolRegistry:
+    return ToolRegistry(
+        specs=(
+            ToolSpec(
+                name="control_led",
+                description="Control the LED",
+                parameters_schema={
+                    "type": "object",
+                    "properties": {"action": {"type": "string"}},
+                    "required": ["action"],
+                    "additionalProperties": False,
+                },
+                handler=lambda arguments: {"ok": True},
+                should_offer=lambda user_text, route_mode: _matches_led_control_intent(
+                    user_text
+                ),
+                execution_meta=ToolExecutionMeta(side_effectful=True),
+            ),
+        )
+    )
+
+
+def make_cup_registry() -> ToolRegistry:
+    return ToolRegistry(
+        specs=(
+            ToolSpec(
+                name="control_cup",
+                description="Control the CUP hardware",
+                parameters_schema={
+                    "type": "object",
+                    "properties": {"action": {"type": "string"}},
+                    "required": ["action"],
+                    "additionalProperties": False,
+                },
+                handler=lambda arguments: {"ok": True},
+                should_offer=lambda user_text, route_mode: _matches_cup_control_intent(
+                    user_text
+                ),
+                execution_meta=ToolExecutionMeta(side_effectful=True),
+            ),
+        )
+    )
+
+
 def make_kimi_thinking_config():
     content = textwrap.dedent(
         """
@@ -659,7 +832,7 @@ class ChatTests(unittest.TestCase):
             config,
             client=client,
             live_context_service=StaticLiveContextService(
-                "Live weather data for the user's current IP-based location:\n- location: Shanghai"
+                "Live weather data for the user's current local area:\n- location: Shanghai"
             ),
             tool_registry=ToolRegistry(specs=()),
         )
@@ -668,8 +841,50 @@ class ChatTests(unittest.TestCase):
 
         assert client.last_messages is not None
         system_prompt = client.last_messages[0]["content"]
-        self.assertIn("Live weather data for the user's current IP-based location", system_prompt)
+        self.assertIn("Live weather data for the user's current local area", system_prompt)
         self.assertIn("- location: Shanghai", system_prompt)
+
+    def test_send_stream_skips_live_context_in_system_prompt_when_tools_are_available(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = ToolChoiceCapturingClient()
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="web_search",
+                    description="Search the web",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {"result": "ok"},
+                    should_offer=lambda user_text, route_mode: route_mode == "search",
+                ),
+            )
+        )
+        service = ChatService(
+            config,
+            client=client,
+            live_context_service=StaticLiveContextService(
+                "Live weather data for the user's current local area:\n- location: Shanghai"
+            ),
+            tool_registry=registry,
+        )
+
+        service.send_stream(session, "帮我查一下最新 AI 新闻", mode_override="search")
+
+        system_prompt = client.calls[0]["messages"][0]["content"]
+        self.assertNotIn(
+            "Live weather data for the user's current local area",
+            system_prompt,
+        )
+        self.assertNotIn("- location: Shanghai", system_prompt)
 
     def test_send_uses_text_transcript_for_prior_turns_not_old_tool_trace(self) -> None:
         config = make_config()
@@ -839,6 +1054,158 @@ class ChatTests(unittest.TestCase):
         self.assertTrue(client.completion_requests[0]["tools"])
         self.assertEqual(client.stream_calls, 0)
         self.assertEqual(session.messages[-1].content, "直接答复")
+
+    def test_send_requires_tool_choice_for_explicit_led_request(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = ToolChoiceCapturingClient()
+        service = ChatService(config, client=client, tool_registry=make_led_registry())
+
+        service.send(session, "帮我调整成浪漫一点的氛围灯")
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["tool_choice"], "required")
+
+    def test_tools_for_request_omits_side_effectful_tools_for_unrelated_input(self) -> None:
+        config = make_config()
+        service = ChatService(config, client=ToolChoiceCapturingClient(), tool_registry=make_led_registry())
+        model_config = config.get_model("chat")
+        provider_config = config.get_provider(model_config.provider)
+
+        tools = service._tools_for_request(
+            provider=provider_config,
+            model=model_config,
+            user_text="你好，最近怎么样",
+            route_mode="chat",
+        )
+
+        self.assertIsNone(tools)
+
+    def test_tools_for_request_only_returns_matching_tool_specs(self) -> None:
+        config = make_config()
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="control_led",
+                    description="Control the LED",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"action": {"type": "string"}},
+                        "required": ["action"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {"ok": True},
+                    should_offer=lambda user_text, route_mode: _matches_led_control_intent(
+                        user_text
+                    ),
+                    execution_meta=ToolExecutionMeta(side_effectful=True),
+                ),
+                ToolSpec(
+                    name="web_search",
+                    description="Search the web",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {"ok": True},
+                    should_offer=lambda user_text, route_mode: route_mode == "search",
+                ),
+            )
+        )
+        service = ChatService(config, client=ToolChoiceCapturingClient(), tool_registry=registry)
+        model_config = config.get_model("chat")
+        provider_config = config.get_provider(model_config.provider)
+
+        tools = service._tools_for_request(
+            provider=provider_config,
+            model=model_config,
+            user_text="帮我调整成浪漫一点的氛围灯",
+            route_mode="chat",
+        )
+
+        self.assertIsNotNone(tools)
+        assert tools is not None
+        self.assertEqual(
+            [tool["function"]["name"] for tool in tools],
+            ["control_led"],
+        )
+
+    def test_send_requires_tool_choice_for_led_scene_followup_with_recent_context(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            messages=[
+                ChatMessage(
+                    role="user",
+                    content="我想看点色色的，调整一下氛围灯",
+                    created_at="2026-01-01T00:00:00+00:00",
+                ),
+                ChatMessage(
+                    role="assistant",
+                    content="我可以帮你把灯调成浪漫、放松或者派对模式。",
+                    created_at="2026-01-01T00:00:01+00:00",
+                    model_alias="chat",
+                ),
+            ],
+        )
+        client = ToolChoiceCapturingClient()
+        service = ChatService(config, client=client, tool_registry=make_led_registry())
+
+        service.send(session, "浪漫模式")
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["tool_choice"], "required")
+
+    def test_send_requires_tool_choice_for_explicit_cup_request(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = ToolChoiceCapturingClient()
+        service = ChatService(config, client=client, tool_registry=make_cup_registry())
+
+        service.send(session, "把飞机杯转快一点")
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["tool_choice"], "required")
+
+    def test_send_requires_tool_choice_for_cup_followup_with_recent_context(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            messages=[
+                ChatMessage(
+                    role="user",
+                    content="把飞机杯先调到正常速度",
+                    created_at="2026-01-01T00:00:00+00:00",
+                ),
+                ChatMessage(
+                    role="assistant",
+                    content="现在已经接入 CUP 控制，我们可以继续微调转速和灯光。",
+                    created_at="2026-01-01T00:00:01+00:00",
+                    model_alias="chat",
+                ),
+            ],
+        )
+        client = ToolChoiceCapturingClient()
+        service = ChatService(config, client=client, tool_registry=make_cup_registry())
+
+        service.send(session, "再刺激一点")
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["tool_choice"], "required")
 
     def test_send_falls_back_when_provider_rejects_tools_payload(self) -> None:
         config = make_config()
@@ -1021,6 +1388,54 @@ class ChatTests(unittest.TestCase):
             session.messages[1].reasoning_content,
             "先搜索最新 release notes，再整理成简短答案。",
         )
+
+    def test_send_enables_kimi_builtin_web_search_and_disables_thinking(self) -> None:
+        config = make_kimi_thinking_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = KimiBuiltinWebSearchClient()
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="web_search",
+                    description="Search the web",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {"result": "unused local search"},
+                ),
+            )
+        )
+        service = ChatService(
+            config,
+            client=client,
+            tool_registry=registry,
+        )
+
+        result = service.send(session, "查一下最新 AI 新闻", mode_override="search")
+
+        self.assertEqual(result.assistant_message.content, "这是联网搜索结果摘要。")
+        self.assertEqual(len(client.calls), 2)
+        self.assertTrue(client.calls[0]["disable_thinking"])
+        builtin_tools = [
+            tool for tool in client.calls[0]["tools"] or ()
+            if tool.get("type") == "builtin_function"
+        ]
+        local_search_tools = [
+            tool for tool in client.calls[0]["tools"] or ()
+            if tool.get("type") == "function"
+            and isinstance(tool.get("function"), dict)
+            and tool["function"].get("name") == "web_search"
+        ]
+        self.assertEqual(len(builtin_tools), 1)
+        self.assertEqual(builtin_tools[0]["function"]["name"], "$web_search")
+        self.assertEqual(local_search_tools, [])
 
     def test_send_omits_legacy_blank_tool_call_ids_from_transcript_replay(self) -> None:
         config = make_kimi_thinking_config()
@@ -1246,6 +1661,74 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(session.messages[3].role, "assistant")
         self.assertEqual(session.messages[4].role, "tool")
         self.assertEqual(session.messages[5].role, "assistant")
+
+    def test_send_returns_structured_ask_user_prompt(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = AskUserToolClient()
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="get_weather_by_location",
+                    description="Get weather",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {"location": arguments["location"], "ok": True},
+                ),
+            )
+        )
+        service = ChatService(config, client=client, tool_registry=registry)
+
+        result = service.send(session, "帮我查天气", mode_override="chat")
+
+        self.assertEqual(result.assistant_message.content, "你想查哪个城市？")
+        self.assertIsNotNone(result.ask_user)
+        assert result.ask_user is not None
+        self.assertEqual(result.ask_user.options[0].label, "上海")
+        self.assertIsNotNone(session.pending_ask_user)
+        self.assertEqual(session.transcript_messages[-1].content, "你想查哪个城市？")
+
+    def test_send_uses_pending_ask_option_value_for_numeric_reply(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = AskUserFollowupClient()
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="get_weather_by_location",
+                    description="Get weather",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {"location": arguments["location"], "ok": True},
+                ),
+            )
+        )
+        service = ChatService(config, client=client, tool_registry=registry)
+
+        first = service.send(session, "帮我查天气", mode_override="chat")
+        second = service.send(session, "2", mode_override="chat")
+
+        self.assertIsNotNone(first.ask_user)
+        self.assertEqual(session.messages[-2].content, "东京")
+        self.assertEqual(session.transcript_messages[-2].content, "东京")
+        self.assertEqual(second.assistant_message.content, "收到地点：东京")
+        self.assertIsNone(session.pending_ask_user)
 
     def test_send_stream_emits_agent_steps_for_multi_tool_loop(self) -> None:
         config = make_config()

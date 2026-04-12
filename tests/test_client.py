@@ -3,16 +3,64 @@ from __future__ import annotations
 import unittest
 
 from whesper.client import (
+    _build_openai_payload,
+    _effective_temperature,
     _extract_reasoning_content,
     _extract_stream_text,
     _extract_tool_calls,
     _extract_tool_calls_from_text,
     _iter_sse_events,
 )
-from whesper.config import ProviderConfig
+from whesper.config import ModelConfig, ProviderConfig
 
 
 class ClientTests(unittest.TestCase):
+    def test_effective_temperature_uses_fixed_values_for_kimi_k25(self) -> None:
+        provider = ProviderConfig(
+            name="kimi",
+            kind="openai_compatible",
+            base_url="https://api.moonshot.cn/v1",
+        )
+        model = ModelConfig(
+            name="kimi-k2.5",
+            provider="kimi",
+            model="kimi-k2.5",
+            temperature=0.2,
+        )
+
+        self.assertEqual(
+            _effective_temperature(provider, model, disable_thinking=False),
+            1.0,
+        )
+        self.assertEqual(
+            _effective_temperature(provider, model, disable_thinking=True),
+            0.6,
+        )
+
+    def test_build_openai_payload_disables_thinking_with_fixed_kimi_temperature(self) -> None:
+        provider = ProviderConfig(
+            name="kimi",
+            kind="openai_compatible",
+            base_url="https://api.moonshot.cn/v1",
+        )
+        model = ModelConfig(
+            name="kimi-k2.5",
+            provider="kimi",
+            model="kimi-k2.5",
+            temperature=1.0,
+        )
+
+        payload = _build_openai_payload(
+            provider,
+            model,
+            [{"role": "user", "content": "查一下最新 AI 新闻"}],
+            stream=False,
+            disable_thinking=True,
+        )
+
+        self.assertIn('"temperature": 0.6', payload.decode("utf-8"))
+        self.assertIn('"thinking": {"type": "disabled"}', payload.decode("utf-8"))
+
     def test_iter_sse_events_groups_data_lines(self) -> None:
         lines = [
             b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n",

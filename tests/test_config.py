@@ -108,6 +108,37 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(endpoint.query_param, "q")
         self.assertEqual(endpoint.api_key_env, "DEVICE_STATUS_KEY")
 
+    def test_loads_optional_search_api_config(self) -> None:
+        content = textwrap.dedent(
+            """
+            [scheduler]
+            chat_model = "local"
+
+            [providers.main]
+            base_url = "http://localhost:11434/v1"
+
+            [models.local]
+            provider = "main"
+            model = "qwen"
+
+            [live_context.search_api]
+            provider = "serpapi"
+            api_key_env = "MY_SERPAPI_KEY"
+            engine = "google"
+            timeout_seconds = 12
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        config = load_config(temp_path)
+        self.assertEqual(config.live_context.search_api.provider, "serpapi")
+        self.assertEqual(config.live_context.search_api.api_key_env, "MY_SERPAPI_KEY")
+        self.assertEqual(config.live_context.search_api.engine, "google")
+        self.assertEqual(config.live_context.search_api.timeout_seconds, 12)
+
     def test_loads_optional_shell_sandbox_config(self) -> None:
         content = textwrap.dedent(
             """
@@ -143,6 +174,66 @@ class ConfigTests(unittest.TestCase):
             config.shell_sandbox.allowed_command_prefixes,
             (("pwd",), ("git", "status"), ("rg",)),
         )
+
+    def test_loads_optional_led_hardware_config(self) -> None:
+        content = textwrap.dedent(
+            """
+            [scheduler]
+            chat_model = "local"
+
+            [providers.main]
+            base_url = "http://localhost:11434/v1"
+
+            [models.local]
+            provider = "main"
+            model = "qwen"
+
+            [hardware.led]
+            enabled = true
+            base_url = "http://led.local"
+            timeout_seconds = 6
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        config = load_config(temp_path)
+        self.assertTrue(config.hardware.led.enabled)
+        self.assertEqual(config.hardware.led.base_url, "http://led.local")
+        self.assertEqual(config.hardware.led.timeout_seconds, 6)
+
+    def test_loads_optional_cup_hardware_config(self) -> None:
+        content = textwrap.dedent(
+            """
+            [scheduler]
+            chat_model = "local"
+
+            [providers.main]
+            base_url = "http://localhost:11434/v1"
+
+            [models.local]
+            provider = "main"
+            model = "qwen"
+
+            [hardware.cup]
+            enabled = true
+            base_url = "http://localhost:3001"
+            api_token = "secret-token"
+            timeout_seconds = 8
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        config = load_config(temp_path)
+        self.assertTrue(config.hardware.cup.enabled)
+        self.assertEqual(config.hardware.cup.base_url, "http://localhost:3001")
+        self.assertEqual(config.hardware.cup.timeout_seconds, 8)
+        self.assertEqual(config.hardware.cup.resolved_api_token(), "secret-token")
 
 
 if __name__ == "__main__":
