@@ -1,18 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import re
 from xml.etree import ElementTree
 
 from whesper.agent_types import ToolInvocation
-
-
-@dataclass(slots=True, frozen=True)
-class ToolMessageFormat:
-    assistant_tool_content_null: bool = True
-    tool_arguments_mode: str = "string"
-    include_tool_name: bool = False
+from whesper.provider_profile import ProviderProfile
 
 
 FUNCTION_CALLS_BLOCK_PATTERN = re.compile(
@@ -20,35 +13,14 @@ FUNCTION_CALLS_BLOCK_PATTERN = re.compile(
     re.DOTALL,
 )
 
+# DeepSeek-style: <tool>name</tool>\n<arg>{"key": "value"}</arg>
+_TOOL_ARG_PATTERN = re.compile(
+    r"<tool>\s*(\S+?)\s*</tool>\s*<arg>\s*(.*?)\s*</arg>",
+    re.DOTALL,
+)
+
 
 class DefaultToolProtocolAdapter:
-    DEFAULT_TOOL_MESSAGE_FORMAT = ToolMessageFormat()
-    KIMI_TOOL_MESSAGE_FORMAT = ToolMessageFormat(
-        assistant_tool_content_null=True,
-        tool_arguments_mode="string",
-        include_tool_name=False,
-    )
-    QWEN_TOOL_MESSAGE_FORMAT = ToolMessageFormat(
-        assistant_tool_content_null=True,
-        tool_arguments_mode="object",
-        include_tool_name=False,
-    )
-
-    def tool_message_format(self, model, provider) -> ToolMessageFormat:
-        candidates = (
-            getattr(model, "name", ""),
-            getattr(model, "model", ""),
-            getattr(provider, "name", ""),
-        )
-        lowered = " ".join(str(item).casefold() for item in candidates if item)
-        if "kimi" in lowered or "moonshot" in lowered:
-            return self.KIMI_TOOL_MESSAGE_FORMAT
-        if "qwen" in lowered:
-            return self.QWEN_TOOL_MESSAGE_FORMAT
-        if getattr(provider, "kind", "") == "ollama_native":
-            return self.QWEN_TOOL_MESSAGE_FORMAT
-        return self.DEFAULT_TOOL_MESSAGE_FORMAT
-
     def tool_call_payload(self, tool_call: ToolInvocation) -> dict[str, object]:
         return {
             "id": tool_call.tool_call_id,
@@ -58,42 +30,6 @@ class DefaultToolProtocolAdapter:
                 "arguments": tool_call.arguments_json,
             },
         }
-
-    def serialize_tool_calls(
-        self,
-        tool_calls: list[dict[str, object]],
-        *,
-        tool_message_format: ToolMessageFormat,
-    ) -> list[dict[str, object]]:
-        serialized_calls: list[dict[str, object]] = []
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                serialized_calls.append(tool_call)
-                continue
-            serialized_call = dict(tool_call)
-            function = serialized_call.get("function")
-            if isinstance(function, dict):
-                serialized_function = dict(function)
-                arguments = serialized_function.get("arguments")
-                if (
-                    tool_message_format.tool_arguments_mode == "object"
-                    and isinstance(arguments, str)
-                ):
-                    try:
-                        serialized_function["arguments"] = json.loads(arguments)
-                    except json.JSONDecodeError:
-                        serialized_function["arguments"] = arguments
-                elif (
-                    tool_message_format.tool_arguments_mode == "string"
-                    and isinstance(arguments, dict)
-                ):
-                    serialized_function["arguments"] = json.dumps(
-                        arguments,
-                        ensure_ascii=False,
-                    )
-                serialized_call["function"] = serialized_function
-            serialized_calls.append(serialized_call)
-        return serialized_calls
 
     def extract_tool_calls(self, provider, raw: dict) -> tuple[ToolInvocation, ...]:
         try:
@@ -112,7 +48,35 @@ class DefaultToolProtocolAdapter:
             return ()
         return ()
 
-    def extract_tool_calls_from_text(self, content: str) -> tuple[ToolInvocation, ...]:
+    def extract_tool_calls_from_text(
+        self,
+        content: str,
+        *,
+        profile: ProviderProfile | None = None,
+    ) -> tuple[ToolInvocation, ...]:
+        patterns = (
+            profile.text_tool_call_patterns
+            if profile is not None
+            else ("function_calls", "tool_arg")
+        )
+        for pattern_name in patterns:
+            tool_calls = self._extract_by_pattern(pattern_name, content)
+            if tool_calls:
+                return tool_calls
+        return ()
+
+    def _extract_by_pattern(
+        self,
+        pattern_name: str,
+        content: str,
+    ) -> tuple[ToolInvocation, ...]:
+        if pattern_name == "function_calls":
+            return self._extract_function_calls_block(content)
+        if pattern_name == "tool_arg":
+            return self._extract_tool_arg_pairs(content)
+        return ()
+
+    def _extract_function_calls_block(self, content: str) -> tuple[ToolInvocation, ...]:
         match = FUNCTION_CALLS_BLOCK_PATTERN.search(content)
         if match is None:
             return ()
@@ -132,6 +96,26 @@ class DefaultToolProtocolAdapter:
                 if not parameter_name:
                     continue
                 arguments[parameter_name] = "".join(parameter.itertext()).strip()
+            tool_calls.append(
+                ToolInvocation(
+                    tool_call_id=f"text-tool-call-{index}",
+                    name=name,
+                    arguments_json=json.dumps(arguments, ensure_ascii=False),
+                    tool_type="function",
+                )
+            )
+        return tuple(tool_calls)
+
+    def _extract_tool_arg_pairs(self, content: str) -> tuple[ToolInvocation, ...]:
+        matches = _TOOL_ARG_PATTERN.findall(content)
+        if not matches:
+            return ()
+        tool_calls: list[ToolInvocation] = []
+        for index, (name, args_text) in enumerate(matches):
+            try:
+                arguments = json.loads(args_text)
+            except json.JSONDecodeError:
+                arguments = {"input": args_text}
             tool_calls.append(
                 ToolInvocation(
                     tool_call_id=f"text-tool-call-{index}",

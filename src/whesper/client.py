@@ -7,6 +7,7 @@ from urllib import error, request
 
 from whesper.agent_types import AgentCompletion, ToolInvocation
 from whesper.config import ModelConfig, ProviderConfig
+from whesper.provider_profile import ProviderProfile, resolve_profile
 from whesper.tool_protocol import DefaultToolProtocolAdapter
 
 
@@ -19,21 +20,14 @@ CompletionResult = AgentCompletion
 DEFAULT_TOOL_PROTOCOL_ADAPTER = DefaultToolProtocolAdapter()
 
 
-def _is_kimi_k25(provider: ProviderConfig, model: ModelConfig) -> bool:
-    candidates = (provider.name, model.name, model.model)
-    lowered = " ".join(str(item).casefold() for item in candidates if item)
-    return provider.kind == "openai_compatible" and "kimi" in lowered and "k2.5" in lowered
-
-
 def _effective_temperature(
     provider: ProviderConfig,
     model: ModelConfig,
     *,
     disable_thinking: bool,
 ) -> float:
-    if _is_kimi_k25(provider, model):
-        return 0.6 if disable_thinking else 1.0
-    return model.temperature
+    profile = resolve_profile(provider, model)
+    return profile.effective_temperature(model, thinking_enabled=not disable_thinking)
 
 
 def _build_openai_payload(
@@ -46,13 +40,13 @@ def _build_openai_payload(
     tool_choice: str | dict[str, object] | None = None,
     disable_thinking: bool = False,
 ) -> bytes:
+    profile: ProviderProfile = resolve_profile(provider, model)
     payload: dict[str, object] = {
         "model": model.model,
         "messages": messages,
-        "temperature": _effective_temperature(
-            provider,
+        "temperature": profile.effective_temperature(
             model,
-            disable_thinking=disable_thinking,
+            thinking_enabled=not disable_thinking,
         ),
         "stream": stream,
     }
@@ -64,10 +58,11 @@ def _build_openai_payload(
         payload["max_tokens"] = model.max_tokens
     if model.top_p is not None:
         payload["top_p"] = model.top_p
-    if disable_thinking:
-        payload["thinking"] = {"type": "disabled"}
-    elif model.think is not None:
-        payload["think"] = model.think
+    profile.apply_thinking(
+        payload,
+        model_think=model.think,
+        disable_thinking=disable_thinking,
+    )
     return json.dumps(payload).encode("utf-8")
 
 
@@ -246,6 +241,39 @@ def _iter_json_lines(lines: Iterable[bytes]) -> Iterable[dict]:
             yield json.loads(line)
         except json.JSONDecodeError as exc:
             raise ProviderError("Ollama returned invalid JSON in the stream.") from exc
+
+
+def list_provider_models(provider: ProviderConfig) -> list[str]:
+    """Query a provider's API for available model IDs.
+
+    OpenAI-compatible: GET {base_url}/models
+    Ollama:            GET {base_url}/api/tags
+    """
+    if provider.kind == "ollama_native":
+        url = f"{provider.base_url.rstrip('/')}/api/tags"
+    else:
+        url = f"{provider.base_url.rstrip('/')}/models"
+
+    req = request.Request(url, headers=_request_headers(provider), method="GET")
+    try:
+        with request.urlopen(req, timeout=provider.timeout_seconds) as response:
+            raw = json.loads(response.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise ProviderError(
+            f"Provider '{provider.name}' returned HTTP {exc.code}: {detail}"
+        ) from exc
+    except error.URLError as exc:
+        raise ProviderError(
+            f"Provider '{provider.name}' is unreachable: {exc.reason}"
+        ) from exc
+
+    if provider.kind == "ollama_native":
+        models = raw.get("models", [])
+        return sorted(m["name"] for m in models if isinstance(m, dict) and "name" in m)
+
+    data = raw.get("data", [])
+    return sorted(m["id"] for m in data if isinstance(m, dict) and "id" in m)
 
 
 class OpenAICompatibleClient:

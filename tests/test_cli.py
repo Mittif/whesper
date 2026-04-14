@@ -18,6 +18,7 @@ from whesper.tools import ToolRegistry, ToolSpec
 from whesper.config import (
     AppConfig,
     AppSettings,
+    CUP_DEFAULT_BASE_URL,
     LiveContextSettings,
     ModelConfig,
     PersonaConfig,
@@ -30,6 +31,8 @@ from whesper.router import RouteDecision
 from whesper.session import ChatMessage, ConversationSession, SessionStore
 from whesper.trace import TraceStore, make_trace_event
 from whesper.agent_types import ToolExecutionMeta
+
+CUP_DEFAULT_API_BASE_URL = f"{CUP_DEFAULT_BASE_URL}/api"
 
 
 class FakeStreamingClient:
@@ -179,10 +182,10 @@ class CliTests(unittest.TestCase):
                 "action": arguments.get("action"),
                 "echo": arguments,
                 "request_trace": [
-                    {"method": "GET", "url": "http://localhost:3001/api/motor"},
+                    {"method": "GET", "url": f"{CUP_DEFAULT_API_BASE_URL}/motor"},
                     {
                         "method": "POST",
-                        "url": "http://localhost:3001/api/motor",
+                        "url": f"{CUP_DEFAULT_API_BASE_URL}/motor",
                         "payload": arguments,
                     },
                 ],
@@ -278,7 +281,8 @@ class CliTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertTrue(changed)
         self.assertEqual(session.pinned_model, "auto")
-        self.assertIn("Unknown model alias: missing-model", rendered)
+        self.assertIn("missing-model", rendered)
+        self.assertIn("no longer available", rendered)
         self.assertIn("Session model was reset to auto.", rendered)
 
     def test_invalid_startup_model_override_keeps_auto(self) -> None:
@@ -298,7 +302,7 @@ class CliTests(unittest.TestCase):
 
         rendered = output.getvalue()
         self.assertEqual(session.pinned_model, "auto")
-        self.assertIn("Unknown model alias: missing-model", rendered)
+        self.assertIn("missing-model", rendered)
         self.assertIn("Starting with session model: auto.", rendered)
 
     def test_status_command_renders_current_state(self) -> None:
@@ -740,7 +744,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("Execution Timeline", rendered)
         self.assertIn("Tool Request Trace", rendered)
         self.assertIn("control_cup", rendered)
-        self.assertIn("http://localhost:3001/api/motor", rendered)
+        self.assertIn(f"{CUP_DEFAULT_API_BASE_URL}/motor", rendered)
         self.assertIn("已经继续增强了一点", rendered)
 
     def test_retry_command_replaces_last_assistant_reply(self) -> None:

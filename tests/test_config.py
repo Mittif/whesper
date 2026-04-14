@@ -4,7 +4,7 @@ import tempfile
 import textwrap
 import unittest
 
-from whesper.config import ConfigError, load_config
+from whesper.config import CUP_DEFAULT_BASE_URL, ConfigError, load_config
 
 
 class ConfigTests(unittest.TestCase):
@@ -139,6 +139,34 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.live_context.search_api.engine, "google")
         self.assertEqual(config.live_context.search_api.timeout_seconds, 12)
 
+    def test_loads_optional_brave_search_api_config_without_key(self) -> None:
+        content = textwrap.dedent(
+            """
+            [scheduler]
+            chat_model = "local"
+
+            [providers.main]
+            base_url = "http://localhost:11434/v1"
+
+            [models.local]
+            provider = "main"
+            model = "qwen"
+
+            [live_context.search_api]
+            provider = "brave"
+            timeout_seconds = 9
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        config = load_config(temp_path)
+        self.assertEqual(config.live_context.search_api.provider, "brave")
+        self.assertEqual(config.live_context.search_api.api_key_env, "WHESPER_BRAVE_API_KEY")
+        self.assertEqual(config.live_context.search_api.timeout_seconds, 9)
+
     def test_loads_optional_shell_sandbox_config(self) -> None:
         content = textwrap.dedent(
             """
@@ -175,35 +203,6 @@ class ConfigTests(unittest.TestCase):
             (("pwd",), ("git", "status"), ("rg",)),
         )
 
-    def test_loads_optional_led_hardware_config(self) -> None:
-        content = textwrap.dedent(
-            """
-            [scheduler]
-            chat_model = "local"
-
-            [providers.main]
-            base_url = "http://localhost:11434/v1"
-
-            [models.local]
-            provider = "main"
-            model = "qwen"
-
-            [hardware.led]
-            enabled = true
-            base_url = "http://led.local"
-            timeout_seconds = 6
-            """
-        ).strip()
-
-        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
-            fh.write(content)
-            temp_path = fh.name
-
-        config = load_config(temp_path)
-        self.assertTrue(config.hardware.led.enabled)
-        self.assertEqual(config.hardware.led.base_url, "http://led.local")
-        self.assertEqual(config.hardware.led.timeout_seconds, 6)
-
     def test_loads_optional_cup_hardware_config(self) -> None:
         content = textwrap.dedent(
             """
@@ -219,9 +218,41 @@ class ConfigTests(unittest.TestCase):
 
             [hardware.cup]
             enabled = true
-            base_url = "http://localhost:3001"
+            base_url = "%s"
             api_token = "secret-token"
             timeout_seconds = 8
+            """
+        ).strip() % CUP_DEFAULT_BASE_URL
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        config = load_config(temp_path)
+        self.assertTrue(config.hardware.cup.enabled)
+        self.assertEqual(config.hardware.cup.base_url, CUP_DEFAULT_BASE_URL)
+        self.assertEqual(config.hardware.cup.timeout_seconds, 8)
+        self.assertEqual(config.hardware.cup.resolved_api_token(), "secret-token")
+
+    def test_loads_cup_hardware_base_url_from_config_variable(self) -> None:
+        content = textwrap.dedent(
+            """
+            [variables]
+            cup_api_base_url = "http://127.0.0.1:3901"
+
+            [scheduler]
+            chat_model = "local"
+
+            [providers.main]
+            base_url = "http://localhost:11434/v1"
+
+            [models.local]
+            provider = "main"
+            model = "qwen"
+
+            [hardware.cup]
+            enabled = true
+            base_url = "${cup_api_base_url}"
             """
         ).strip()
 
@@ -230,10 +261,7 @@ class ConfigTests(unittest.TestCase):
             temp_path = fh.name
 
         config = load_config(temp_path)
-        self.assertTrue(config.hardware.cup.enabled)
-        self.assertEqual(config.hardware.cup.base_url, "http://localhost:3001")
-        self.assertEqual(config.hardware.cup.timeout_seconds, 8)
-        self.assertEqual(config.hardware.cup.resolved_api_token(), "secret-token")
+        self.assertEqual(config.hardware.cup.base_url, "http://127.0.0.1:3901")
 
 
 if __name__ == "__main__":

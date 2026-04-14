@@ -17,8 +17,8 @@ The runtime path should go through the local client API at `http://localhost:300
 
 ## Source Of Truth
 
-- Treat [`/Users/mitty/Documents/GitHub/whesper/hardware.md`](/Users/mitty/Documents/GitHub/whesper/hardware.md) as the primary device spec
-- [`/Users/mitty/Documents/GitHub/whesper/hardware/http_api.md`](/Users/mitty/Documents/GitHub/whesper/hardware/http_api.md) mirrors the current HTTP section
+- Treat `hardware.md` as the primary device spec
+- [`hardware/http_api.md`](../../hardware/http_api.md) mirrors the current HTTP section
 
 ## Workflow
 

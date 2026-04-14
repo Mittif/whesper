@@ -8,9 +8,9 @@ from whesper.client import ToolCall
 from whesper.config import (
     AppConfig,
     AppSettings,
+    CUP_DEFAULT_BASE_URL,
     CupHardwareSettings,
     HardwareSettings,
-    LedHardwareSettings,
     LiveContextSettings,
     ModelConfig,
     PersonaConfig,
@@ -22,18 +22,19 @@ from whesper.tools import (
     ToolRegistry,
     ToolSpec,
     _handle_control_cup,
-    _handle_control_led,
     _handle_get_local_area,
     _handle_get_local_time,
     _handle_get_local_weather,
     _handle_get_public_ip,
     _handle_get_weather_by_location,
+    _handle_web_search,
     _matches_cup_control_intent,
     _matches_cup_scene_followup,
-    _matches_led_control_intent,
-    _matches_led_scene_followup,
 )
 from whesper.agent_types import ToolExecutionMeta
+from whesper.live_data import FetchedTextResponse, SearchContextService
+
+CUP_DEFAULT_API_BASE_URL = f"{CUP_DEFAULT_BASE_URL}/api"
 
 
 class ToolRegistryTests(unittest.TestCase):
@@ -93,48 +94,6 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertNotIn("get_public_ip", openai_tool_names)
         self.assertNotIn("get_ip_location", openai_tool_names)
 
-    def test_default_registry_registers_led_tool_when_hardware_enabled(self) -> None:
-        config = AppConfig(
-            app=AppSettings(),
-            persona=PersonaConfig(),
-            scheduler=SchedulerConfig(chat_model="local_chat"),
-            live_context=LiveContextSettings(),
-            shell_sandbox=ShellSandboxSettings(),
-            providers={
-                "local": ProviderConfig(
-                    name="local",
-                    kind="ollama_native",
-                    base_url="http://localhost:11434",
-                )
-            },
-            models={
-                "local_chat": ModelConfig(
-                    name="local_chat",
-                    provider="local",
-                    model="qwen",
-                )
-            },
-            source_path=Path("whesper.toml"),
-            hardware=HardwareSettings(
-                led=LedHardwareSettings(
-                    enabled=True,
-                    base_url="http://led.local",
-                    timeout_seconds=5,
-                )
-            ),
-        )
-
-        registry = ToolRegistry.default(config)
-
-        tool_names = {spec.name for spec in registry.specs}
-        self.assertIn("control_led", tool_names)
-
-    def test_led_control_intent_matches_ambience_request(self) -> None:
-        self.assertTrue(_matches_led_control_intent("帮我调整成浪漫一点的氛围灯"))
-
-    def test_led_scene_followup_matches_romantic_mode(self) -> None:
-        self.assertTrue(_matches_led_scene_followup("浪漫模式"))
-
     def test_default_registry_registers_cup_tool_when_hardware_enabled(self) -> None:
         config = AppConfig(
             app=AppSettings(),
@@ -160,7 +119,7 @@ class ToolRegistryTests(unittest.TestCase):
             hardware=HardwareSettings(
                 cup=CupHardwareSettings(
                     enabled=True,
-                    base_url="http://localhost:3001",
+                    base_url=CUP_DEFAULT_BASE_URL,
                     timeout_seconds=5,
                 )
             ),
@@ -177,15 +136,15 @@ class ToolRegistryTests(unittest.TestCase):
     def test_cup_scene_followup_matches_intensity_request(self) -> None:
         self.assertTrue(_matches_cup_scene_followup("再刺激一点"))
 
-    def test_default_tool_choice_requires_side_effectful_led_request(self) -> None:
+    def test_default_tool_choice_requires_side_effectful_cup_request(self) -> None:
         registry = ToolRegistry(
             specs=(
                 ToolSpec(
-                    name="control_led",
-                    description="Control the LED",
+                    name="control_cup",
+                    description="Control the CUP hardware",
                     parameters_schema={"type": "object"},
                     handler=lambda arguments: {"ok": True},
-                    should_offer=lambda user_text, route_mode: _matches_led_control_intent(
+                    should_offer=lambda user_text, route_mode: _matches_cup_control_intent(
                         user_text
                     ),
                     execution_meta=ToolExecutionMeta(side_effectful=True),
@@ -195,7 +154,7 @@ class ToolRegistryTests(unittest.TestCase):
 
         self.assertEqual(
             registry.default_tool_choice(
-                user_text="帮我调整成浪漫一点的氛围灯",
+                user_text="帮我把飞机杯调刺激一点",
                 route_mode="manual",
             ),
             "required",
@@ -205,11 +164,11 @@ class ToolRegistryTests(unittest.TestCase):
         registry = ToolRegistry(
             specs=(
                 ToolSpec(
-                    name="control_led",
-                    description="Control the LED",
+                    name="control_cup",
+                    description="Control the CUP hardware",
                     parameters_schema={"type": "object"},
                     handler=lambda arguments: {"ok": True},
-                    should_offer=lambda user_text, route_mode: _matches_led_control_intent(
+                    should_offer=lambda user_text, route_mode: _matches_cup_control_intent(
                         user_text
                     ),
                     execution_meta=ToolExecutionMeta(side_effectful=True),
@@ -225,24 +184,24 @@ class ToolRegistryTests(unittest.TestCase):
         )
 
         tools = registry.openai_tools_for_request(
-            "帮我调整成浪漫一点的氛围灯",
+            "帮我把飞机杯转快一点",
             route_mode="chat",
         )
 
         self.assertEqual(
             [tool["function"]["name"] for tool in tools],
-            ["control_led"],
+            ["control_cup"],
         )
 
     def test_openai_tools_for_request_returns_no_tools_for_unmatched_request(self) -> None:
         registry = ToolRegistry(
             specs=(
                 ToolSpec(
-                    name="control_led",
-                    description="Control the LED",
+                    name="control_cup",
+                    description="Control the CUP hardware",
                     parameters_schema={"type": "object"},
                     handler=lambda arguments: {"ok": True},
-                    should_offer=lambda user_text, route_mode: _matches_led_control_intent(
+                    should_offer=lambda user_text, route_mode: _matches_cup_control_intent(
                         user_text
                     ),
                     execution_meta=ToolExecutionMeta(side_effectful=True),
@@ -558,6 +517,29 @@ class ToolRegistryTests(unittest.TestCase):
             ["web_search"],
         )
 
+    def test_handle_web_search_returns_structured_sources(self) -> None:
+        service = SearchContextService(
+            provider="serpapi",
+            api_key="test-key",
+            fetch_json=lambda url, timeout: {
+                "organic_results": [
+                    {
+                        "title": "OpenAI News | OpenAI",
+                        "link": "https://openai.com/news/",
+                        "snippet": "Stay up to speed on AI progress.",
+                    }
+                ]
+            },
+        )
+
+        payload = _handle_web_search(service, {"query": "openai release notes"})
+
+        self.assertEqual(payload["provider"], "serpapi")
+        self.assertEqual(payload["status"], "ok")
+        assert isinstance(payload["sources"], list)
+        self.assertEqual(payload["sources"][0]["url"], "https://openai.com/news/")
+        self.assertIn("provider: serpapi", str(payload["result"]))
+
     def test_handle_get_weather_by_location_returns_weather_payload(self) -> None:
         from whesper import tools as tools_module
 
@@ -699,79 +681,6 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertEqual(result.name, "get_weather_by_location")
         self.assertIn('"location": "Tokyo"', result.content)
 
-    def test_handle_control_led_sets_color_from_named_color(self) -> None:
-        from whesper import tools as tools_module
-
-        seen_urls: list[str] = []
-        original_fetch = tools_module._tool_fetch_json
-        try:
-            def fetch(url, timeout):
-                seen_urls.append(url)
-                return {"r": 255, "g": 0, "b": 0}
-
-            tools_module._tool_fetch_json = fetch
-            payload = _handle_control_led(
-                {"action": "set_color", "color": "红色"},
-                base_url="http://led.local",
-                timeout_seconds=5,
-            )
-        finally:
-            tools_module._tool_fetch_json = original_fetch
-
-        self.assertEqual(
-            seen_urls,
-            ["http://led.local/led?r=255&g=0&b=0"],
-        )
-        self.assertEqual(payload["action"], "set_color")
-        self.assertEqual(payload["color_hex"], "#ff0000")
-        self.assertEqual(payload["requested_color_hex"], "#ff0000")
-
-    def test_handle_control_led_toggles_blink(self) -> None:
-        from whesper import tools as tools_module
-
-        seen_urls: list[str] = []
-        original_fetch = tools_module._tool_fetch_json
-        try:
-            def fetch(url, timeout):
-                seen_urls.append(url)
-                return {"blink": 1}
-
-            tools_module._tool_fetch_json = fetch
-            payload = _handle_control_led(
-                {"action": "set_blink", "blink": True},
-                base_url="http://led.local",
-                timeout_seconds=5,
-            )
-        finally:
-            tools_module._tool_fetch_json = original_fetch
-
-        self.assertEqual(seen_urls, ["http://led.local/blink?v=1"])
-        self.assertEqual(payload["action"], "set_blink")
-        self.assertTrue(payload["blink"])
-
-    def test_handle_control_led_reads_status(self) -> None:
-        from whesper import tools as tools_module
-
-        seen_urls: list[str] = []
-        original_fetch = tools_module._tool_fetch_json
-        try:
-            def fetch(url, timeout):
-                seen_urls.append(url)
-                return {"r": 16, "g": 16, "b": 16}
-
-            tools_module._tool_fetch_json = fetch
-            payload = _handle_control_led(
-                {"action": "status"},
-                base_url="http://led.local",
-                timeout_seconds=5,
-            )
-        finally:
-            tools_module._tool_fetch_json = original_fetch
-
-        self.assertEqual(seen_urls, ["http://led.local/status"])
-        self.assertEqual(payload["action"], "status")
-        self.assertEqual(payload["color_hex"], "#101010")
-
     def test_handle_control_cup_sets_led(self) -> None:
         from whesper import tools as tools_module
 
@@ -785,7 +694,7 @@ class ToolRegistryTests(unittest.TestCase):
             tools_module._tool_http_json_request = request
             payload = _handle_control_cup(
                 {"action": "set_led", "color": "粉色", "blink_mode": 3},
-                base_url="http://localhost:3001",
+                base_url=CUP_DEFAULT_BASE_URL,
                 api_token="token-1",
                 timeout_seconds=5,
             )
@@ -797,7 +706,7 @@ class ToolRegistryTests(unittest.TestCase):
             [
                 (
                     "POST",
-                    "http://localhost:3001/api/led",
+                    f"{CUP_DEFAULT_API_BASE_URL}/led",
                     {"color": "#ff69b4", "blink_mode": 3},
                     {
                         "Accept": "application/json",
@@ -826,18 +735,18 @@ class ToolRegistryTests(unittest.TestCase):
             tools_module._tool_http_json_request = request
             payload = _handle_control_cup(
                 {"action": "nudge_intensity", "direction": "up"},
-                base_url="http://localhost:3001",
+                base_url=CUP_DEFAULT_BASE_URL,
                 api_token=None,
                 timeout_seconds=5,
             )
         finally:
             tools_module._tool_http_json_request = original_request
 
-        self.assertEqual(seen_requests[0], ("GET", "http://localhost:3001/api/motor", None))
+        self.assertEqual(seen_requests[0], ("GET", f"{CUP_DEFAULT_API_BASE_URL}/motor", None))
         self.assertEqual(seen_requests[1][0], "POST")
-        self.assertEqual(seen_requests[1][1], "http://localhost:3001/api/led")
+        self.assertEqual(seen_requests[1][1], f"{CUP_DEFAULT_API_BASE_URL}/led")
         self.assertEqual(seen_requests[2][0], "POST")
-        self.assertEqual(seen_requests[2][1], "http://localhost:3001/api/motor")
+        self.assertEqual(seen_requests[2][1], f"{CUP_DEFAULT_API_BASE_URL}/motor")
         self.assertEqual(
             seen_requests[2][2],
             {"target_velocity": 95.0, "enabled": True},
@@ -847,15 +756,15 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertEqual(
             payload["request_trace"],
             [
-                {"method": "GET", "url": "http://localhost:3001/api/motor"},
+                {"method": "GET", "url": f"{CUP_DEFAULT_API_BASE_URL}/motor"},
                 {
                     "method": "POST",
-                    "url": "http://localhost:3001/api/led",
+                    "url": f"{CUP_DEFAULT_API_BASE_URL}/led",
                     "payload": {"color": "#ff3b30", "blink_hz": 2.0, "blink_mode": 2},
                 },
                 {
                     "method": "POST",
-                    "url": "http://localhost:3001/api/motor",
+                    "url": f"{CUP_DEFAULT_API_BASE_URL}/motor",
                     "payload": {"target_velocity": 95.0, "enabled": True},
                 },
             ],
@@ -876,7 +785,7 @@ class ToolRegistryTests(unittest.TestCase):
             tools_module._tool_http_json_request = request
             payload = _handle_control_cup(
                 {"action": "status"},
-                base_url="http://localhost:3001",
+                base_url=CUP_DEFAULT_BASE_URL,
                 api_token=None,
                 timeout_seconds=5,
             )
@@ -886,8 +795,8 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertEqual(
             seen_requests,
             [
-                "http://localhost:3001/api/status",
-                "http://localhost:3001/api/motor",
+                f"{CUP_DEFAULT_API_BASE_URL}/status",
+                f"{CUP_DEFAULT_API_BASE_URL}/motor",
             ],
         )
         self.assertEqual(payload["action"], "status")
@@ -907,7 +816,7 @@ class ToolRegistryTests(unittest.TestCase):
             tools_module._tool_http_json_request = request
             _handle_control_cup(
                 {"action": "status"},
-                base_url="http://localhost:3001/api",
+                base_url=CUP_DEFAULT_API_BASE_URL,
                 api_token=None,
                 timeout_seconds=5,
             )
@@ -917,8 +826,8 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertEqual(
             seen_requests,
             [
-                "http://localhost:3001/api/status",
-                "http://localhost:3001/api/motor",
+                f"{CUP_DEFAULT_API_BASE_URL}/status",
+                f"{CUP_DEFAULT_API_BASE_URL}/motor",
             ],
         )
 
@@ -933,11 +842,11 @@ class ToolRegistryTests(unittest.TestCase):
             tools_module._tool_http_json_request = request
             with self.assertRaisesRegex(
                 Exception,
-                "HTTP GET http://localhost:3001/api/status failed",
+                f"HTTP GET {CUP_DEFAULT_API_BASE_URL}/status failed",
             ):
                 _handle_control_cup(
                     {"action": "status"},
-                    base_url="http://localhost:3001",
+                    base_url=CUP_DEFAULT_BASE_URL,
                     api_token=None,
                     timeout_seconds=5,
                 )

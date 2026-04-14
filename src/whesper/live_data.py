@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from html import unescape as html_unescape
 from html.parser import HTMLParser
 import json
 import re
@@ -372,6 +373,96 @@ class HtmlSnapshot:
     title: str
     description: str
     headings: tuple[str, ...] = ()
+
+
+@dataclass(slots=True)
+class SearchResultItem:
+    title: str
+    url: str
+    snippet: str
+    source: str
+    page_age: str | None = None
+
+
+@dataclass(slots=True)
+class SearchSnapshot:
+    query: str
+    provider: str
+    status: str = "ok"
+    summary: str | None = None
+    summary_url: str | None = None
+    results: tuple[SearchResultItem, ...] = ()
+    error_code: str | None = None
+    error_message: str | None = None
+
+    def to_prompt_context(self) -> str:
+        if self.status == "error":
+            lines = [
+                "Live search lookup status:",
+                f"- query: {self.query}",
+                f"- provider: {self.provider}",
+            ]
+            if self.error_code:
+                lines.append(f"- error_code: {self.error_code}")
+            if self.error_message:
+                lines.append(f"- failed: {self.error_message}")
+            lines.append(
+                "- instruction: If live search is unavailable, say so briefly instead of pretending you searched."
+            )
+            return "\n".join(lines)
+
+        lines = [
+            "Live search snapshot:",
+            f"- query: {self.query}",
+            f"- provider: {self.provider}",
+            f"- status: {self.status}",
+        ]
+        if self.summary:
+            lines.append(f"- summary: {self.summary}")
+        if self.summary_url:
+            lines.append(f"- summary_url: {self.summary_url}")
+        for index, item in enumerate(self.results, start=1):
+            lines.append(f"- result_{index}_title: {item.title}")
+            if item.source:
+                lines.append(f"- result_{index}_source: {item.source}")
+            if item.page_age:
+                lines.append(f"- result_{index}_page_age: {item.page_age}")
+            if item.snippet:
+                lines.append(f"- result_{index}_snippet: {item.snippet}")
+            lines.append(f"- result_{index}_link: {item.url}")
+        if not self.results and not self.summary:
+            lines.append("- note: No concise web search results were available for this query.")
+        lines.append(
+            "- instruction: Treat this as a lightweight web search snapshot. Mention the source title or domain you relied on, and be careful with freshness claims."
+        )
+        return "\n".join(lines)
+
+    def to_tool_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "query": self.query,
+            "provider": self.provider,
+            "status": self.status,
+            "sources": [
+                {
+                    "title": item.title,
+                    "url": item.url,
+                    "snippet": item.snippet,
+                    "source": item.source,
+                    "page_age": item.page_age,
+                }
+                for item in self.results
+            ],
+            "result": self.to_prompt_context(),
+        }
+        if self.summary:
+            payload["summary"] = self.summary
+        if self.summary_url:
+            payload["summary_url"] = self.summary_url
+        if self.error_code:
+            payload["error_code"] = self.error_code
+        if self.error_message:
+            payload["error"] = self.error_message
+        return payload
 
 
 @dataclass(slots=True)
@@ -861,6 +952,7 @@ class LiveContextService:
                 TimeContextService(),
                 NewsContextService(),
                 SearchContextService(
+                    provider=config.live_context.search_api.provider,
                     api_key=config.live_context.search_api.resolved_api_key(),
                     engine=config.live_context.search_api.engine,
                     timeout_seconds=config.live_context.search_api.timeout_seconds,
@@ -1331,7 +1423,9 @@ class NewsContextService:
 
 @dataclass(slots=True)
 class SearchContextService:
+    provider: str = "duckduckgo"
     fetch_json: JsonFetcher = _default_fetch_json
+    fetch_text: TextFetcher = _default_fetch_text
     timeout_seconds: int = 10
     api_key: str | None = None
     engine: str = "google"
@@ -1346,12 +1440,42 @@ class SearchContextService:
         if not should_search or not normalized_query or _extract_urls(normalized_query):
             return None
 
+        return self.search_query(normalized_query).to_prompt_context()
+
+    def search_query(self, query: str) -> SearchSnapshot:
+        normalized_query = query.strip()
+        if not normalized_query:
+            return SearchSnapshot(
+                query="",
+                provider=self.provider,
+                status="error",
+                error_code="invalid_input",
+                error_message="missing search query",
+            )
+        dispatch = {
+            "duckduckgo": self._search_with_duckduckgo,
+            "brave": self._search_with_brave,
+            "serpapi": self._search_with_serpapi,
+        }
+        handler = dispatch.get(self.provider)
+        if handler is None:
+            return SearchSnapshot(
+                query=normalized_query,
+                provider=self.provider,
+                status="error",
+                error_code="unsupported_provider",
+                error_message=f"unsupported search provider: {self.provider}",
+            )
+        return handler(normalized_query)
+
+    def _search_with_serpapi(self, query: str) -> SearchSnapshot:
         if not self.api_key:
-            return (
-                "Live search lookup status:\n"
-                f"- query: {normalized_query}\n"
-                "- failed: missing SerpAPI API key\n"
-                "- instruction: If live search is unavailable, say so briefly instead of pretending you searched."
+            return SearchSnapshot(
+                query=query,
+                provider="serpapi",
+                status="error",
+                error_code="missing_api_key",
+                error_message="missing SerpAPI API key",
             )
 
         search_url = (
@@ -1359,7 +1483,7 @@ class SearchContextService:
             + parse.urlencode(
                 {
                     "engine": self.engine,
-                    "q": normalized_query,
+                    "q": query,
                     "api_key": self.api_key,
                     "num": self.max_results,
                 }
@@ -1368,17 +1492,114 @@ class SearchContextService:
         try:
             response = self.fetch_json(search_url, self.timeout_seconds)
         except Exception as exc:
-            return (
-                "Live search lookup status:\n"
-                f"- query: {normalized_query}\n"
-                f"- failed: {exc.__class__.__name__}: {exc}\n"
-                "- instruction: If live search is unavailable, say so briefly instead of pretending you searched."
+            return SearchSnapshot(
+                query=query,
+                provider="serpapi",
+                status="error",
+                error_code="unavailable",
+                error_message=f"{exc.__class__.__name__}: {exc}",
             )
 
-        lines = [
-            "Live search snapshot:",
-            f"- query: {normalized_query}",
-        ]
+        summary, summary_url = self._extract_serpapi_summary(response)
+        results = tuple(self._extract_organic_results(response.get("organic_results")))
+        status = "ok" if results or summary else "no_results"
+        return SearchSnapshot(
+            query=query,
+            provider="serpapi",
+            status=status,
+            summary=summary,
+            summary_url=summary_url,
+            results=results,
+        )
+
+    def _search_with_duckduckgo(self, query: str) -> SearchSnapshot:
+        try:
+            from ddgs import DDGS  # type: ignore[import-untyped]
+        except ImportError:
+            return SearchSnapshot(
+                query=query,
+                provider="duckduckgo",
+                status="error",
+                error_code="missing_dependency",
+                error_message=(
+                    "ddgs package is not installed; "
+                    "run: pip install ddgs"
+                ),
+            )
+        try:
+            ddgs = DDGS()
+            raw_results = list(ddgs.text(query, max_results=self.max_results))
+        except Exception as exc:
+            return SearchSnapshot(
+                query=query,
+                provider="duckduckgo",
+                status="error",
+                error_code="unavailable",
+                error_message=f"{exc.__class__.__name__}: {exc}",
+            )
+
+        results = tuple(
+            SearchResultItem(
+                title=_collapse_whitespace(str(item.get("title", "Untitled"))),
+                url=str(item.get("href", "")),
+                snippet=_collapse_whitespace(str(item.get("body", ""))),
+                source=_search_result_source(str(item.get("href", ""))),
+            )
+            for item in raw_results
+            if item.get("title") or item.get("href")
+        )
+        status = "ok" if results else "no_results"
+        return SearchSnapshot(
+            query=query,
+            provider="duckduckgo",
+            status=status,
+            results=results,
+        )
+
+    def _search_with_brave(self, query: str) -> SearchSnapshot:
+        if not self.api_key:
+            return SearchSnapshot(
+                query=query,
+                provider="brave",
+                status="error",
+                error_code="missing_api_key",
+                error_message="missing Brave Search API key",
+            )
+
+        search_url = (
+            "https://api.search.brave.com/res/v1/web/search?"
+            + parse.urlencode({"q": query, "count": self.max_results})
+        )
+        req = request.Request(
+            search_url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+                "X-Subscription-Token": self.api_key,
+            },
+        )
+        try:
+            with request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                response = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            return SearchSnapshot(
+                query=query,
+                provider="brave",
+                status="error",
+                error_code="unavailable",
+                error_message=f"{exc.__class__.__name__}: {exc}",
+            )
+
+        results = tuple(self._extract_brave_api_results(response))
+        status = "ok" if results else "no_results"
+        return SearchSnapshot(
+            query=query,
+            provider="brave",
+            status=status,
+            results=results,
+        )
+
+    def _extract_serpapi_summary(self, response: dict[str, object]) -> tuple[str | None, str | None]:
         answer_box = response.get("answer_box")
         if isinstance(answer_box, dict):
             answer = _collapse_whitespace(
@@ -1389,42 +1610,24 @@ class SearchContextService:
                     or ""
                 )
             )
-            answer_link = _collapse_whitespace(str(answer_box.get("link", "")))
+            answer_link = _collapse_whitespace(str(answer_box.get("link", ""))) or None
             if answer:
-                lines.append(f"- answer_box: {answer}")
-            if answer_link:
-                lines.append(f"- answer_box_link: {answer_link}")
+                return answer, answer_link
 
         knowledge_graph = response.get("knowledge_graph")
         if isinstance(knowledge_graph, dict):
             title = _collapse_whitespace(str(knowledge_graph.get("title", "")))
             description = _collapse_whitespace(str(knowledge_graph.get("description", "")))
-            website = _collapse_whitespace(str(knowledge_graph.get("website", "")))
-            if title:
-                lines.append(f"- knowledge_title: {title}")
-            if description:
-                lines.append(f"- knowledge_description: {description}")
-            if website:
-                lines.append(f"- knowledge_website: {website}")
+            website = _collapse_whitespace(str(knowledge_graph.get("website", ""))) or None
+            summary = _collapse_whitespace(" - ".join(part for part in (title, description) if part))
+            if summary:
+                return summary, website
+        return None, None
 
-        organic_results = self._extract_organic_results(response.get("organic_results"))
-        for index, item in enumerate(organic_results, start=1):
-            lines.append(f"- result_{index}_title: {item['title']}")
-            if item["snippet"]:
-                lines.append(f"- result_{index}_snippet: {item['snippet']}")
-            if item["link"]:
-                lines.append(f"- result_{index}_link: {item['link']}")
-        if len(lines) == 2:
-            lines.append("- note: No concise organic results were available for this query.")
-        lines.append(
-            "- instruction: If you use this search snapshot, make it clear it is a lightweight live lookup rather than a full web crawl."
-        )
-        return "\n".join(lines)
-
-    def _extract_organic_results(self, raw_results: object) -> list[dict[str, str]]:
+    def _extract_organic_results(self, raw_results: object) -> list[SearchResultItem]:
         if not isinstance(raw_results, list):
             return []
-        results: list[dict[str, str]] = []
+        results: list[SearchResultItem] = []
         for item in raw_results:
             if len(results) >= self.max_results:
                 break
@@ -1436,13 +1639,111 @@ class SearchContextService:
             if not title and not snippet and not link:
                 continue
             results.append(
-                {
-                    "title": title,
-                    "snippet": snippet,
-                    "link": link,
-                }
+                SearchResultItem(
+                    title=title or "Untitled result",
+                    url=link,
+                    snippet=snippet,
+                    source=_search_result_source(link),
+                )
             )
         return results
+
+    def _extract_brave_api_results(self, response: dict[str, object]) -> list[SearchResultItem]:
+        web = response.get("web")
+        if not isinstance(web, dict):
+            return []
+        raw_results = web.get("results")
+        if not isinstance(raw_results, list):
+            return []
+
+        results: list[SearchResultItem] = []
+        for item in raw_results:
+            if len(results) >= self.max_results:
+                break
+            if not isinstance(item, dict):
+                continue
+            title = _collapse_whitespace(str(item.get("title", "")))
+            url = str(item.get("url", ""))
+            snippet = _collapse_whitespace(str(item.get("description", "")))
+            page_age = str(item.get("page_age", "")).strip() or None
+            if not title or not url:
+                continue
+            results.append(
+                SearchResultItem(
+                    title=title,
+                    url=url,
+                    snippet=snippet,
+                    source=_search_result_source(url),
+                    page_age=page_age,
+                )
+            )
+        return results
+
+def _search_result_source(url: str) -> str:
+    try:
+        return parse.urlparse(url).netloc
+    except ValueError:
+        return ""
+
+
+def _split_top_level_js_objects(raw: str) -> list[str]:
+    items: list[str] = []
+    depth = 0
+    start_index: int | None = None
+    in_string = False
+    escaped = False
+    for index, char in enumerate(raw):
+        if in_string:
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            if depth == 0:
+                start_index = index
+            depth += 1
+            continue
+        if char == "}":
+            depth -= 1
+            if depth == 0 and start_index is not None:
+                items.append(raw[start_index : index + 1])
+                start_index = None
+    return items
+
+
+def _extract_js_string_field(
+    raw: str,
+    field_name: str,
+    *,
+    strip_tags: bool = True,
+) -> str | None:
+    match = re.search(
+        rf'{re.escape(field_name)}:"((?:[^"\\]|\\.)*)"',
+        raw,
+    )
+    if match is None:
+        return None
+    value = _decode_js_string(match.group(1))
+    value = html_unescape(value)
+    if strip_tags:
+        value = re.sub(r"<[^>]+>", "", value)
+    value = _collapse_whitespace(value)
+    return value or None
+
+
+def _decode_js_string(raw: str) -> str:
+    try:
+        return str(json.loads(f'"{raw}"'))
+    except json.JSONDecodeError:
+        return raw
 
 
 @dataclass(slots=True)
