@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from whesper.client import (
+    OpenAICompatibleClient,
     _build_openai_payload,
     _effective_temperature,
     _extract_reasoning_content,
@@ -12,6 +13,7 @@ from whesper.client import (
     _iter_sse_events,
 )
 from whesper.config import ModelConfig, ProviderConfig
+from whesper.provider_profile import OPENAI_DEFAULT_PROFILE, SILICONFLOW_QWEN_PROFILE
 
 
 class ClientTests(unittest.TestCase):
@@ -134,6 +136,252 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0].name, "web_search")
         self.assertIn("Brent WTI 2025", tool_calls[0].arguments_json)
+
+    def test_extract_tool_calls_from_text_ignores_tool_arg_pairs_for_default_profile(self) -> None:
+        content = """
+        Here is a literal example:
+        <tool>web_search</tool>
+        <arg>{"query":"latest news"}</arg>
+        """
+
+        tool_calls = _extract_tool_calls_from_text(
+            content,
+            profile=OPENAI_DEFAULT_PROFILE,
+        )
+
+        self.assertEqual(tool_calls, ())
+
+    def test_extract_tool_calls_from_text_supports_tool_arg_pairs_for_siliconflow_profile(self) -> None:
+        content = """
+        <tool>web_search</tool>
+        <arg>{"query":"latest news"}</arg>
+        """
+
+        tool_calls = _extract_tool_calls_from_text(
+            content,
+            profile=SILICONFLOW_QWEN_PROFILE,
+        )
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].name, "web_search")
+        self.assertIn("latest news", tool_calls[0].arguments_json)
+
+    def test_extract_tool_calls_from_text_skips_fenced_code_blocks(self) -> None:
+        content = """
+        这里是调用示例（仅作说明，不是真的请求）：
+        ```
+        <function_calls>
+        <invoke name="web_search">
+        <parameter name="query">demo</parameter>
+        </invoke>
+        </function_calls>
+        ```
+        """
+
+        tool_calls = _extract_tool_calls_from_text(
+            content,
+            profile=OPENAI_DEFAULT_PROFILE,
+        )
+
+        self.assertEqual(tool_calls, ())
+
+    def test_extract_tool_calls_from_text_skips_inline_code_spans(self) -> None:
+        content = (
+            "你可以写 `<tool>web_search</tool><arg>{\"query\":\"demo\"}</arg>` "
+            "来表达调用意图。"
+        )
+
+        tool_calls = _extract_tool_calls_from_text(
+            content,
+            profile=SILICONFLOW_QWEN_PROFILE,
+        )
+
+        self.assertEqual(tool_calls, ())
+
+    def test_extract_tool_calls_from_text_filters_unregistered_tool_names(self) -> None:
+        content = """
+        <function_calls>
+        <invoke name="fabricated_tool">
+        <parameter name="query">demo</parameter>
+        </invoke>
+        </function_calls>
+        """
+
+        tool_calls = _extract_tool_calls_from_text(
+            content,
+            profile=OPENAI_DEFAULT_PROFILE,
+            allowed_tool_names={"web_search"},
+        )
+
+        self.assertEqual(tool_calls, ())
+
+    def test_extract_tool_calls_from_text_keeps_registered_tool_names(self) -> None:
+        content = """
+        <function_calls>
+        <invoke name="web_search">
+        <parameter name="query">demo</parameter>
+        </invoke>
+        </function_calls>
+        """
+
+        tool_calls = _extract_tool_calls_from_text(
+            content,
+            profile=OPENAI_DEFAULT_PROFILE,
+            allowed_tool_names={"web_search"},
+        )
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].name, "web_search")
+
+    def test_create_chat_completion_uses_profile_specific_text_tool_patterns(self) -> None:
+        client = OpenAICompatibleClient()
+        provider = ProviderConfig(
+            name="remote",
+            kind="openai_compatible",
+            base_url="https://example.com/v1",
+        )
+        model = ModelConfig(
+            name="chat",
+            provider="remote",
+            model="gpt-like",
+        )
+
+        raw = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "<tool>web_search</tool><arg>{\"query\":\"latest news\"}</arg>",
+                    }
+                }
+            ]
+        }
+
+        import json
+        from unittest import mock
+
+        class DummyResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(raw).encode("utf-8")
+
+        with mock.patch("whesper.client.request.urlopen", return_value=DummyResponse()):
+            result = client.create_chat_completion(
+                provider,
+                model,
+                [{"role": "user", "content": "hello"}],
+            )
+
+        self.assertEqual(result.tool_calls, ())
+        self.assertIn("<tool>web_search</tool>", result.content)
+
+    def test_create_chat_completion_skips_text_extraction_when_tools_not_requested(
+        self,
+    ) -> None:
+        client = OpenAICompatibleClient()
+        provider = ProviderConfig(
+            name="siliconflow",
+            kind="openai_compatible",
+            base_url="https://api.siliconflow.cn/v1",
+        )
+        model = ModelConfig(
+            name="qwen",
+            provider="siliconflow",
+            model="Qwen/Qwen3-8B",
+        )
+
+        raw = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "<tool>web_search</tool><arg>{\"query\":\"x\"}</arg>",
+                    }
+                }
+            ]
+        }
+
+        import json
+        from unittest import mock
+
+        class DummyResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(raw).encode("utf-8")
+
+        with mock.patch("whesper.client.request.urlopen", return_value=DummyResponse()):
+            result = client.create_chat_completion(
+                provider,
+                model,
+                [{"role": "user", "content": "hello"}],
+            )
+
+        self.assertEqual(result.tool_calls, ())
+        self.assertIn("<tool>web_search</tool>", result.content)
+
+    def test_create_chat_completion_drops_text_tool_calls_with_unknown_names(
+        self,
+    ) -> None:
+        client = OpenAICompatibleClient()
+        provider = ProviderConfig(
+            name="siliconflow",
+            kind="openai_compatible",
+            base_url="https://api.siliconflow.cn/v1",
+        )
+        model = ModelConfig(
+            name="qwen",
+            provider="siliconflow",
+            model="Qwen/Qwen3-8B",
+        )
+
+        raw = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "<tool>fabricated</tool><arg>{\"query\":\"x\"}</arg>",
+                    }
+                }
+            ]
+        }
+
+        import json
+        from unittest import mock
+
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "web_search", "parameters": {"type": "object"}},
+            }
+        ]
+
+        class DummyResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(raw).encode("utf-8")
+
+        with mock.patch("whesper.client.request.urlopen", return_value=DummyResponse()):
+            result = client.create_chat_completion(
+                provider,
+                model,
+                [{"role": "user", "content": "hello"}],
+                tools=tools,
+            )
+
+        self.assertEqual(result.tool_calls, ())
+        self.assertIn("<tool>fabricated</tool>", result.content)
 
     def test_extract_reasoning_content_from_openai_response(self) -> None:
         provider = ProviderConfig(

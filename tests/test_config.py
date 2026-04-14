@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 from whesper.config import CUP_DEFAULT_BASE_URL, ConfigError, load_config
 
@@ -262,6 +264,64 @@ class ConfigTests(unittest.TestCase):
 
         config = load_config(temp_path)
         self.assertEqual(config.hardware.cup.base_url, "http://127.0.0.1:3901")
+
+    def test_loads_provider_base_url_from_environment_variable_default(self) -> None:
+        content = textwrap.dedent(
+            """
+            [scheduler]
+            chat_model = "local"
+
+            [providers.ollama_local]
+            kind = "ollama_native"
+            base_url = "${WHESPER_OLLAMA_BASE_URL:-http://localhost:11434}"
+
+            [models.local]
+            provider = "ollama_local"
+            model = "qwen"
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            config = load_config(temp_path)
+        self.assertEqual(
+            config.get_provider("ollama_local").base_url,
+            "http://localhost:11434",
+        )
+
+    def test_loads_provider_base_url_from_environment_variable_override(self) -> None:
+        content = textwrap.dedent(
+            """
+            [scheduler]
+            chat_model = "local"
+
+            [providers.ollama_local]
+            kind = "ollama_native"
+            base_url = "${WHESPER_OLLAMA_BASE_URL:-http://localhost:11434}"
+
+            [models.local]
+            provider = "ollama_local"
+            model = "qwen"
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        with mock.patch.dict(
+            os.environ,
+            {"WHESPER_OLLAMA_BASE_URL": "http://family.zhoudians.com:41434"},
+            clear=False,
+        ):
+            config = load_config(temp_path)
+        self.assertEqual(
+            config.get_provider("ollama_local").base_url,
+            "http://family.zhoudians.com:41434",
+        )
 
 
 if __name__ == "__main__":

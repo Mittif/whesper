@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from typing import Iterable
 from xml.etree import ElementTree
 
 from whesper.agent_types import ToolInvocation
@@ -18,6 +19,16 @@ _TOOL_ARG_PATTERN = re.compile(
     r"<tool>\s*(\S+?)\s*</tool>\s*<arg>\s*(.*?)\s*</arg>",
     re.DOTALL,
 )
+
+# Fenced (```...```) and inline (`...`) code segments where tool-call-like
+# syntax is almost always a quoted example rather than a real invocation.
+_CODE_FENCE_PATTERN = re.compile(r"```[\s\S]*?```")
+_INLINE_CODE_PATTERN = re.compile(r"`[^`\n]*`")
+
+
+def _strip_code_segments(content: str) -> str:
+    without_fences = _CODE_FENCE_PATTERN.sub(" ", content)
+    return _INLINE_CODE_PATTERN.sub(" ", without_fences)
 
 
 class DefaultToolProtocolAdapter:
@@ -53,14 +64,23 @@ class DefaultToolProtocolAdapter:
         content: str,
         *,
         profile: ProviderProfile | None = None,
+        allowed_tool_names: Iterable[str] | None = None,
     ) -> tuple[ToolInvocation, ...]:
         patterns = (
             profile.text_tool_call_patterns
             if profile is not None
             else ("function_calls", "tool_arg")
         )
+        allow = (
+            frozenset(allowed_tool_names)
+            if allowed_tool_names is not None
+            else None
+        )
+        cleaned = _strip_code_segments(content)
         for pattern_name in patterns:
-            tool_calls = self._extract_by_pattern(pattern_name, content)
+            tool_calls = self._extract_by_pattern(pattern_name, cleaned)
+            if allow is not None:
+                tool_calls = tuple(tc for tc in tool_calls if tc.name in allow)
             if tool_calls:
                 return tool_calls
         return ()

@@ -187,8 +187,34 @@ def _extract_tool_calls(provider: ProviderConfig, raw: dict) -> tuple[ToolCall, 
     return DEFAULT_TOOL_PROTOCOL_ADAPTER.extract_tool_calls(provider, raw)
 
 
-def _extract_tool_calls_from_text(content: str) -> tuple[ToolCall, ...]:
-    return DEFAULT_TOOL_PROTOCOL_ADAPTER.extract_tool_calls_from_text(content)
+def _extract_tool_calls_from_text(
+    content: str,
+    *,
+    profile: ProviderProfile | None = None,
+    allowed_tool_names: Iterable[str] | None = None,
+) -> tuple[ToolCall, ...]:
+    return DEFAULT_TOOL_PROTOCOL_ADAPTER.extract_tool_calls_from_text(
+        content,
+        profile=profile,
+        allowed_tool_names=allowed_tool_names,
+    )
+
+
+def _tool_names_from_tools(
+    tools: list[dict[str, object]] | None,
+) -> frozenset[str]:
+    if not tools:
+        return frozenset()
+    names: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+    return frozenset(names)
 
 
 def _extract_reasoning_content(provider: ProviderConfig, raw: dict) -> str | None:
@@ -287,6 +313,7 @@ class OpenAICompatibleClient:
         tool_choice: str | dict[str, object] | None = None,
         disable_thinking: bool = False,
     ) -> CompletionResult:
+        profile = resolve_profile(provider, model)
         req = request.Request(
             _completion_endpoint(provider),
             data=_request_payload(
@@ -335,8 +362,13 @@ class OpenAICompatibleClient:
                 f"Provider '{provider.name}' returned an unexpected response shape."
             ) from exc
 
-        if not tool_calls and content:
-            tool_calls = _extract_tool_calls_from_text(content)
+        if not tool_calls and content and tools:
+            allowed = _tool_names_from_tools(tools)
+            tool_calls = _extract_tool_calls_from_text(
+                content,
+                profile=profile,
+                allowed_tool_names=allowed,
+            )
             if tool_calls:
                 content = ""
 

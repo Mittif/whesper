@@ -34,6 +34,7 @@ The script will choose a runnable setup automatically:
 Useful environment variables:
 
 ```bash
+WHESPER_OLLAMA_BASE_URL="http://localhost:11434" ./scripts/bootstrap.sh
 WHESPER_LOCAL_MODEL="qwen3.5:14b" ./scripts/bootstrap.sh
 WHESPER_KIMI_API_KEY="your-api-key" ./scripts/bootstrap.sh
 WHESPER_SILICONFLOW_API_KEY="your-api-key" ./scripts/bootstrap.sh
@@ -64,6 +65,7 @@ cp whesper.example.toml whesper.toml
 
 3. Update `whesper.toml`:
 
+- Export `WHESPER_OLLAMA_BASE_URL` if your Ollama server is not `http://localhost:11434`
 - Set `[models.local_chat].model` to a real Ollama model name if you want local chat
 - Export `WHESPER_KIMI_API_KEY` or `WHESPER_SILICONFLOW_API_KEY` if you want a remote model
 - If you are running fully local, set `search_model = "local_chat"` under `[scheduler]`
@@ -117,6 +119,8 @@ Default model aliases in the example config:
 - `kimi-k2.5`: Moonshot/Kimi via `WHESPER_KIMI_API_KEY`
 - `siliconflow-qwen3-8b`: SiliconFlow via `WHESPER_SILICONFLOW_API_KEY`
 
+The example config reads the Ollama base URL from `WHESPER_OLLAMA_BASE_URL` and falls back to `http://localhost:11434`.
+
 Optional live-data endpoint sections are also supported in config:
 
 - `live_context.status_api.*`
@@ -143,6 +147,17 @@ Whesper is still in an MVP / prototype phase. The current focus is:
 - making the conversation loop and tool path solid
 - improving CLI usability and deployment ergonomics
 - validating local-first and hybrid model routing before expanding beyond CLI
+
+## Development Progress
+
+- `2026-03-13`: Project initialization and repository setup.
+- `2026-03-17`: First runnable Whesper CLI scaffold landed, establishing the base chat workflow.
+- `2026-03-18`: Improved CLI usability with better streaming output, session management, and day-to-day interaction flow.
+- `2026-03-23`: Added the first practical assistant capabilities, including tools, memory, live-context lookups, and tracing.
+- `2026-03-26`: Introduced the agent harness, tool protocol, and bootstrap flow to make the system more structured and easier to deploy.
+- `2026-03-27`: Refined tool-result streaming and improved weather lookup quality for live-data turns.
+- `2026-04-12`: Expanded the interaction loop with ask-user support and CUP hardware tooling for real device control scenarios.
+- `2026-04-14`: Added provider profiles plus broader remote/search support, improving cross-provider compatibility for Kimi, SiliconFlow, Ollama, and web search backends.
 
 ## Development
 
