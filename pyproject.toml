@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "prompt_toolkit>=3.0.43,<4",
+    "ddgs>=7.0",
 ]
 
 [project.scripts]

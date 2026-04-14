@@ -23,6 +23,7 @@ class ChatMessage:
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[dict[str, object]] | None = None
+    source_profile: str | None = None
 
 
 def is_transcript_message(message: ChatMessage) -> bool:
@@ -68,6 +69,11 @@ def _message_from_dict(item: dict[str, object]) -> ChatMessage:
         tool_calls=(
             item["tool_calls"]
             if isinstance(item.get("tool_calls"), list)
+            else None
+        ),
+        source_profile=(
+            str(item["source_profile"])
+            if item.get("source_profile") is not None
             else None
         ),
     )

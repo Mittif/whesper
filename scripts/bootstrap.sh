@@ -9,8 +9,11 @@ CONFIG_FILE="${ROOT_DIR}/whesper.toml"
 
 LOCAL_MODEL="${WHESPER_LOCAL_MODEL:-}"
 KIMI_API_KEY="${WHESPER_KIMI_API_KEY:-}"
+SILICONFLOW_API_KEY="${WHESPER_SILICONFLOW_API_KEY:-}"
 SKIP_INSTALL="${WHESPER_SKIP_INSTALL:-0}"
 BOOTSTRAP_PROFILE=""
+REMOTE_PROFILE=""
+REMOTE_MODEL_ALIAS="local_chat"
 PYTHON_BIN=""
 
 log() {
@@ -74,26 +77,58 @@ detect_local_model() {
   fi
 }
 
+remote_runtime_label() {
+  case "$1" in
+    kimi)
+      printf 'Kimi'
+      ;;
+    siliconflow)
+      printf 'SiliconFlow'
+      ;;
+    *)
+      printf 'remote'
+      ;;
+  esac
+}
+
 select_bootstrap_profile() {
   detect_local_model
 
   if [ -n "$LOCAL_MODEL" ]; then
     BOOTSTRAP_PROFILE="local"
+    if [ -n "$KIMI_API_KEY" ]; then
+      REMOTE_PROFILE="kimi"
+      REMOTE_MODEL_ALIAS="kimi-k2.5"
+    elif [ -n "$SILICONFLOW_API_KEY" ]; then
+      REMOTE_PROFILE="siliconflow"
+      REMOTE_MODEL_ALIAS="siliconflow-qwen3-8b"
+    fi
     return 0
   fi
 
   if [ -n "$KIMI_API_KEY" ]; then
     BOOTSTRAP_PROFILE="kimi"
+    REMOTE_PROFILE="kimi"
+    REMOTE_MODEL_ALIAS="kimi-k2.5"
     log "No local Ollama model detected; configuring Kimi as the default runtime"
     return 0
   fi
 
+  if [ -n "$SILICONFLOW_API_KEY" ]; then
+    BOOTSTRAP_PROFILE="siliconflow"
+    REMOTE_PROFILE="siliconflow"
+    REMOTE_MODEL_ALIAS="siliconflow-qwen3-8b"
+    log "No local Ollama model detected; configuring SiliconFlow as the default runtime"
+    return 0
+  fi
+
   fail \
-"Could not detect a local Ollama model and WHESPER_KIMI_API_KEY is not set.
+"Could not detect a local Ollama model and neither WHESPER_KIMI_API_KEY nor WHESPER_SILICONFLOW_API_KEY is set.
 To complete one-click deployment, do one of the following before rerunning bootstrap:
   1. Install/start Ollama and pull a model, then rerun ./scripts/bootstrap.sh
   2. Export WHESPER_LOCAL_MODEL=\"your-local-model\"
-  3. Export WHESPER_KIMI_API_KEY=\"your-api-key\""
+  3. Export WHESPER_KIMI_API_KEY=\"your-api-key\"
+  4. Export WHESPER_SILICONFLOW_API_KEY=\"your-api-key\""
 }
 
 write_config_from_example() {
@@ -101,7 +136,7 @@ write_config_from_example() {
 
   WHESPER_BOOTSTRAP_PROFILE="$BOOTSTRAP_PROFILE" \
   WHESPER_BOOTSTRAP_LOCAL_MODEL="$LOCAL_MODEL" \
-  WHESPER_BOOTSTRAP_KIMI_ENABLED="$([ -n "$KIMI_API_KEY" ] && printf '1' || printf '0')" \
+  WHESPER_BOOTSTRAP_REMOTE_MODEL="$REMOTE_MODEL_ALIAS" \
   "$PYTHON_BIN" - "$CONFIG_FILE" <<'PY'
 from pathlib import Path
 import os
@@ -111,17 +146,17 @@ config_path = Path(sys.argv[1])
 text = config_path.read_text(encoding="utf-8")
 profile = os.environ["WHESPER_BOOTSTRAP_PROFILE"]
 local_model = os.environ.get("WHESPER_BOOTSTRAP_LOCAL_MODEL", "").strip()
-kimi_enabled = os.environ.get("WHESPER_BOOTSTRAP_KIMI_ENABLED") == "1"
+remote_model = os.environ.get("WHESPER_BOOTSTRAP_REMOTE_MODEL", "local_chat").strip() or "local_chat"
 
 if profile == "local":
     if not local_model:
         raise SystemExit("missing local model for local bootstrap profile")
     text = text.replace('model = "your-model"', f'model = "{local_model}"', 1)
-    if not kimi_enabled:
-        text = text.replace('search_model = "kimi-k2.5"', 'search_model = "local_chat"', 1)
-elif profile == "kimi":
-    text = text.replace('chat_model = "local_chat"', 'chat_model = "kimi-k2.5"', 1)
-    text = text.replace('reasoning_model = "local_chat"', 'reasoning_model = "kimi-k2.5"', 1)
+    text = text.replace('search_model = "kimi-k2.5"', f'search_model = "{remote_model}"', 1)
+elif profile in {"kimi", "siliconflow"}:
+    text = text.replace('chat_model = "local_chat"', f'chat_model = "{remote_model}"', 1)
+    text = text.replace('reasoning_model = "local_chat"', f'reasoning_model = "{remote_model}"', 1)
+    text = text.replace('search_model = "kimi-k2.5"', f'search_model = "{remote_model}"', 1)
     text = text.replace('model = "your-model"', 'model = "local-model-not-configured"', 1)
 else:
     raise SystemExit(f"unknown bootstrap profile: {profile}")
@@ -131,14 +166,17 @@ PY
 
   case "$BOOTSTRAP_PROFILE" in
     local)
-      if [ -n "$KIMI_API_KEY" ]; then
-        log "Created whesper.toml for local chat with Kimi search fallback"
+      if [ -n "$REMOTE_PROFILE" ]; then
+        log "Created whesper.toml for local chat with $(remote_runtime_label "$REMOTE_PROFILE") search fallback"
       else
         log "Created whesper.toml for fully local use"
       fi
       ;;
     kimi)
       log "Created whesper.toml for Kimi-only runtime"
+      ;;
+    siliconflow)
+      log "Created whesper.toml for SiliconFlow-only runtime"
       ;;
   esac
 }
@@ -178,6 +216,7 @@ Run the CLI:
 Helpful environment variables:
   WHESPER_LOCAL_MODEL   Force the local Ollama model name bootstrap should write
   WHESPER_KIMI_API_KEY  Optional, enables or becomes the default Kimi runtime
+  WHESPER_SILICONFLOW_API_KEY  Optional, enables or becomes the default SiliconFlow runtime
   WHESPER_SKIP_INSTALL  Optional, set to 1 to skip pip install during debugging
 
 EOF
@@ -188,7 +227,7 @@ EOF
 Configured runtime:
   chat_model      = local_chat
   reasoning_model = local_chat
-  search_model    = $([ -n "$KIMI_API_KEY" ] && printf 'kimi-k2.5' || printf 'local_chat')
+  search_model    = ${REMOTE_MODEL_ALIAS}
 
 Selected local model:
   ${LOCAL_MODEL}
@@ -198,17 +237,28 @@ EOF
     kimi)
       cat <<EOF
 Configured runtime:
-  chat_model      = kimi-k2.5
-  reasoning_model = kimi-k2.5
-  search_model    = kimi-k2.5
+  chat_model      = ${REMOTE_MODEL_ALIAS}
+  reasoning_model = ${REMOTE_MODEL_ALIAS}
+  search_model    = ${REMOTE_MODEL_ALIAS}
 
 Kimi-only bootstrap was selected because no local Ollama model was detected.
 
 EOF
       ;;
+    siliconflow)
+      cat <<EOF
+Configured runtime:
+  chat_model      = ${REMOTE_MODEL_ALIAS}
+  reasoning_model = ${REMOTE_MODEL_ALIAS}
+  search_model    = ${REMOTE_MODEL_ALIAS}
+
+SiliconFlow-only bootstrap was selected because no local Ollama model was detected.
+
+EOF
+      ;;
   esac
 
-  if [ "$BOOTSTRAP_PROFILE" = "kimi" ]; then
+  if [ "$BOOTSTRAP_PROFILE" = "kimi" ] || [ "$BOOTSTRAP_PROFILE" = "siliconflow" ]; then
     cat <<EOF
 If you later add a local Ollama model, rerun bootstrap like this:
   WHESPER_LOCAL_MODEL="your-local-model" ./scripts/bootstrap.sh
@@ -221,6 +271,15 @@ EOF
 Kimi is not configured yet.
 If you want to use the remote Kimi model, export:
   export WHESPER_KIMI_API_KEY="your-api-key"
+
+EOF
+  fi
+
+  if [ -z "$SILICONFLOW_API_KEY" ]; then
+    cat <<EOF
+SiliconFlow is not configured yet.
+If you want to use the remote SiliconFlow model, export:
+  export WHESPER_SILICONFLOW_API_KEY="your-api-key"
 
 EOF
   fi

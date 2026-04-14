@@ -15,7 +15,7 @@ from whesper.agent_types import AgentStep
 from whesper.agent_types import AskUserAction
 from whesper.agent_types import ToolInvocation
 from whesper.chat import ChatService, ChatTurnResult, GenerationInterrupted
-from whesper.client import ProviderError
+from whesper.client import ProviderError, list_provider_models
 from whesper.commands import (
     VALID_MODES,
     ParsedCommand,
@@ -23,8 +23,9 @@ from whesper.commands import (
     help_text,
     parse_command,
 )
-from whesper.config import AppConfig, ConfigError, load_config
+from whesper.config import AppConfig, ConfigError, VALID_SEARCH_PROVIDERS, load_config
 from whesper.memory import MemoryService, MemoryStore
+from whesper.provider_profile import resolve_profile
 from whesper.router import select_model
 from whesper.session import (
     ChatMessage,
@@ -354,7 +355,7 @@ def run_trace_debug_turn(
     )
     model_config = chat_service.config.get_model(decision.model_alias)
     provider_config = chat_service.config.get_provider(model_config.provider)
-    tool_message_format = chat_service._tool_message_format(model_config, provider_config)
+    target_profile = resolve_profile(provider_config, model_config)
     tools = chat_service._tools_for_request(
         session=shadow_session,
         provider=provider_config,
@@ -362,13 +363,15 @@ def run_trace_debug_turn(
         user_text=user_text,
         route_mode=decision.mode,
     )
+    needs_reasoning = chat_service._requires_reasoning_content_replay(target_profile, model_config)
     messages = chat_service._build_messages(
         shadow_session,
         model_config.system_prompt,
-        tool_message_format=tool_message_format,
+        target_profile=target_profile,
         user_text=user_text,
         route_mode=decision.mode,
         include_live_context=tools is None,
+        ensure_reasoning_content=needs_reasoning,
     )
     tool_choice = chat_service._tool_choice_for_request(
         shadow_session,
@@ -996,10 +999,20 @@ def ensure_valid_session_model(
 
     try:
         config.get_model(pinned_model)
-    except ConfigError as exc:
-        print_cli_error(str(exc), output_stream=output_stream)
+    except ConfigError:
+        if "/" in pinned_model:
+            provider_name = pinned_model.split("/", 1)[0]
+            model_id = pinned_model.split("/", 1)[1]
+            try:
+                config.register_model(pinned_model, provider_name, model_id)
+                return False
+            except ConfigError:
+                pass
+        print_cli_error(
+            f"Saved session model '{pinned_model}' is no longer available.",
+            output_stream=output_stream,
+        )
         print_cli_hint("Session model was reset to auto.", output_stream=output_stream)
-        print_cli_hint("Tip: run /models to inspect configured aliases.", output_stream=output_stream)
         session.pinned_model = "auto"
         return True
 
@@ -1016,10 +1029,22 @@ def apply_pinned_model_override(
 ) -> None:
     try:
         config.get_model(pinned_model)
-    except ConfigError as exc:
-        print_cli_error(str(exc), output_stream=output_stream)
+    except ConfigError:
+        if "/" in pinned_model:
+            provider_name = pinned_model.split("/", 1)[0]
+            model_id = pinned_model.split("/", 1)[1]
+            try:
+                config.register_model(pinned_model, provider_name, model_id)
+                session.pinned_model = pinned_model
+                store.save(session)
+                return
+            except ConfigError:
+                pass
+        print_cli_error(
+            f"Model '{pinned_model}' is not available.",
+            output_stream=output_stream,
+        )
         print_cli_hint("Starting with session model: auto.", output_stream=output_stream)
-        print_cli_hint("Tip: run /models to inspect configured aliases.", output_stream=output_stream)
     else:
         session.pinned_model = pinned_model
         store.save(session)
@@ -1071,7 +1096,47 @@ def handle_command(
             print_trace(trace_store, output_stream=output_stream)
             return CommandOutcome(True, session, mode_override)
         if parsed.name == "/models":
-            print_models(config)
+            if parsed.arg:
+                provider_name = parsed.arg
+                try:
+                    provider = config.get_provider(provider_name)
+                except ConfigError:
+                    print_cli_error(
+                        f"Unknown provider: {provider_name}",
+                        output_stream=output_stream,
+                    )
+                    print_cli_hint(
+                        f"available providers: {', '.join(sorted(config.providers.keys()))}",
+                        output_stream=output_stream,
+                    )
+                    return CommandOutcome(True, session, mode_override)
+                print(f"Fetching models from {provider_name}...", file=output_stream)
+                try:
+                    model_ids = list_provider_models(provider)
+                except ProviderError as exc:
+                    print_cli_error(str(exc), output_stream=output_stream)
+                    return CommandOutcome(True, session, mode_override)
+                if not model_ids:
+                    print("  (no models returned)", file=output_stream)
+                else:
+                    print(
+                        f"Available models on {provider_name} ({len(model_ids)}):",
+                        file=output_stream,
+                    )
+                    for model_id in model_ids:
+                        alias = f"{provider_name}/{model_id}"
+                        configured = any(
+                            m.provider == provider_name and m.model == model_id
+                            for m in config.models.values()
+                        )
+                        marker = " [configured]" if configured else ""
+                        print(f"  - {alias}{marker}", file=output_stream)
+                    print(
+                        f"\nTip: use /model {provider_name}/<model_id> to switch",
+                        file=output_stream,
+                    )
+            else:
+                print_models(config)
             return CommandOutcome(True, session, mode_override)
         if parsed.name == "/sessions":
             print_sessions(store)
@@ -1151,16 +1216,96 @@ def handle_command(
             output_stream=output_stream,
         ):
             return CommandOutcome(True, session, mode_override)
+        if parsed.name == "/websearch":
+            search_service = chat_service.tool_registry.search_service
+            if parsed.arg is None:
+                current = search_service.provider if search_service else "duckduckgo"
+                available = ", ".join(VALID_SEARCH_PROVIDERS)
+                print(
+                    f"Web search provider: {current}\n"
+                    f"Available: {available}",
+                    file=output_stream,
+                )
+                return CommandOutcome(True, session, mode_override)
+            provider = parsed.arg.strip().casefold()
+            if provider not in VALID_SEARCH_PROVIDERS:
+                available = ", ".join(VALID_SEARCH_PROVIDERS)
+                print_cli_error(f"Unknown provider: {parsed.arg}", output_stream=output_stream)
+                print_cli_hint(f"available: {available}", output_stream=output_stream)
+                return CommandOutcome(True, session, mode_override)
+            if search_service is not None:
+                search_service.provider = provider
+                if provider == "brave":
+                    import os
+                    search_service.api_key = os.getenv("WHESPER_BRAVE_API_KEY")
+                elif provider == "serpapi":
+                    import os
+                    search_service.api_key = os.getenv("WHESPER_SERPAPI_API_KEY")
+                else:
+                    search_service.api_key = None
+            print(f"Web search provider set to: {provider}", file=output_stream)
+            return CommandOutcome(True, session, mode_override)
         if parsed.name in {"/model", "/use"}:
-            alias = parsed.arg or "auto"
+            if not parsed.arg:
+                current = session.pinned_model or "auto"
+                print(f"Current model: {current}", file=output_stream)
+                if current != "auto":
+                    try:
+                        m = config.get_model(current)
+                        p = config.get_provider(m.provider)
+                        print(
+                            f"  provider={p.name}  model={m.model}  "
+                            f"temperature={m.temperature}",
+                            file=output_stream,
+                        )
+                    except ConfigError:
+                        pass
+                print(
+                    "Tip: /model <alias|provider/model|auto> to switch",
+                    file=output_stream,
+                )
+                return CommandOutcome(True, session, mode_override)
+            alias = parsed.arg
             if alias != "auto":
-                config.get_model(alias)
+                # Support provider/model_id format — auto-register if needed
+                if "/" in alias and alias not in config.models:
+                    parts = alias.split("/", 1)
+                    provider_name, model_id = parts[0], parts[1]
+                    try:
+                        config.get_provider(provider_name)
+                    except ConfigError:
+                        print_cli_error(
+                            f"Unknown provider: {provider_name}",
+                            output_stream=output_stream,
+                        )
+                        print_cli_hint(
+                            f"available providers: {', '.join(sorted(config.providers.keys()))}",
+                            output_stream=output_stream,
+                        )
+                        return CommandOutcome(True, session, mode_override)
+                    config.register_model(alias, provider_name, model_id)
+                    print(
+                        f"Auto-registered model: {alias} (provider={provider_name}, model={model_id})",
+                        file=output_stream,
+                    )
+                else:
+                    config.get_model(alias)
             session.pinned_model = alias
             store.save(session)
             print(f"Session model set to: {alias}", file=output_stream)
             return CommandOutcome(True, session, mode_override)
         if parsed.name == "/mode":
-            next_mode = parsed.arg or "auto"
+            if not parsed.arg:
+                print(
+                    f"Current routing mode: {mode_override}",
+                    file=output_stream,
+                )
+                print(
+                    f"Tip: /mode <{AVAILABLE_MODES_TEXT}> to switch",
+                    file=output_stream,
+                )
+                return CommandOutcome(True, session, mode_override)
+            next_mode = parsed.arg
             if next_mode not in VALID_MODES:
                 print_cli_error(f"Invalid mode: {next_mode}", output_stream=output_stream)
                 print_cli_hint(
@@ -1240,7 +1385,11 @@ def handle_command(
     except ConfigError as exc:
         print_cli_error(str(exc), output_stream=output_stream)
         if parsed.name in {"/model", "/use"}:
-            print_cli_hint("Tip: run /models to inspect configured aliases.", output_stream=output_stream)
+            print_cli_hint(
+                "Tip: run /models to inspect configured aliases, "
+                "or /models <provider> to browse available models.",
+                output_stream=output_stream,
+            )
         if parsed.name in {"/status", "/info"}:
             print_cli_hint("Tip: check /models and /mode for the current routing state.", output_stream=output_stream)
         return CommandOutcome(True, session, mode_override)

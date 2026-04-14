@@ -8,3 +8,4 @@ whesper.toml
 DEVELOPMENT_NOTES.local.md
 hardware.md
 src/whesper.egg-info/
+docs/cross_model_compatibility_design.md

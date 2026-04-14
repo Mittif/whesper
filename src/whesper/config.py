@@ -3,12 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import re
 import tomllib
 from typing import Any
 
 
 class ConfigError(ValueError):
     pass
+
+
+CUP_DEFAULT_BASE_URL = "http://localhost:3001"
+_CONFIG_VARIABLE_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
 @dataclass(slots=True)
@@ -20,6 +25,7 @@ class ProviderConfig:
     api_key_env: str | None = None
     timeout_seconds: int = 120
     extra_headers: dict[str, str] = field(default_factory=dict)
+    profile_override: str | None = None
 
     def resolved_api_key(self) -> str | None:
         if self.api_key is not None:
@@ -40,6 +46,7 @@ class ModelConfig:
     think: bool | str | None = None
     system_prompt: str | None = None
     tags: tuple[str, ...] = ()
+    profile_override: str | None = None
 
 
 @dataclass(slots=True)
@@ -84,9 +91,9 @@ class LiveContextEndpointConfig:
 
 @dataclass(slots=True)
 class SearchApiSettings:
-    provider: str = "serpapi"
+    provider: str = "duckduckgo"
     api_key: str | None = None
-    api_key_env: str | None = "WHESPER_SERPAPI_API_KEY"
+    api_key_env: str | None = None
     engine: str = "google"
     timeout_seconds: int = 10
 
@@ -115,16 +122,9 @@ class ShellSandboxSettings:
 
 
 @dataclass(slots=True)
-class LedHardwareSettings:
-    enabled: bool = False
-    base_url: str = "http://led.local"
-    timeout_seconds: int = 5
-
-
-@dataclass(slots=True)
 class CupHardwareSettings:
     enabled: bool = False
-    base_url: str = "http://localhost:3001"
+    base_url: str = CUP_DEFAULT_BASE_URL
     api_token: str | None = None
     api_token_env: str | None = "WHESPER_CUP_API_TOKEN"
     timeout_seconds: int = 5
@@ -143,7 +143,6 @@ class CupHardwareSettings:
 
 @dataclass(slots=True)
 class HardwareSettings:
-    led: LedHardwareSettings = field(default_factory=LedHardwareSettings)
     cup: CupHardwareSettings = field(default_factory=CupHardwareSettings)
 
 
@@ -171,6 +170,23 @@ class AppConfig:
             raise ConfigError(
                 f"Unknown provider: {name}. no providers are configured."
             ) from exc
+
+    def register_model(self, alias: str, provider_name: str, model_id: str) -> ModelConfig:
+        """Create a model config at runtime and add it to the config."""
+        if provider_name not in self.providers:
+            raise ConfigError(
+                f"Unknown provider: {provider_name}. "
+                f"available providers: {', '.join(sorted(self.providers.keys()))}"
+            )
+        model = ModelConfig(
+            name=alias,
+            provider=provider_name,
+            model=model_id,
+            temperature=0.7,
+            max_tokens=1600,
+        )
+        self.models[alias] = model
+        return model
 
     def get_model(self, name: str) -> ModelConfig:
         try:
@@ -250,6 +266,44 @@ def _parse_shell_command_prefixes(raw: Any) -> tuple[tuple[str, ...], ...]:
     return tuple(prefixes)
 
 
+def _parse_config_variables(raw: Any) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("Invalid [variables] section in config.")
+
+    variables: dict[str, str] = {}
+    for name, value in raw.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError("variables keys must be non-empty strings.")
+        if not isinstance(value, str):
+            raise ConfigError(f"variables.{name} must be a string.")
+        variables[name.strip()] = value.strip()
+    return variables
+
+
+def _resolve_config_variables(
+    value: str,
+    *,
+    field_name: str,
+    variables: dict[str, str],
+) -> str:
+    def replace(match: re.Match[str]) -> str:
+        variable_name = match.group(1) or match.group(2)
+        assert variable_name is not None
+        if variable_name in variables:
+            return variables[variable_name]
+        environment_value = os.getenv(variable_name)
+        if environment_value is not None:
+            return environment_value
+        raise ConfigError(
+            f"{field_name} references unknown variable '{variable_name}'. "
+            "Define it under [variables] or export it in the environment."
+        )
+
+    return _CONFIG_VARIABLE_PATTERN.sub(replace, value)
+
+
 def _parse_live_context_endpoints(raw: Any, section_name: str) -> dict[str, LiveContextEndpointConfig]:
     if raw is None:
         return {}
@@ -289,22 +343,33 @@ def _parse_live_context_endpoints(raw: Any, section_name: str) -> dict[str, Live
     return endpoints
 
 
+VALID_SEARCH_PROVIDERS = ("duckduckgo", "brave", "serpapi")
+
+_SEARCH_API_KEY_ENV_DEFAULTS: dict[str, str] = {
+    "serpapi": "WHESPER_SERPAPI_API_KEY",
+    "brave": "WHESPER_BRAVE_API_KEY",
+}
+
+
 def _parse_search_api_settings(raw: Any) -> SearchApiSettings:
     if raw is None:
         return SearchApiSettings()
     if not isinstance(raw, dict):
         raise ConfigError("Invalid [live_context.search_api] section in config.")
 
-    provider = str(raw.get("provider", "serpapi")).strip()
-    if provider != "serpapi":
-        raise ConfigError("live_context.search_api.provider currently only supports 'serpapi'.")
+    provider = str(raw.get("provider", "duckduckgo")).strip()
+    if provider not in VALID_SEARCH_PROVIDERS:
+        raise ConfigError(
+            f"live_context.search_api.provider must be one of: "
+            f"{', '.join(VALID_SEARCH_PROVIDERS)}."
+        )
 
     engine = str(raw.get("engine", "google")).strip()
-    if not engine:
+    if provider == "serpapi" and not engine:
         raise ConfigError("live_context.search_api.engine must be a non-empty string.")
 
     api_key = raw.get("api_key")
-    api_key_env = raw.get("api_key_env", "WHESPER_SERPAPI_API_KEY")
+    api_key_env = raw.get("api_key_env", _SEARCH_API_KEY_ENV_DEFAULTS.get(provider))
     return SearchApiSettings(
         provider=provider,
         api_key=str(api_key).strip() if api_key is not None else None,
@@ -314,30 +379,21 @@ def _parse_search_api_settings(raw: Any) -> SearchApiSettings:
     )
 
 
-def _parse_led_hardware_settings(raw: Any) -> LedHardwareSettings:
-    if raw is None:
-        return LedHardwareSettings()
-    if not isinstance(raw, dict):
-        raise ConfigError("Invalid [hardware.led] section in config.")
-
-    base_url = str(raw.get("base_url", "http://led.local")).strip().rstrip("/")
-    if not base_url:
-        raise ConfigError("hardware.led.base_url must be a non-empty string.")
-
-    return LedHardwareSettings(
-        enabled=bool(raw.get("enabled", False)),
-        base_url=base_url,
-        timeout_seconds=int(raw.get("timeout_seconds", 5)),
-    )
-
-
-def _parse_cup_hardware_settings(raw: Any) -> CupHardwareSettings:
+def _parse_cup_hardware_settings(
+    raw: Any,
+    *,
+    variables: dict[str, str],
+) -> CupHardwareSettings:
     if raw is None:
         return CupHardwareSettings()
     if not isinstance(raw, dict):
         raise ConfigError("Invalid [hardware.cup] section in config.")
 
-    base_url = str(raw.get("base_url", "http://localhost:3001")).strip().rstrip("/")
+    base_url = _resolve_config_variables(
+        str(raw.get("base_url", CUP_DEFAULT_BASE_URL)),
+        field_name="hardware.cup.base_url",
+        variables=variables,
+    ).strip().rstrip("/")
     if not base_url:
         raise ConfigError("hardware.cup.base_url must be a non-empty string.")
 
@@ -362,6 +418,7 @@ def load_config(path: str | Path) -> AppConfig:
     with config_path.open("rb") as fh:
         raw = tomllib.load(fh)
 
+    variables = _parse_config_variables(raw.get("variables"))
     app_raw = raw.get("app", {})
     persona_raw = raw.get("persona", {})
     live_context_raw = raw.get("live_context", {})
@@ -434,11 +491,9 @@ def load_config(path: str | Path) -> AppConfig:
         ),
     )
     hardware = HardwareSettings(
-        led=_parse_led_hardware_settings(
-            hardware_raw.get("led") if isinstance(hardware_raw, dict) else None
-        ),
         cup=_parse_cup_hardware_settings(
-            hardware_raw.get("cup") if isinstance(hardware_raw, dict) else None
+            hardware_raw.get("cup") if isinstance(hardware_raw, dict) else None,
+            variables=variables,
         ),
     )
 
@@ -459,6 +514,11 @@ def load_config(path: str | Path) -> AppConfig:
                 str(key): str(value)
                 for key, value in item.get("extra_headers", {}).items()
             },
+            profile_override=(
+                str(item["profile"]).strip()
+                if isinstance(item.get("profile"), str) and item["profile"].strip()
+                else None
+            ),
         )
 
     models: dict[str, ModelConfig] = {}
@@ -475,6 +535,11 @@ def load_config(path: str | Path) -> AppConfig:
             think=_optional_think(item.get("think")),
             system_prompt=str(item["system_prompt"]) if item.get("system_prompt") else None,
             tags=_to_tuple(item.get("tags")),
+            profile_override=(
+                str(item["profile"]).strip()
+                if isinstance(item.get("profile"), str) and item["profile"].strip()
+                else None
+            ),
         )
 
     if not models:

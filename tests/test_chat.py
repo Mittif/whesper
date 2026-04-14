@@ -14,7 +14,6 @@ from whesper.tools import (
     ToolRegistry,
     ToolSpec,
     _matches_cup_control_intent,
-    _matches_led_control_intent,
 )
 from whesper.agent_types import ToolExecutionMeta
 
@@ -267,8 +266,6 @@ class KimiBuiltinWebSearchClient:
             )
             if builtin_tool["function"]["name"] != "$web_search":
                 raise AssertionError("missing kimi builtin web search tool declaration")
-            if disable_thinking is not True:
-                raise AssertionError("kimi builtin web search should disable thinking")
             return CompletionResult(
                 content="",
                 raw_response={},
@@ -654,28 +651,6 @@ def make_ollama_native_config():
     return load_config(temp_path)
 
 
-def make_led_registry() -> ToolRegistry:
-    return ToolRegistry(
-        specs=(
-            ToolSpec(
-                name="control_led",
-                description="Control the LED",
-                parameters_schema={
-                    "type": "object",
-                    "properties": {"action": {"type": "string"}},
-                    "required": ["action"],
-                    "additionalProperties": False,
-                },
-                handler=lambda arguments: {"ok": True},
-                should_offer=lambda user_text, route_mode: _matches_led_control_intent(
-                    user_text
-                ),
-                execution_meta=ToolExecutionMeta(side_effectful=True),
-            ),
-        )
-    )
-
-
 def make_cup_registry() -> ToolRegistry:
     return ToolRegistry(
         specs=(
@@ -1055,7 +1030,7 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(client.stream_calls, 0)
         self.assertEqual(session.messages[-1].content, "直接答复")
 
-    def test_send_requires_tool_choice_for_explicit_led_request(self) -> None:
+    def test_send_requires_tool_choice_for_explicit_cup_request(self) -> None:
         config = make_config()
         session = ConversationSession(
             session_id="demo",
@@ -1063,16 +1038,16 @@ class ChatTests(unittest.TestCase):
             updated_at="2026-01-01T00:00:00+00:00",
         )
         client = ToolChoiceCapturingClient()
-        service = ChatService(config, client=client, tool_registry=make_led_registry())
+        service = ChatService(config, client=client, tool_registry=make_cup_registry())
 
-        service.send(session, "帮我调整成浪漫一点的氛围灯")
+        service.send(session, "帮我把飞机杯调刺激一点")
 
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(client.calls[0]["tool_choice"], "required")
 
     def test_tools_for_request_omits_side_effectful_tools_for_unrelated_input(self) -> None:
         config = make_config()
-        service = ChatService(config, client=ToolChoiceCapturingClient(), tool_registry=make_led_registry())
+        service = ChatService(config, client=ToolChoiceCapturingClient(), tool_registry=make_cup_registry())
         model_config = config.get_model("chat")
         provider_config = config.get_provider(model_config.provider)
 
@@ -1090,8 +1065,8 @@ class ChatTests(unittest.TestCase):
         registry = ToolRegistry(
             specs=(
                 ToolSpec(
-                    name="control_led",
-                    description="Control the LED",
+                    name="control_cup",
+                    description="Control the CUP hardware",
                     parameters_schema={
                         "type": "object",
                         "properties": {"action": {"type": "string"}},
@@ -1099,7 +1074,7 @@ class ChatTests(unittest.TestCase):
                         "additionalProperties": False,
                     },
                     handler=lambda arguments: {"ok": True},
-                    should_offer=lambda user_text, route_mode: _matches_led_control_intent(
+                    should_offer=lambda user_text, route_mode: _matches_cup_control_intent(
                         user_text
                     ),
                     execution_meta=ToolExecutionMeta(side_effectful=True),
@@ -1125,7 +1100,7 @@ class ChatTests(unittest.TestCase):
         tools = service._tools_for_request(
             provider=provider_config,
             model=model_config,
-            user_text="帮我调整成浪漫一点的氛围灯",
+            user_text="帮我把飞机杯转快一点",
             route_mode="chat",
         )
 
@@ -1133,10 +1108,10 @@ class ChatTests(unittest.TestCase):
         assert tools is not None
         self.assertEqual(
             [tool["function"]["name"] for tool in tools],
-            ["control_led"],
+            ["control_cup"],
         )
 
-    def test_send_requires_tool_choice_for_led_scene_followup_with_recent_context(self) -> None:
+    def test_send_requires_tool_choice_for_cup_scene_followup_with_recent_context(self) -> None:
         config = make_config()
         session = ConversationSession(
             session_id="demo",
@@ -1145,21 +1120,21 @@ class ChatTests(unittest.TestCase):
             messages=[
                 ChatMessage(
                     role="user",
-                    content="我想看点色色的，调整一下氛围灯",
+                    content="我想爽一点，帮我调一下飞机杯",
                     created_at="2026-01-01T00:00:00+00:00",
                 ),
                 ChatMessage(
                     role="assistant",
-                    content="我可以帮你把灯调成浪漫、放松或者派对模式。",
+                    content="我可以帮你把速度调柔和、稳定或者刺激一点。",
                     created_at="2026-01-01T00:00:01+00:00",
                     model_alias="chat",
                 ),
             ],
         )
         client = ToolChoiceCapturingClient()
-        service = ChatService(config, client=client, tool_registry=make_led_registry())
+        service = ChatService(config, client=client, tool_registry=make_cup_registry())
 
-        service.send(session, "浪漫模式")
+        service.send(session, "再刺激一点")
 
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(client.calls[0]["tool_choice"], "required")
@@ -1389,7 +1364,7 @@ class ChatTests(unittest.TestCase):
             "先搜索最新 release notes，再整理成简短答案。",
         )
 
-    def test_send_enables_kimi_builtin_web_search_and_disables_thinking(self) -> None:
+    def test_send_enables_kimi_builtin_web_search(self) -> None:
         config = make_kimi_thinking_config()
         session = ConversationSession(
             session_id="demo",
@@ -1422,7 +1397,7 @@ class ChatTests(unittest.TestCase):
 
         self.assertEqual(result.assistant_message.content, "这是联网搜索结果摘要。")
         self.assertEqual(len(client.calls), 2)
-        self.assertTrue(client.calls[0]["disable_thinking"])
+        self.assertFalse(client.calls[0].get("disable_thinking", False))
         builtin_tools = [
             tool for tool in client.calls[0]["tools"] or ()
             if tool.get("type") == "builtin_function"

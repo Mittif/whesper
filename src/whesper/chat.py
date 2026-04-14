@@ -15,17 +15,16 @@ from whesper.config import AppConfig
 from whesper.live_data import LiveContextService
 from whesper.message_builder import SessionMessageBuilder
 from whesper.memory import MemoryService
+from whesper.provider_profile import ProviderProfile, resolve_profile
 from whesper.router import RouteDecision, select_model
 from whesper.session import ChatMessage, ConversationSession, utc_now_iso
 from whesper.tool_executor import ToolExecutor
-from whesper.tool_protocol import DefaultToolProtocolAdapter, ToolMessageFormat
+from whesper.tool_protocol import DefaultToolProtocolAdapter
 from whesper.trace import TraceStore, make_trace_event
 from whesper.tools import (
     ToolRegistry,
     _matches_cup_control_intent,
     _matches_cup_scene_followup,
-    _matches_led_control_intent,
-    _matches_led_scene_followup,
 )
 
 
@@ -62,7 +61,6 @@ class ChatService:
         self.tool_protocol_adapter = DefaultToolProtocolAdapter()
         self.message_builder = SessionMessageBuilder(
             config,
-            tool_protocol_adapter=self.tool_protocol_adapter,
             memory_service=self.memory_service,
             live_context_service=self.live_context_service,
             tool_registry=self.tool_registry,
@@ -166,7 +164,7 @@ class ChatService:
 
         model_config = self.config.get_model(decision.model_alias)
         provider_config = self.config.get_provider(model_config.provider)
-        tool_message_format = self._tool_message_format(model_config, provider_config)
+        target_profile = resolve_profile(provider_config, model_config)
         tools = self._tools_for_request(
             session=session,
             provider=provider_config,
@@ -175,13 +173,15 @@ class ChatService:
             route_mode=decision.mode,
         )
 
+        needs_reasoning = self._requires_reasoning_content_replay(target_profile, model_config)
         messages = self._build_messages(
             session,
             model_config.system_prompt,
-            tool_message_format=tool_message_format,
+            target_profile=target_profile,
             user_text=user_text,
             route_mode=decision.mode,
             include_live_context=tools is None,
+            ensure_reasoning_content=needs_reasoning,
         )
         if tools is not None:
             run_result = self.harness.run_until_final(
@@ -193,8 +193,9 @@ class ChatService:
                 user_text=user_text,
                 route_mode=decision.mode,
                 tools=tools,
-                tool_message_format=tool_message_format,
+                target_profile=target_profile,
                 on_step=on_step,
+                ensure_reasoning_content=needs_reasoning,
             )
             completion = run_result.completion
             ask_user = run_result.ask_user
@@ -213,6 +214,7 @@ class ChatService:
             decision,
             ask_user.prompt if ask_user is not None else completion.content,
             ask_user=ask_user,
+            target_profile=target_profile,
         )
 
     def _complete_turn_stream(
@@ -234,7 +236,7 @@ class ChatService:
 
         model_config = self.config.get_model(decision.model_alias)
         provider_config = self.config.get_provider(model_config.provider)
-        tool_message_format = self._tool_message_format(model_config, provider_config)
+        target_profile = resolve_profile(provider_config, model_config)
         tools = self._tools_for_request(
             session=session,
             provider=provider_config,
@@ -242,13 +244,15 @@ class ChatService:
             user_text=user_text,
             route_mode=decision.mode,
         )
+        needs_reasoning = self._requires_reasoning_content_replay(target_profile, model_config)
         messages = self._build_messages(
             session,
             model_config.system_prompt,
-            tool_message_format=tool_message_format,
+            target_profile=target_profile,
             user_text=user_text,
             route_mode=decision.mode,
             include_live_context=tools is None,
+            ensure_reasoning_content=needs_reasoning,
         )
         if tools is None:
             return self._stream_final_answer(
@@ -258,6 +262,7 @@ class ChatService:
                 model=model_config,
                 messages=messages,
                 on_chunk=on_chunk,
+                target_profile=target_profile,
             )
         run_result = self.harness.run_until_final(
             session,
@@ -268,8 +273,9 @@ class ChatService:
             user_text=user_text,
             route_mode=decision.mode,
             tools=tools,
-            tool_message_format=tool_message_format,
+            target_profile=target_profile,
             on_step=on_step,
+            ensure_reasoning_content=needs_reasoning,
         )
         if run_result.final_messages is not None:
             return self._stream_final_answer(
@@ -279,6 +285,7 @@ class ChatService:
                 model=model_config,
                 messages=run_result.final_messages,
                 on_chunk=on_chunk,
+                target_profile=target_profile,
             )
         completion = run_result.completion
         ask_user = run_result.ask_user
@@ -290,10 +297,16 @@ class ChatService:
                 decision,
                 ask_user.prompt,
                 ask_user=ask_user,
+                target_profile=target_profile,
             )
         if on_chunk is not None and completion.content:
             on_chunk(completion.content)
-        return self._append_assistant_message(session, decision, completion.content)
+        return self._append_assistant_message(
+            session,
+            decision,
+            completion.content,
+            target_profile=target_profile,
+        )
 
     def _last_user_index(self, session: ConversationSession) -> int | None:
         return self._last_user_index_in_messages(session.messages)
@@ -346,21 +359,23 @@ class ChatService:
         session: ConversationSession,
         model_system_prompt: str | None,
         *,
-        tool_message_format: ToolMessageFormat,
+        target_profile: ProviderProfile,
         user_text: str,
         route_mode: str,
         include_planning_prompt: bool = True,
         include_live_context: bool = True,
+        ensure_reasoning_content: bool = False,
     ) -> list[dict[str, object]]:
         planning_prompt = AGENTIC_PLANNING_PROMPT if include_planning_prompt else None
         return self.message_builder.build_messages(
             session,
             model_system_prompt,
-            tool_message_format=tool_message_format,
+            target_profile=target_profile,
             user_text=user_text,
             route_mode=route_mode,
             planning_prompt=planning_prompt,
             include_live_context=include_live_context,
+            ensure_reasoning_content=ensure_reasoning_content,
         )
 
     def _tool_call_payload(self, tool_call: ToolCall) -> dict[str, object]:
@@ -583,7 +598,8 @@ class ChatService:
         )
         if not tools and session is not None:
             tools = self._hardware_followup_tools_for_request(session, user_text)
-        if self._supports_kimi_builtin_web_search(provider, model):
+        profile = resolve_profile(provider, model)
+        if "$web_search" in profile.builtin_tools:
             tools = [
                 tool
                 for tool in tools
@@ -604,8 +620,6 @@ class ChatService:
         user_text: str,
     ) -> list[dict[str, object]]:
         tool_names: list[str] = []
-        if self._should_require_led_followup_tool_choice(session, user_text):
-            tool_names.append("control_led")
         if self._should_require_cup_followup_tool_choice(session, user_text):
             tool_names.append("control_cup")
         if not tool_names:
@@ -644,34 +658,7 @@ class ChatService:
         session: ConversationSession,
         user_text: str,
     ) -> bool:
-        return self._should_require_led_followup_tool_choice(
-            session, user_text
-        ) or self._should_require_cup_followup_tool_choice(session, user_text)
-
-    def _should_require_led_followup_tool_choice(
-        self,
-        session: ConversationSession,
-        user_text: str,
-    ) -> bool:
-        if _matches_led_control_intent(user_text):
-            return True
-        if not _matches_led_scene_followup(user_text):
-            return False
-        recent_messages = session.messages[-6:]
-        context_keywords = ("led", "灯", "灯光", "氛围灯", "彩灯", "浪漫模式", "闪烁")
-        for message in reversed(recent_messages):
-            if message.role == "tool" and message.name == "control_led":
-                return True
-            if message.role not in {"user", "assistant"}:
-                continue
-            normalized = (message.content or "").casefold()
-            if not normalized:
-                continue
-            if _matches_led_control_intent(message.content):
-                return True
-            if any(keyword in normalized for keyword in context_keywords):
-                return True
-        return False
+        return self._should_require_cup_followup_tool_choice(session, user_text)
 
     def _should_require_cup_followup_tool_choice(
         self,
@@ -698,17 +685,6 @@ class ChatService:
                 return True
         return False
 
-    def _supports_kimi_builtin_web_search(self, provider, model) -> bool:
-        if getattr(provider, "kind", "") != "openai_compatible":
-            return False
-        candidates = (
-            getattr(provider, "name", ""),
-            getattr(model, "name", ""),
-            getattr(model, "model", ""),
-        )
-        lowered = " ".join(str(item).casefold() for item in candidates if item)
-        return "kimi" in lowered and "k2.5" in lowered
-
     @staticmethod
     def _kimi_web_search_tool() -> dict[str, object]:
         return {
@@ -724,17 +700,10 @@ class ChatService:
         model,
         tools: list[dict[str, object]] | None,
     ) -> bool:
-        if not self._supports_kimi_builtin_web_search(provider, model):
-            return False
-        if not tools:
-            return False
-        return any(
-            isinstance(tool, dict)
-            and tool.get("type") == "builtin_function"
-            and isinstance(tool.get("function"), dict)
-            and tool["function"].get("name") == "$web_search"
-            for tool in tools
-        )
+        # Kimi k2.5 with $web_search should keep thinking enabled.
+        # Disabling thinking mid-conversation causes reasoning_content
+        # mismatches that trigger HTTP 400 from the Kimi API.
+        return False
 
     def _append_trace(
         self,
@@ -796,9 +765,6 @@ class ChatService:
         if isinstance(tool_choice, str):
             return tool_choice
         return str(tool_choice)
-
-    def _tool_message_format(self, model, provider) -> ToolMessageFormat:
-        return self.tool_protocol_adapter.tool_message_format(model, provider)
 
     def _should_continue_tool_loop(
         self,
@@ -870,17 +836,21 @@ class ChatService:
             return completion.reasoning_content
         model_config = self.config.get_model(decision.model_alias)
         provider_config = self.config.get_provider(model_config.provider)
-        if not self._requires_reasoning_content_replay(provider_config, model_config):
+        profile = resolve_profile(provider_config, model_config)
+        if not self._requires_reasoning_content_replay(profile, model_config):
             return None
-        return ""
+        return profile.reasoning_content_empty_placeholder
 
-    def _requires_reasoning_content_replay(self, provider, model) -> bool:
-        think = getattr(model, "think", None)
-        if think in (None, False):
+    def _requires_reasoning_content_replay(
+        self,
+        profile: ProviderProfile,
+        model,
+    ) -> bool:
+        if not profile.reasoning_content_required_when_thinking:
             return False
-        provider_name = str(getattr(provider, "name", "")).casefold()
-        model_name = str(getattr(model, "model", "")).casefold()
-        return "kimi" in provider_name or "moonshot" in provider_name or "kimi" in model_name
+        if model.think is False:
+            return False
+        return True
 
     def _stream_final_answer(
         self,
@@ -891,6 +861,7 @@ class ChatService:
         model,
         messages: list[dict[str, object]],
         on_chunk: Callable[[str], None] | None,
+        target_profile: ProviderProfile | None = None,
     ) -> ChatTurnResult:
         messages = self.tool_protocol_adapter.messages_with_normalized_tool_call_ids(messages)
         content_parts: list[str] = []
@@ -920,6 +891,7 @@ class ChatService:
                     session,
                     decision,
                     partial_content,
+                    target_profile=target_profile,
                 )
             raise GenerationInterrupted(partial_result=partial_result) from exc
         except ProviderError:
@@ -950,6 +922,7 @@ class ChatService:
             session,
             decision,
             final_content,
+            target_profile=target_profile,
         )
 
     def _append_assistant_message(
@@ -959,13 +932,16 @@ class ChatService:
         content: str,
         *,
         ask_user: AskUserAction | None = None,
+        target_profile: ProviderProfile | None = None,
     ) -> ChatTurnResult:
+        source_profile_id = target_profile.profile_id if target_profile is not None else None
         assistant_message = ChatMessage(
             role="assistant",
             content=content,
             created_at=utc_now_iso(),
             model_alias=decision.model_alias,
             route_reason=decision.reason,
+            source_profile=source_profile_id,
         )
         session.append(assistant_message)
         session.append_transcript(
@@ -975,6 +951,7 @@ class ChatService:
                 created_at=assistant_message.created_at,
                 model_alias=decision.model_alias,
                 route_reason=decision.reason,
+                source_profile=source_profile_id,
             )
         )
         session.pending_ask_user = ask_user

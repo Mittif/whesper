@@ -18,6 +18,11 @@ search_model = "kimi-k2.5"
 long_message_chars = 600
 reasoning_keywords = ["分析", "总结", "比较", "计划", "设计", "为什么", "how", "why"]
 
+# Optional config-local variables for values you want to change in one place.
+#
+# [variables]
+# cup_api_base_url = "http://localhost:3001"
+
 # Optional live-context endpoints. Keep them empty if you want the companion
 # to stay intentionally narrow by default.
 #
@@ -42,21 +47,22 @@ reasoning_keywords = ["分析", "总结", "比较", "计划", "设计", "为什�
 # api_key_env = "WHESPER_DEVICE_STATUS_API_KEY"
 #
 # [live_context.search_api]
-# provider = "serpapi"
+# provider = "duckduckgo"   # default, free, no key required
+# timeout_seconds = 10
+#
+# Other providers:
+# provider = "brave"        # requires API key
+# api_key_env = "WHESPER_BRAVE_API_KEY"
+#
+# provider = "serpapi"       # requires API key
 # api_key_env = "WHESPER_SERPAPI_API_KEY"
 # engine = "google"
-# timeout_seconds = 10
 
 # Optional hardware device controls.
 #
-# [hardware.led]
-# enabled = true
-# base_url = "http://led.local"
-# timeout_seconds = 5
-#
 # [hardware.cup]
 # enabled = true
-# base_url = "http://localhost:3001"
+# base_url = "${cup_api_base_url}"
 # api_token_env = "WHESPER_CUP_API_TOKEN"
 # timeout_seconds = 5
 
@@ -72,6 +78,12 @@ base_url = "https://api.moonshot.cn/v1"
 api_key_env = "WHESPER_KIMI_API_KEY"
 timeout_seconds = 180
 
+[providers.siliconflow]
+kind = "openai_compatible"
+base_url = "https://api.siliconflow.cn/v1"
+api_key_env = "WHESPER_SILICONFLOW_API_KEY"
+timeout_seconds = 180
+
 [models.local_chat]
 provider = "ollama_local"
 model = "your-model"
@@ -84,3 +96,11 @@ provider = "kimi"
 model = "kimi-k2.5"
 temperature = 1
 max_tokens = 1600
+think = true
+
+[models."siliconflow-qwen3-8b"]
+provider = "siliconflow"
+model = "Qwen/Qwen3-8B"
+temperature = 0.7
+max_tokens = 1600
+think = true

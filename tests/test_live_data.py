@@ -794,6 +794,7 @@ class LiveDataTests(unittest.TestCase):
             )
         )
         service = SearchContextService(
+            provider="serpapi",
             api_key="serp-key",
             fetch_json=lambda url, timeout: {
                 "answer_box": {
@@ -820,10 +821,21 @@ class LiveDataTests(unittest.TestCase):
         context = service.build_prompt_context("openai release notes", route_mode="search")
 
         assert context is not None
-        self.assertIn("answer_box: OpenAI 发布了新的 release notes。", context)
-        self.assertIn("answer_box_link: https://openai.com/", context)
+        self.assertIn("provider: serpapi", context)
+        self.assertIn("summary: OpenAI 发布了新的 release notes。", context)
+        self.assertIn("summary_url: https://openai.com/", context)
         self.assertIn("result_1_title: OpenAI API release notes", context)
         self.assertIn("result_2_link: https://openai.com/changelog", context)
+
+    def test_search_context_brave_requires_api_key(self) -> None:
+        service = SearchContextService(provider="brave")
+        snapshot = service.search_query("openai release notes")
+        self.assertEqual(snapshot.status, "error")
+        self.assertEqual(snapshot.error_code, "missing_api_key")
+
+    def test_search_context_duckduckgo_is_default(self) -> None:
+        service = SearchContextService()
+        self.assertEqual(service.provider, "duckduckgo")
 
     def test_tech_docs_context_extracts_headings(self) -> None:
         service = TechDocsContextService(

@@ -2,7 +2,7 @@
 
 Whesper is a Python-first CLI companion focused on natural conversation, configurable personas, memory, and multi-model routing.
 
-The project is local-first: you can run it with Ollama on your machine, with Kimi, or with a local chat model plus Kimi as a search fallback.
+The project is local-first: you can run it with Ollama on your machine, with Kimi or SiliconFlow, or with a local chat model plus a remote fallback.
 
 ## What It Can Do
 
@@ -12,7 +12,7 @@ The project is local-first: you can run it with Ollama on your machine, with Kim
 - Local memory capture and recall with `/memory`, `/remember`, and `/forget`
 - Search / live-data assisted turns for things like weather, news, docs, and URLs
 - Config-driven providers through `TOML`
-- Local Ollama support and optional Moonshot/Kimi support
+- Local Ollama support and optional Moonshot/Kimi or SiliconFlow support
 
 ## Quick Start
 
@@ -28,6 +28,7 @@ The script will choose a runnable setup automatically:
 
 - If you already have a local Ollama model, it writes a local-first config
 - If no local model is found but `WHESPER_KIMI_API_KEY` is set, it writes a Kimi-only config
+- If no local model is found but `WHESPER_SILICONFLOW_API_KEY` is set, it writes a SiliconFlow-only config
 - If neither is available, it stops with clear next steps instead of generating a broken config
 
 Useful environment variables:
@@ -35,6 +36,7 @@ Useful environment variables:
 ```bash
 WHESPER_LOCAL_MODEL="qwen3.5:14b" ./scripts/bootstrap.sh
 WHESPER_KIMI_API_KEY="your-api-key" ./scripts/bootstrap.sh
+WHESPER_SILICONFLOW_API_KEY="your-api-key" ./scripts/bootstrap.sh
 ```
 
 After bootstrap:
@@ -63,7 +65,7 @@ cp whesper.example.toml whesper.toml
 3. Update `whesper.toml`:
 
 - Set `[models.local_chat].model` to a real Ollama model name if you want local chat
-- Export `WHESPER_KIMI_API_KEY` if you want to use Kimi
+- Export `WHESPER_KIMI_API_KEY` or `WHESPER_SILICONFLOW_API_KEY` if you want a remote model
 - If you are running fully local, set `search_model = "local_chat"` under `[scheduler]`
 
 4. Start the CLI:
@@ -77,6 +79,7 @@ cp whesper.example.toml whesper.toml
 - `/models`
 - `/model local_chat`
 - `/model kimi-k2.5`
+- `/model siliconflow-qwen3-8b`
 - `/model auto`
 - `/mode auto`
 - `/mode reasoning`
@@ -112,11 +115,15 @@ Default model aliases in the example config:
 
 - `local_chat`: local Ollama chat model
 - `kimi-k2.5`: Moonshot/Kimi via `WHESPER_KIMI_API_KEY`
+- `siliconflow-qwen3-8b`: SiliconFlow via `WHESPER_SILICONFLOW_API_KEY`
 
 Optional live-data endpoint sections are also supported in config:
 
 - `live_context.status_api.*`
 - `live_context.custom_api.*`
+- `live_context.search_api`
+
+`live_context.search_api` defaults to Brave web search with no API key required. `serpapi` is still supported if you want it.
 
 Leave them empty if you want a narrow default setup.
 
@@ -124,7 +131,8 @@ Leave them empty if you want a narrow default setup.
 
 - Python `3.12+` is required
 - Ollama is optional, but recommended for local-first usage
-- Kimi is optional, but useful as a remote fallback
+- Kimi and SiliconFlow are optional remote fallbacks
+- SiliconFlow uses the OpenAI-compatible API; Whesper maps `think` to SiliconFlow's `enable_thinking` field automatically
 - Session and memory data are stored under `.whesper/`
 - `whesper.toml` is local-only and should not be committed
 

@@ -8,7 +8,8 @@ from whesper.agent_types import AgentCompletion, ToolInvocation
 from whesper.router import RouteDecision
 from whesper.session import ChatMessage, ConversationSession
 from whesper.tool_executor import ToolExecutor
-from whesper.tool_protocol import DefaultToolProtocolAdapter, ToolMessageFormat
+from whesper.provider_profile import OPENAI_DEFAULT_PROFILE, ProviderProfile
+from whesper.tool_protocol import DefaultToolProtocolAdapter
 from whesper.tools import ToolRegistry, ToolSpec
 
 
@@ -18,11 +19,12 @@ class StubMessageBuilder:
         session: ConversationSession,
         model_system_prompt: str | None,
         *,
-        tool_message_format: ToolMessageFormat,
+        target_profile: ProviderProfile,
         user_text: str,
         route_mode: str,
         planning_prompt: str | None = None,
         include_live_context: bool = True,
+        ensure_reasoning_content: bool = False,
     ) -> list[dict[str, object]]:
         messages: list[dict[str, object]] = [
             {"role": "system", "content": model_system_prompt or "system"}
@@ -176,7 +178,7 @@ class AgentHarnessTests(unittest.TestCase):
             model_system_prompt="system",
             user_text="帮我查一下最新 release notes",
             route_mode="search",
-            tool_message_format=ToolMessageFormat(),
+            target_profile=OPENAI_DEFAULT_PROFILE,
             tools=tool_registry.openai_tools(),
         )
 
@@ -233,7 +235,7 @@ class AgentHarnessTests(unittest.TestCase):
             model_system_prompt="system",
             user_text="帮我查天气",
             route_mode="chat",
-            tool_message_format=ToolMessageFormat(),
+            target_profile=OPENAI_DEFAULT_PROFILE,
             tools=tool_registry.openai_tools(),
         )
 

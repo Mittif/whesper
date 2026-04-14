@@ -5,11 +5,10 @@ from datetime import datetime
 import json
 import re
 from typing import Callable
-from urllib import parse as urlparse
 from urllib import request as urlrequest
 from zoneinfo import ZoneInfo
 
-from whesper.config import AppConfig
+from whesper.config import AppConfig, CUP_DEFAULT_BASE_URL
 from whesper.agent_types import ToolExecutionMeta, ToolInvocation
 from whesper.shell_sandbox import ShellSandboxError, ShellSandboxExecutor
 from whesper.live_data import (
@@ -91,14 +90,21 @@ class ToolExecutionResult:
 
 
 class ToolRegistry:
-    def __init__(self, specs: tuple[ToolSpec, ...]) -> None:
+    def __init__(
+        self,
+        specs: tuple[ToolSpec, ...],
+        *,
+        search_service: SearchContextService | None = None,
+    ) -> None:
         self.specs = specs
         self._by_name = {spec.name: spec for spec in specs}
+        self.search_service = search_service
 
     @classmethod
     def default(cls, config: AppConfig | None = None) -> "ToolRegistry":
         search_settings = config.live_context.search_api if config is not None else None
         search_service = SearchContextService(
+            provider=search_settings.provider if search_settings is not None else "duckduckgo",
             api_key=search_settings.resolved_api_key() if search_settings is not None else None,
             engine=search_settings.engine if search_settings is not None else "google",
             timeout_seconds=(
@@ -118,7 +124,8 @@ class ToolRegistry:
                 name="web_search",
                 description=(
                     "Search the web for recent or factual information when you are unsure "
-                    "or need up-to-date context."
+                    "or need up-to-date context. Returns a lightweight search snapshot plus "
+                    "structured source URLs."
                 ),
                 parameters_schema={
                     "type": "object",
@@ -136,7 +143,8 @@ class ToolRegistry:
                     "Use when the user explicitly asks to search, wants recent information, "
                     "or needs broad web research beyond a single page or headline snapshot. "
                     "If the request is specifically for concise current-news headlines on a topic, "
-                    "get_news is usually a better fit unless the user explicitly asked to search."
+                    "get_news is usually a better fit unless the user explicitly asked to search. "
+                    "Use the returned source titles or domains when you cite what you relied on."
                 ),
                 examples=(
                     ('用户说: "/search openai release notes"', '{"query":"openai release notes"}'),
@@ -485,83 +493,6 @@ class ToolRegistry:
             ),
         ]
 
-        if config is not None and config.hardware.led.enabled:
-            led_settings = config.hardware.led
-            specs.append(
-                ToolSpec(
-                    name="control_led",
-                    description=(
-                        "Control the configured test RGB LED device over HTTP. Use it to "
-                        "set a color, toggle blinking, or read the current LED status."
-                    ),
-                    parameters_schema={
-                        "type": "object",
-                        "properties": {
-                            "action": {
-                                "type": "string",
-                                "description": (
-                                    "One of: set_color, set_blink, or status. For combined "
-                                    "requests like setting a color and blinking, call the tool "
-                                    "multiple times."
-                                ),
-                            },
-                            "color": {
-                                "type": "string",
-                                "description": (
-                                    "Optional color name or hex value for set_color, such as "
-                                    "red, 蓝色, 暖白, or #ff8800."
-                                ),
-                            },
-                            "r": {
-                                "type": "integer",
-                                "description": "Red channel 0-255 for set_color.",
-                            },
-                            "g": {
-                                "type": "integer",
-                                "description": "Green channel 0-255 for set_color.",
-                            },
-                            "b": {
-                                "type": "integer",
-                                "description": "Blue channel 0-255 for set_color.",
-                            },
-                            "blink": {
-                                "type": "boolean",
-                                "description": (
-                                    "True to enable blinking or false to disable it when "
-                                    "action is set_blink."
-                                ),
-                            },
-                        },
-                        "required": ["action"],
-                        "additionalProperties": False,
-                    },
-                    handler=lambda arguments: _handle_control_led(
-                        arguments,
-                        base_url=led_settings.base_url,
-                        timeout_seconds=led_settings.timeout_seconds,
-                    ),
-                    usage_guidance=(
-                        "Use only when the user clearly asks to inspect or change the test LED. "
-                        "This tool performs a real device action. Prefer color names or hex for "
-                        "simple requests, and use multiple calls for compound actions."
-                    ),
-                    examples=(
-                        ('用户说: "把测试灯调成红色"', '{"action":"set_color","color":"红色"}'),
-                        ('用户说: "让 LED 开始闪烁"', '{"action":"set_blink","blink":true}'),
-                        ('用户说: "看看灯现在是什么颜色"', '{"action":"status"}'),
-                    ),
-                    should_offer=lambda user_text, route_mode: _matches_led_control_intent(
-                        user_text
-                    ),
-                    execution_meta=ToolExecutionMeta(
-                        parallel_safe=False,
-                        side_effectful=True,
-                        retryable=False,
-                        timeout_seconds=float(led_settings.timeout_seconds),
-                    ),
-                )
-            )
-
         if config is not None and config.hardware.cup.enabled:
             cup_settings = config.hardware.cup
             specs.append(
@@ -802,7 +733,7 @@ class ToolRegistry:
                 )
             )
 
-        return cls(specs=tuple(specs))
+        return cls(specs=tuple(specs), search_service=search_service)
 
     def openai_tools(self) -> list[dict[str, object]]:
         return [
@@ -942,11 +873,7 @@ def _handle_web_search(
     arguments: dict[str, object],
 ) -> dict[str, object]:
     query = _require_string_argument(arguments, "query", tool_name="web_search")
-    context = search_service.build_prompt_context(query, route_mode="search")
-    return {
-        "query": query,
-        "result": context or "No concise search result was available.",
-    }
+    return search_service.search_query(query).to_tool_payload()
 
 
 def _handle_get_public_ip(arguments: dict[str, object]) -> dict[str, object]:
@@ -1037,47 +964,6 @@ def _handle_get_local_weather(arguments: dict[str, object]) -> dict[str, object]
     return _weather_payload_from_report(report, request_query=query)
 
 
-def _handle_control_led(
-    arguments: dict[str, object],
-    *,
-    base_url: str,
-    timeout_seconds: int,
-) -> dict[str, object]:
-    action, implied_blink = _resolve_led_action(
-        _require_string_argument(arguments, "action", tool_name="control_led")
-    )
-    if action == "status":
-        response = _tool_fetch_json(_led_api_url(base_url, "/status"), timeout_seconds)
-        return _led_payload_from_response(base_url, action=action, response=response)
-
-    if action == "set_color":
-        red, green, blue = _resolve_led_rgb(arguments)
-        response = _tool_fetch_json(
-            _led_api_url(
-                base_url,
-                "/led",
-                {"r": red, "g": green, "b": blue},
-            ),
-            timeout_seconds,
-        )
-        payload = _led_payload_from_response(base_url, action=action, response=response)
-        payload["requested_color_hex"] = _rgb_to_hex(red, green, blue)
-        return payload
-
-    blink = (
-        implied_blink
-        if implied_blink is not None
-        else _require_boolish_argument(arguments, "blink", tool_name="control_led")
-    )
-    response = _tool_fetch_json(
-        _led_api_url(base_url, "/blink", {"v": 1 if blink else 0}),
-        timeout_seconds,
-    )
-    payload = _led_payload_from_response(base_url, action="set_blink", response=response)
-    payload["blink"] = _coerce_boolish(response.get("blink"), fallback=blink)
-    return payload
-
-
 def _handle_control_cup(
     arguments: dict[str, object],
     *,
@@ -1118,8 +1004,8 @@ def _handle_control_cup(
         _require_string_argument(arguments, "action", tool_name="control_cup")
     )
     if action == "status":
-        system_response = cup_request("/api/status")
-        motor_response = cup_request("/api/motor")
+        system_response = cup_request(_CUP_STATUS_ENDPOINT)
+        motor_response = cup_request(_CUP_MOTOR_ENDPOINT)
         return {
             "ok": True,
             "device": base_url,
@@ -1141,7 +1027,7 @@ def _handle_control_cup(
             raise ToolExecutionError(
                 "control_cup set_motor requires 'target_velocity', 'enabled', or both."
             )
-        response = cup_request("/api/motor", method="POST", payload=body)
+        response = cup_request(_CUP_MOTOR_ENDPOINT, method="POST", payload=body)
         payload = _device_action_payload(
             base_url,
             action="set_motor",
@@ -1152,7 +1038,7 @@ def _handle_control_cup(
         return payload
 
     if action == "stop":
-        response = cup_request("/api/motor/stop", method="POST", payload={})
+        response = cup_request(_CUP_STOP_ENDPOINT, method="POST", payload={})
         payload = _device_action_payload(
             base_url,
             action="stop",
@@ -1165,7 +1051,7 @@ def _handle_control_cup(
 
     if action == "set_led":
         body = _cup_led_body_from_arguments(arguments)
-        response = cup_request("/api/led", method="POST", payload=body)
+        response = cup_request(_CUP_LED_ENDPOINT, method="POST", payload=body)
         payload = _device_action_payload(
             base_url,
             action="set_led",
@@ -1181,11 +1067,11 @@ def _handle_control_cup(
         )
         led_body = dict(scene_payload["led"])
         motor_body = dict(scene_payload["motor"])
-        led_response = cup_request("/api/led", method="POST", payload=led_body)
+        led_response = cup_request(_CUP_LED_ENDPOINT, method="POST", payload=led_body)
         if not motor_body.get("enabled", True):
-            motor_response = cup_request("/api/motor/stop", method="POST", payload={})
+            motor_response = cup_request(_CUP_STOP_ENDPOINT, method="POST", payload={})
         else:
-            motor_response = cup_request("/api/motor", method="POST", payload=motor_body)
+            motor_response = cup_request(_CUP_MOTOR_ENDPOINT, method="POST", payload=motor_body)
         return {
             "ok": True,
             "device": base_url,
@@ -1201,23 +1087,23 @@ def _handle_control_cup(
     direction = _resolve_cup_direction(
         _require_string_argument(arguments, "direction", tool_name="control_cup")
     )
-    current_response = cup_request("/api/motor")
+    current_response = cup_request(_CUP_MOTOR_ENDPOINT)
     current_target = _cup_current_target_velocity(_unwrap_device_response(current_response))
     requested_step = _optional_number_argument(arguments, "step")
     step = abs(requested_step) if requested_step is not None else 15.0
     next_target = current_target + step if direction == "up" else current_target - step
     next_target = max(0.0, min(_CUP_MAX_TARGET_VELOCITY, next_target))
     led_body = _cup_led_profile_for_velocity(next_target)
-    led_response = cup_request("/api/led", method="POST", payload=led_body)
+    led_response = cup_request(_CUP_LED_ENDPOINT, method="POST", payload=led_body)
     if next_target <= 0.0:
-        motor_response = cup_request("/api/motor/stop", method="POST", payload={})
+        motor_response = cup_request(_CUP_STOP_ENDPOINT, method="POST", payload={})
         motor_body: dict[str, object] = {"target_velocity": 0.0, "enabled": False}
     else:
         motor_body = {
             "target_velocity": round(next_target, 3),
             "enabled": True,
         }
-        motor_response = cup_request("/api/motor", method="POST", payload=motor_body)
+        motor_response = cup_request(_CUP_MOTOR_ENDPOINT, method="POST", payload=motor_body)
     return {
         "ok": True,
         "device": base_url,
@@ -1458,51 +1344,7 @@ def _matches_shell_command_intent(user_text: str) -> bool:
     return any(keyword in lowered for keyword in keywords)
 
 
-_LED_DEVICE_KEYWORDS = ("led", "灯", "灯光", "彩灯", "氛围灯", "rgb")
-_LED_COLOR_ACTION_KEYWORDS = (
-    "color",
-    "颜色",
-    "red",
-    "green",
-    "blue",
-    "white",
-    "yellow",
-    "orange",
-    "purple",
-    "pink",
-    "红",
-    "绿",
-    "蓝",
-    "白",
-    "黄",
-    "橙",
-    "紫",
-    "粉",
-    "blink",
-    "闪",
-    "状态",
-    "status",
-    "关灯",
-    "熄灭",
-)
-_LED_SCENE_KEYWORDS = (
-    "mood",
-    "romantic",
-    "cozy",
-    "ambient",
-    "模式",
-    "氛围",
-    "浪漫",
-    "柔和",
-    "冷色",
-    "暖色",
-    "冷一点",
-    "暖一点",
-    "烛光",
-    "派对",
-    "放松",
-)
-_LED_CONTROL_VERBS = (
+_CONTROL_VERBS = (
     "set",
     "switch",
     "change",
@@ -1524,30 +1366,6 @@ _LED_CONTROL_VERBS = (
     "开",
     "关",
 )
-
-
-def _matches_led_control_intent(user_text: str) -> bool:
-    lowered = user_text.casefold()
-    return any(keyword in lowered for keyword in _LED_DEVICE_KEYWORDS) and any(
-        keyword in lowered
-        for keyword in (
-            *_LED_COLOR_ACTION_KEYWORDS,
-            *_LED_SCENE_KEYWORDS,
-            *_LED_CONTROL_VERBS,
-        )
-    )
-
-
-def _matches_led_scene_followup(user_text: str) -> bool:
-    lowered = user_text.casefold()
-    return any(
-        keyword in lowered
-        for keyword in (
-            *_LED_COLOR_ACTION_KEYWORDS,
-            *_LED_SCENE_KEYWORDS,
-            *_LED_CONTROL_VERBS,
-        )
-    )
 
 
 _CUP_DEVICE_KEYWORDS = (
@@ -1612,7 +1430,7 @@ def _matches_cup_control_intent(user_text: str) -> bool:
         for keyword in (
             *_CUP_CONTROL_KEYWORDS,
             *_CUP_SCENE_KEYWORDS,
-            *_LED_CONTROL_VERBS,
+            *_CONTROL_VERBS,
         )
     )
 
@@ -1712,7 +1530,7 @@ def _optional_boolish_argument(arguments: dict[str, object], key: str) -> bool |
     return coerced
 
 
-_LED_COLOR_ALIASES: dict[str, tuple[int, int, int]] = {
+_COLOR_ALIASES: dict[str, tuple[int, int, int]] = {
     "red": (255, 0, 0),
     "红": (255, 0, 0),
     "红色": (255, 0, 0),
@@ -1754,6 +1572,11 @@ _LED_COLOR_ALIASES: dict[str, tuple[int, int, int]] = {
     "黑色": (0, 0, 0),
 }
 
+_CUP_API_ROOT_PATH = "/api"
+_CUP_STATUS_ENDPOINT = "/status"
+_CUP_MOTOR_ENDPOINT = "/motor"
+_CUP_STOP_ENDPOINT = "/motor/stop"
+_CUP_LED_ENDPOINT = "/led"
 _CUP_MAX_TARGET_VELOCITY = 140.0
 _CUP_SCENES: dict[str, dict[str, object]] = {
     "gentle": {
@@ -1777,23 +1600,6 @@ _CUP_SCENES: dict[str, dict[str, object]] = {
         "led": {"color": "#7fd8ff", "blink_hz": 0.35, "blink_mode": 3},
     },
 }
-
-
-def _resolve_led_action(action: str) -> tuple[str, bool | None]:
-    key = _normalize_control_token(action)
-    if key in {"status", "getstatus", "readstatus", "querystatus", "状态"}:
-        return "status", None
-    if key in {"setcolor", "color", "setrgb", "rgb", "颜色"}:
-        return "set_color", None
-    if key in {"setblink", "blink", "闪烁"}:
-        return "set_blink", None
-    if key in {"blinkon", "enableblink", "startblink", "打开闪烁", "开启闪烁"}:
-        return "set_blink", True
-    if key in {"blinkoff", "disableblink", "stopblink", "关闭闪烁", "停止闪烁"}:
-        return "set_blink", False
-    raise ToolExecutionError(
-        "control_led action must be one of set_color, set_blink, or status."
-    )
 
 
 def _resolve_cup_action(action: str) -> str:
@@ -1847,28 +1653,6 @@ def _resolve_cup_direction(direction: str) -> str:
     )
 
 
-def _resolve_led_rgb(arguments: dict[str, object]) -> tuple[int, int, int]:
-    color = _optional_string_argument(arguments, "color")
-    explicit_rgb_present = any(key in arguments for key in ("r", "g", "b"))
-    if color is not None and explicit_rgb_present:
-        raise ToolExecutionError(
-            "control_led set_color accepts either 'color' or explicit r/g/b values, not both."
-        )
-    if color is not None:
-        parsed = _parse_led_color(color)
-        if parsed is None:
-            raise ToolExecutionError(
-                "control_led could not parse the requested color. Use a common color name, "
-                "a #RRGGBB hex value, or explicit r/g/b values."
-            )
-        return parsed
-    return (
-        _require_byte_argument(arguments, "r", tool_name="control_led"),
-        _require_byte_argument(arguments, "g", tool_name="control_led"),
-        _require_byte_argument(arguments, "b", tool_name="control_led"),
-    )
-
-
 def _parse_led_color(color: str) -> tuple[int, int, int] | None:
     normalized = color.strip()
     if not normalized:
@@ -1887,7 +1671,7 @@ def _parse_led_color(color: str) -> tuple[int, int, int] | None:
         if all(0 <= value <= 255 for value in (red, green, blue)):
             return red, green, blue
         return None
-    return _LED_COLOR_ALIASES.get(_normalize_control_token(normalized))
+    return _COLOR_ALIASES.get(_normalize_control_token(normalized))
 
 
 def _normalize_control_token(value: str) -> str:
@@ -1898,33 +1682,6 @@ def _normalize_control_token(value: str) -> str:
         .replace("-", "")
         .replace("_", "")
     )
-
-
-def _require_byte_argument(
-    arguments: dict[str, object],
-    key: str,
-    *,
-    tool_name: str,
-) -> int:
-    value = arguments.get(key)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ToolExecutionError(f"{tool_name} requires integer '{key}' values between 0 and 255.")
-    if value < 0 or value > 255:
-        raise ToolExecutionError(f"{tool_name} requires integer '{key}' values between 0 and 255.")
-    return value
-
-
-def _require_boolish_argument(
-    arguments: dict[str, object],
-    key: str,
-    *,
-    tool_name: str,
-) -> bool:
-    value = arguments.get(key)
-    coerced = _coerce_boolish(value)
-    if coerced is None:
-        raise ToolExecutionError(f"{tool_name} requires a boolean '{key}' value.")
-    return coerced
 
 
 def _coerce_boolish(value: object, *, fallback: bool | None = None) -> bool | None:
@@ -1939,49 +1696,6 @@ def _coerce_boolish(value: object, *, fallback: bool | None = None) -> bool | No
         if key in {"0", "false", "off", "disable", "disabled", "no", "stop"}:
             return False
     return fallback
-
-
-def _led_api_url(base_url: str, path: str, params: dict[str, object] | None = None) -> str:
-    endpoint = f"{base_url.rstrip('/')}{path}"
-    if not params:
-        return endpoint
-    return f"{endpoint}?{urlparse.urlencode(params)}"
-
-
-def _led_payload_from_response(
-    base_url: str,
-    *,
-    action: str,
-    response: dict[str, object],
-) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "ok": True,
-        "device": base_url,
-        "action": action,
-    }
-    red = _coerce_led_channel(response.get("r"))
-    green = _coerce_led_channel(response.get("g"))
-    blue = _coerce_led_channel(response.get("b"))
-    if None not in {red, green, blue}:
-        payload["r"] = red
-        payload["g"] = green
-        payload["b"] = blue
-        payload["color_hex"] = _rgb_to_hex(red, green, blue)
-    blink = _coerce_boolish(response.get("blink"))
-    if blink is not None:
-        payload["blink"] = blink
-    return payload
-
-
-def _coerce_led_channel(value: object) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if 0 <= value <= 255 else None
-    if isinstance(value, str) and value.isdigit():
-        numeric = int(value)
-        return numeric if 0 <= numeric <= 255 else None
-    return None
 
 
 def _rgb_to_hex(red: int, green: int, blue: int) -> str:
@@ -2035,14 +1749,16 @@ def _cup_current_target_velocity(payload: object) -> float:
     return velocity or 0.0
 
 
-def _cup_api_url(base_url: str, path: str) -> str:
-    normalized_base = base_url.rstrip("/")
-    normalized_path = path if path.startswith("/") else f"/{path}"
-    if normalized_base.endswith("/api") and normalized_path.startswith("/api/"):
-        normalized_path = normalized_path.removeprefix("/api")
-    elif normalized_base.endswith("/api") and normalized_path == "/api":
-        normalized_path = ""
-    return f"{normalized_base}{normalized_path}"
+def _cup_api_base_url(base_url: str) -> str:
+    normalized_base = base_url.strip().rstrip("/") or CUP_DEFAULT_BASE_URL
+    if normalized_base.endswith(_CUP_API_ROOT_PATH):
+        return normalized_base
+    return f"{normalized_base}{_CUP_API_ROOT_PATH}"
+
+
+def _cup_api_url(base_url: str, endpoint: str) -> str:
+    normalized_endpoint = endpoint if endpoint.startswith("/") else f"/{endpoint}"
+    return f"{_cup_api_base_url(base_url)}{normalized_endpoint}"
 
 
 def _cup_api_headers(api_token: str | None) -> dict[str, str]:

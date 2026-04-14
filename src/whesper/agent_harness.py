@@ -36,6 +36,7 @@ class AgentRunState:
     consecutive_errors: int = 0
     steps: list[AgentStep] = field(default_factory=list)
     last_completion: AgentCompletion | None = None
+    ensure_reasoning_content: bool = False
 
 
 StepCallback = Callable[[AgentStep], None]
@@ -208,19 +209,21 @@ class AgentHarness:
         model_system_prompt: str | None,
         user_text: str,
         route_mode: str,
-        tool_message_format,
+        target_profile,
         tools: list[dict[str, object]],
         on_step: StepCallback | None = None,
+        ensure_reasoning_content: bool = False,
     ) -> HarnessRunResult:
         state = AgentRunState(
             working_messages=self.message_builder.build_messages(
                 session,
                 model_system_prompt,
-                tool_message_format=tool_message_format,
+                target_profile=target_profile,
                 user_text=user_text,
                 route_mode=route_mode,
                 planning_prompt=f"{AGENTIC_PLANNING_PROMPT}\n\n{ASK_USER_FORMAT_PROMPT}",
                 include_live_context=False,
+                ensure_reasoning_content=ensure_reasoning_content,
             ),
             tool_choice=self.tool_choice_builder(
                 session,
@@ -228,6 +231,7 @@ class AgentHarness:
                 tools,
                 route_mode=route_mode,
             ),
+            ensure_reasoning_content=ensure_reasoning_content,
         )
 
         for round_index in range(self.max_rounds):
@@ -255,7 +259,7 @@ class AgentHarness:
                     model_system_prompt=model_system_prompt,
                     user_text=user_text,
                     route_mode=route_mode,
-                    tool_message_format=tool_message_format,
+                    target_profile=target_profile,
                     on_step=on_step,
                 )
                 if should_stop:
@@ -407,11 +411,21 @@ class AgentHarness:
         model_system_prompt: str | None,
         user_text: str,
         route_mode: str,
-        tool_message_format,
+        target_profile,
         on_step: StepCallback | None,
     ) -> bool:
         state.used_tools = True
-        self._append_assistant_tool_message(session, decision, completion)
+        source_profile_id = (
+            getattr(target_profile, "profile_id", None)
+            if target_profile is not None
+            else None
+        )
+        self._append_assistant_tool_message(
+            session,
+            decision,
+            completion,
+            source_profile_id=source_profile_id,
+        )
         self._emit_trace(
             kind="tool_calls",
             session_id=session.session_id,
@@ -443,6 +457,7 @@ class AgentHarness:
             provider_name=provider_name,
             tool_calls=completion.tool_calls,
             tool_choice=state.tool_choice,
+            source_profile_id=source_profile_id,
         ):
             is_error = self._is_error_content(message.content)
             has_error = has_error or is_error
@@ -475,11 +490,12 @@ class AgentHarness:
         state.working_messages = self.message_builder.build_messages(
             session,
             model_system_prompt,
-            tool_message_format=tool_message_format,
+            target_profile=target_profile,
             user_text=user_text,
             route_mode=route_mode,
             planning_prompt=f"{AGENTIC_PLANNING_PROMPT}\n\n{ASK_USER_FORMAT_PROMPT}",
             include_live_context=False,
+            ensure_reasoning_content=state.ensure_reasoning_content,
         )
         if has_error:
             state.working_messages = [
@@ -502,6 +518,8 @@ class AgentHarness:
         session: ConversationSession,
         decision: RouteDecision,
         completion: AgentCompletion,
+        *,
+        source_profile_id: str | None = None,
     ) -> None:
         session.append(
             ChatMessage(
@@ -512,6 +530,7 @@ class AgentHarness:
                 route_reason=decision.reason,
                 reasoning_content=self.reasoning_content_resolver(decision, completion),
                 tool_calls=[self.tool_call_payload_builder(item) for item in completion.tool_calls],
+                source_profile=source_profile_id,
             )
         )
 
@@ -523,6 +542,7 @@ class AgentHarness:
         provider_name: str,
         tool_calls: tuple[ToolInvocation, ...],
         tool_choice: str | dict[str, object] | None,
+        source_profile_id: str | None = None,
     ) -> list[ChatMessage]:
         tool_messages: list[ChatMessage] = []
         for tool_call in tool_calls:
@@ -541,6 +561,7 @@ class AgentHarness:
                 created_at=utc_now_iso(),
                 name=name,
                 tool_call_id=tool_call_id,
+                source_profile=source_profile_id,
             )
             session.append(message)
             tool_messages.append(message)

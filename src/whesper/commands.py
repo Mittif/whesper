@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from whesper.config import AppConfig
+from whesper.config import AppConfig, VALID_SEARCH_PROVIDERS
 from whesper.memory import MemoryStore
 from whesper.session import SessionStore
 
@@ -23,7 +23,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/clear", description="Clear the current terminal screen"),
     CommandSpec("/search", "<query>", "Run a web-backed search turn"),
     CommandSpec("/trace", "[message]", "Show recent trace or debug one message step-by-step"),
-    CommandSpec("/models", description="List configured models"),
+    CommandSpec("/models", "[provider]", "List configured models, or query a provider for available models"),
     CommandSpec("/sessions", description="List saved sessions"),
     CommandSpec("/status", description="Show current session and routing state"),
     CommandSpec("/info", description="Show the active model configuration"),
@@ -39,8 +39,9 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/cup-scene", "<gentle|steady|intense|cooldown>", "Apply a preset CUP scene"),
     CommandSpec("/cup-intensity", "<up|down> [step]", "Nudge CUP intensity up or down"),
     CommandSpec("/cup-led", "<color> [blink_hz] [blink_mode]", "Set CUP LED color and blink"),
-    CommandSpec("/model", "<alias|auto>", "Switch the current session model"),
+    CommandSpec("/model", "<alias|provider/model|auto>", "Switch model (auto-registers provider/model)"),
     CommandSpec("/use", "<alias|auto>", "Pin the current session model"),
+    CommandSpec("/websearch", "[provider]", "Show or switch web search provider"),
     CommandSpec("/mode", "<auto|chat|reasoning|search>", "Override routing mode"),
     CommandSpec("/new", "[session_id]", "Create or switch session"),
     CommandSpec("/rename", "<session_id>", "Rename the current session"),
@@ -90,7 +91,7 @@ def command_completions(
         "/clear": None,
         "/search": None,
         "/trace": None,
-        "/models": None,
+        "/models": {name: None for name in config.providers.keys()},
         "/sessions": None,
         "/status": None,
         "/info": None,
@@ -116,6 +117,7 @@ def command_completions(
             "#40c4ff": None,
             "#ff3b30": None,
         },
+        "/websearch": {provider: None for provider in VALID_SEARCH_PROVIDERS},
         "/model": {alias: None for alias in ("auto", *config.models.keys())},
         "/use": {alias: None for alias in ("auto", *config.models.keys())},
         "/mode": {mode: None for mode in VALID_MODES},
