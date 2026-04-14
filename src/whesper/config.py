@@ -13,9 +13,9 @@ class ConfigError(ValueError):
 
 
 CUP_DEFAULT_BASE_URL = "http://localhost:3001"
-_CONFIG_VARIABLE_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
-
-
+_CONFIG_VARIABLE_PATTERN = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)"
+)
 @dataclass(slots=True)
 class ProviderConfig:
     name: str
@@ -300,13 +300,17 @@ def _resolve_config_variables(
     variables: dict[str, str],
 ) -> str:
     def replace(match: re.Match[str]) -> str:
-        variable_name = match.group(1) or match.group(2)
+        variable_name = match.group(1) or match.group(3)
+        default_value = match.group(2)
         assert variable_name is not None
         if variable_name in variables:
             return variables[variable_name]
         environment_value = os.getenv(variable_name)
         if environment_value is not None:
             return environment_value
+
+        if default_value is not None:
+            return default_value
         raise ConfigError(
             f"{field_name} references unknown variable '{variable_name}'. "
             "Define it under [variables] or export it in the environment."
@@ -515,7 +519,11 @@ def load_config(path: str | Path) -> AppConfig:
         providers[name] = ProviderConfig(
             name=name,
             kind=str(item.get("kind", "openai_compatible")),
-            base_url=str(item["base_url"]).rstrip("/"),
+            base_url=_resolve_config_variables(
+                str(item["base_url"]),
+                field_name=f"providers.{name}.base_url",
+                variables=variables,
+            ).rstrip("/"),
             api_key=str(item["api_key"]) if item.get("api_key") is not None else None,
             api_key_env=(
                 str(item["api_key_env"]) if item.get("api_key_env") is not None else None

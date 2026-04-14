@@ -214,6 +214,7 @@ Run the CLI:
   .venv/bin/python -m whesper --config whesper.toml chat
 
 Helpful environment variables:
+  WHESPER_OLLAMA_BASE_URL  Optional, override the Ollama base URL (default: http://localhost:11434)
   WHESPER_LOCAL_MODEL   Force the local Ollama model name bootstrap should write
   WHESPER_KIMI_API_KEY  Optional, enables or becomes the default Kimi runtime
   WHESPER_SILICONFLOW_API_KEY  Optional, enables or becomes the default SiliconFlow runtime
@@ -261,6 +262,7 @@ EOF
   if [ "$BOOTSTRAP_PROFILE" = "kimi" ] || [ "$BOOTSTRAP_PROFILE" = "siliconflow" ]; then
     cat <<EOF
 If you later add a local Ollama model, rerun bootstrap like this:
+  export WHESPER_OLLAMA_BASE_URL="http://localhost:11434"
   WHESPER_LOCAL_MODEL="your-local-model" ./scripts/bootstrap.sh
 
 EOF

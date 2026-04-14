@@ -68,7 +68,7 @@ reasoning_keywords = ["分析", "总结", "比较", "计划", "设计", "为什�
 
 [providers.ollama_local]
 kind = "ollama_native"
-base_url = "http://localhost:11434/"
+base_url = "${WHESPER_OLLAMA_BASE_URL:-http://localhost:11434}"
 api_key = "ollama"
 timeout_seconds = 180
 
