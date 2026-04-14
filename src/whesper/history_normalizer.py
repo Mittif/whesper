@@ -4,6 +4,7 @@ import json
 
 from whesper.provider_profile import ProviderProfile
 from whesper.session import ChatMessage
+from whesper.tool_protocol import TOOL_CALL_XML_BLOCK_PATTERNS
 
 
 class HistoryNormalizer:
@@ -36,15 +37,20 @@ class HistoryNormalizer:
         profile = self.target_profile
         payload: dict[str, object] = {"role": message.role}
 
+        content = (
+            _strip_tool_call_xml(message.content)
+            if message.role == "assistant" and message.tool_calls is None
+            else message.content
+        )
         if (
             message.role == "assistant"
             and message.tool_calls is not None
-            and not message.content.strip()
+            and not content.strip()
             and profile.assistant_tool_content_null
         ):
             payload["content"] = None
         else:
-            payload["content"] = message.content
+            payload["content"] = content
 
         reasoning_value = self._resolve_reasoning_content(
             message,
@@ -79,7 +85,12 @@ class HistoryNormalizer:
         )
 
         existing = message.reasoning_content or ""
-        if same_profile and existing:
+        # Only replay reasoning_content back to providers that explicitly require it
+        # in their input history (e.g. Kimi K2.5 with thinking enabled).
+        # Providers like SiliconFlow and Ollama may extract reasoning_content from
+        # responses but do NOT accept the field in request messages, so injecting it
+        # would cause HTTP 400 errors on multi-round tool call loops.
+        if same_profile and existing and profile.reasoning_content_required_when_thinking:
             return existing
 
         if inject_reasoning_placeholder and message.role == "assistant":
@@ -247,3 +258,18 @@ def _format_builtin_call_summary(tool_call: dict[str, object]) -> str:
     if arguments_text:
         return f"[previous {name} call: {arguments_text}]"
     return f"[previous {name} call]"
+
+
+def _strip_tool_call_xml(content: str) -> str:
+    """Remove leaked tool-call XML blocks from assistant message content.
+
+    When a model emits tool calls in text format (e.g. MiniMax's
+    <minimax:tool_call> wrapper) and the harness fails to extract them,
+    the raw XML is stored as the message content.  Replaying that XML
+    verbatim to subsequent models causes them to reproduce the same
+    pattern (prompt contamination).  This helper strips any such blocks
+    so the stored content stays clean.
+    """
+    for pattern in TOOL_CALL_XML_BLOCK_PATTERNS:
+        content = pattern.sub("", content)
+    return content.strip()

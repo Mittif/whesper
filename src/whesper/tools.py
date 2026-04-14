@@ -35,6 +35,7 @@ from whesper.live_data import (
     TransportStatusContextService,
     UrlSummaryContextService,
     _contains_any,
+    _extract_map_place,
     _extract_city_weather_place,
     _extract_time_place,
     _extract_urls,
@@ -69,6 +70,7 @@ class ToolSpec:
     examples: tuple[tuple[str, str], ...] = ()
     should_offer: RequestMatcher | None = None
     related_tools: tuple[str, ...] = ()
+    related_tools_when: RequestMatcher | None = None
     execution_meta: ToolExecutionMeta = ToolExecutionMeta()
 
     def as_openai_tool(self) -> dict[str, object]:
@@ -261,6 +263,9 @@ class ToolRegistry:
                 ),
                 should_offer=lambda user_text, route_mode: _matches_local_area_intent(user_text),
                 related_tools=("lookup_place", "lookup_time"),
+                related_tools_when=lambda user_text, route_mode: _has_contextual_place_reference(
+                    user_text
+                ),
                 execution_meta=ToolExecutionMeta(timeout_seconds=5.0),
             ),
             ToolSpec(
@@ -287,6 +292,9 @@ class ToolRegistry:
                 ),
                 should_offer=lambda user_text, route_mode: _matches_local_time_intent(user_text),
                 related_tools=("lookup_time",),
+                related_tools_when=lambda user_text, route_mode: _has_contextual_place_reference(
+                    user_text
+                ),
                 execution_meta=ToolExecutionMeta(timeout_seconds=5.0),
             ),
             ToolSpec(
@@ -320,6 +328,9 @@ class ToolRegistry:
                 ),
                 should_offer=lambda user_text, route_mode: _matches_local_weather_intent(user_text),
                 related_tools=("get_weather_by_location",),
+                related_tools_when=lambda user_text, route_mode: _has_contextual_place_reference(
+                    user_text
+                ),
             ),
             ToolSpec(
                 name="get_weather_by_location",
@@ -417,24 +428,39 @@ class ToolRegistry:
                 description=(
                     "Resolve a place query into coordinates, country, and timezone."
                 ),
-                parameters_schema=_query_tool_schema(
-                    "Original user request asking where a place is, or asking for coordinates."
+                parameters_schema=_location_or_query_tool_schema(
+                    query_description=(
+                        "Original user request asking where a place is, or asking for coordinates."
+                    ),
+                    location_description=(
+                        "Concrete place name resolved from the current turn or prior context, "
+                        "such as Singapore, Tokyo, or 嘉定区."
+                    ),
                 ),
-                handler=lambda arguments: _handle_query_context_tool(
-                    "lookup_place",
+                handler=lambda arguments: _handle_lookup_place(
                     arguments,
                     geocoding_service,
                 ),
                 usage_guidance=(
                     "Use for map, coordinate, latitude, longitude, or address-style questions about "
-                    "a named or previously mentioned non-local place."
+                    "a named or previously mentioned non-local place. If the current user text says "
+                    "那里/那个城市/that city/there, resolve that reference from conversation "
+                    "context and pass the concrete place in location."
                 ),
                 examples=(
                     ('用户说: "Hangzhou coordinates"', '{"query":"Hangzhou coordinates"}'),
+                    (
+                        '用户说: "那个城市的经纬度"',
+                        '{"query":"那个城市的经纬度","location":"Singapore"}',
+                    ),
                 ),
                 should_offer=lambda user_text, route_mode: (
                     _contains_any(user_text, MAP_KEYWORDS)
-                    and not _matches_local_area_intent(user_text)
+                    and (
+                        _extract_map_place(user_text) is not None
+                        or _has_contextual_place_reference(user_text)
+                    )
+                    and not _has_explicit_local_reference(user_text)
                 ),
             ),
             ToolSpec(
@@ -442,29 +468,44 @@ class ToolRegistry:
                 description=(
                     "Get live local time or timezone information from a raw location query."
                 ),
-                parameters_schema=_query_tool_schema(
-                    "Original user request about local time, timezone, time difference, or holidays."
+                parameters_schema=_location_or_query_tool_schema(
+                    query_description=(
+                        "Original user request about local time, timezone, time difference, or holidays."
+                    ),
+                    location_description=(
+                        "Concrete place name resolved from the current turn or prior context, "
+                        "such as Singapore, Tokyo, or 嘉定区."
+                    ),
                 ),
-                handler=lambda arguments: _handle_query_context_tool(
-                    "lookup_time",
+                handler=lambda arguments: _handle_lookup_time(
                     arguments,
                     time_service,
                 ),
                 usage_guidance=(
                     "Use for local time, timezone, time difference, and holiday calendar questions "
                     "about a named place, or when context suggests words like 当地/here refer to a "
-                    "previously mentioned non-local place. Pass the original request text."
+                    "previously mentioned non-local place. If the user says 那个城市/there/that city, "
+                    "resolve it from conversation context and pass the concrete place in location."
                 ),
                 examples=(
                     ('用户说: "current time in Singapore"', '{"query":"current time in Singapore"}'),
                     ('用户说: "2026 Japan holidays"', '{"query":"2026 Japan holidays"}'),
+                    (
+                        '用户说: "那个城市的时区"',
+                        '{"query":"那个城市的时区","location":"Singapore"}',
+                    ),
                 ),
                 should_offer=lambda user_text, route_mode: (
                     (
                         _contains_any(user_text, ("holiday", "holidays", "节假日", "假期"))
                         or _extract_time_place(user_text) is not None
+                        or _has_contextual_place_reference(user_text)
                     )
                     and _contains_any(user_text, TIME_KEYWORDS)
+                    and not (
+                        _has_explicit_local_reference(user_text)
+                        and not _has_contextual_place_reference(user_text)
+                    )
                 ),
             ),
             ToolSpec(
@@ -816,7 +857,11 @@ class ToolRegistry:
         if matched_specs:
             selected_names = {spec.name for spec in matched_specs}
             for spec in matched_specs:
-                selected_names.update(spec.related_tools)
+                if (
+                    spec.related_tools_when is None
+                    or spec.related_tools_when(user_text, route_mode)
+                ):
+                    selected_names.update(spec.related_tools)
             return tuple(
                 spec for spec in visible_specs if spec.name in selected_names
             )
@@ -917,6 +962,80 @@ def _handle_get_local_time(arguments: dict[str, object]) -> dict[str, object]:
         "local_datetime": now.isoformat(),
         "local_date": now.date().isoformat(),
         "local_time": now.strftime("%H:%M:%S"),
+    }
+
+
+def _handle_lookup_place(
+    arguments: dict[str, object],
+    service: GeocodingContextService,
+) -> dict[str, object]:
+    query = _optional_string_argument(arguments, "query")
+    location = _optional_string_argument(arguments, "location")
+    if location is not None:
+        normalized_location = _normalize_place_candidate(location)
+        if normalized_location is None:
+            raise ToolExecutionError(
+                "lookup_place requires 'location' to identify a concrete place."
+            )
+        context = service.build_place_context(normalized_location)
+        if context is None:
+            raise ToolExecutionError(
+                "lookup_place could not derive live context from the provided location."
+            )
+        payload: dict[str, object] = {
+            "location": normalized_location,
+            "context": context,
+        }
+        if query is not None:
+            payload["query"] = query
+        return payload
+    if query is None:
+        raise ToolExecutionError("lookup_place requires a non-empty 'query' string.")
+    context = service.build_prompt_context(query, route_mode="chat")
+    if context is None:
+        raise ToolExecutionError(
+            "lookup_place could not derive live context from the provided query."
+        )
+    return {
+        "query": query,
+        "context": context,
+    }
+
+
+def _handle_lookup_time(
+    arguments: dict[str, object],
+    service: TimeContextService,
+) -> dict[str, object]:
+    query = _optional_string_argument(arguments, "query")
+    location = _optional_string_argument(arguments, "location")
+    if location is not None:
+        normalized_location = _normalize_place_candidate(location)
+        if normalized_location is None:
+            raise ToolExecutionError(
+                "lookup_time requires 'location' to identify a concrete place."
+            )
+        context = service.build_time_context(normalized_location)
+        if context is None:
+            raise ToolExecutionError(
+                "lookup_time could not derive live context from the provided location."
+            )
+        payload: dict[str, object] = {
+            "location": normalized_location,
+            "context": context,
+        }
+        if query is not None:
+            payload["query"] = query
+        return payload
+    if query is None:
+        raise ToolExecutionError("lookup_time requires a non-empty 'query' string.")
+    context = service.build_prompt_context(query, route_mode="chat")
+    if context is None:
+        raise ToolExecutionError(
+            "lookup_time could not derive live context from the provided query."
+        )
+    return {
+        "query": query,
+        "context": context,
     }
 
 
@@ -1300,6 +1419,38 @@ def _matches_local_time_intent(user_text: str) -> bool:
     }
 
 
+def _has_contextual_place_reference(user_text: str) -> bool:
+    lowered = user_text.casefold()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "当地",
+            "那里",
+            "那个城市",
+            "那个地方",
+            "there",
+            "that city",
+            "that place",
+        )
+    )
+
+
+def _has_explicit_local_reference(user_text: str) -> bool:
+    lowered = user_text.casefold()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "我这里",
+            "我这边",
+            "where i am",
+            "where i'm",
+            "my location",
+            "my area",
+            "当前位置",
+        )
+    )
+
+
 def _is_local_reference_phrase(value: str) -> bool:
     normalized = re.sub(r"\s+", " ", value.casefold()).strip(" ?？!！.,，。")
     return normalized in {
@@ -1456,6 +1607,27 @@ def _query_tool_schema(description: str) -> dict[str, object]:
             }
         },
         "required": ["query"],
+        "additionalProperties": False,
+    }
+
+
+def _location_or_query_tool_schema(
+    *,
+    query_description: str,
+    location_description: str,
+) -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": query_description,
+            },
+            "location": {
+                "type": "string",
+                "description": location_description,
+            },
+        },
         "additionalProperties": False,
     }
 

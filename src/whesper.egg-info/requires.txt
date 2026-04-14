@@ -1,1 +1,2 @@
 prompt_toolkit<4,>=3.0.43
+ddgs>=7.0

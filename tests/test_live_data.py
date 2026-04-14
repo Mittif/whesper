@@ -5,6 +5,8 @@ from urllib import parse
 
 from whesper.config import LiveContextEndpointConfig
 from whesper.live_data import (
+    _extract_map_place,
+    _extract_time_place,
     _extract_city_weather_place,
     CityWeatherContextService,
     CustomApiContextService,
@@ -761,6 +763,12 @@ class LiveDataTests(unittest.TestCase):
         assert context is not None
         self.assertIn("article_1_title: AI headline one", context)
         self.assertIn("article_2_link: https://example.com/2", context)
+
+    def test_extract_time_place_ignores_contextual_placeholder_city(self) -> None:
+        self.assertIsNone(_extract_time_place("那个城市的时区"))
+
+    def test_extract_map_place_ignores_contextual_placeholder_location(self) -> None:
+        self.assertIsNone(_extract_map_place("那里经纬度"))
 
     def test_url_summary_context_extracts_title_and_description(self) -> None:
         service = UrlSummaryContextService(

@@ -19,6 +19,18 @@ _TOOL_ARG_PATTERN = re.compile(
     re.DOTALL,
 )
 
+# MiniMax models emit <minimax:tool_call>…<invoke>…</invoke></minimax:tool_call>.
+# Normalise to <function_calls> before parsing so the same extraction path applies.
+_MINIMAX_OPEN_TAG = re.compile(r"<minimax:tool_call>", re.IGNORECASE)
+_MINIMAX_CLOSE_TAG = re.compile(r"</minimax:tool_call>", re.IGNORECASE)
+
+# Patterns that match known tool-call XML blocks that may leak into stored content.
+# Used by HistoryNormalizer to sanitise dirty assistant messages.
+TOOL_CALL_XML_BLOCK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"<function_calls>.*?</function_calls>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<minimax:tool_call>.*?</minimax:tool_call>", re.DOTALL | re.IGNORECASE),
+)
+
 
 class DefaultToolProtocolAdapter:
     def tool_call_payload(self, tool_call: ToolInvocation) -> dict[str, object]:
@@ -77,6 +89,10 @@ class DefaultToolProtocolAdapter:
         return ()
 
     def _extract_function_calls_block(self, content: str) -> tuple[ToolInvocation, ...]:
+        # Normalise MiniMax-style wrapper tags so the same extraction path applies.
+        # <minimax:tool_call>…</minimax:tool_call>  →  <function_calls>…</function_calls>
+        content = _MINIMAX_OPEN_TAG.sub("<function_calls>", content)
+        content = _MINIMAX_CLOSE_TAG.sub("</function_calls>", content)
         match = FUNCTION_CALLS_BLOCK_PATTERN.search(content)
         if match is None:
             return ()

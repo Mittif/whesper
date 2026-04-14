@@ -344,6 +344,12 @@ STOPWORD_LOCATIONS = {
     "当前",
     "本地",
     "当地",
+    "那里",
+    "那个城市",
+    "那个地方",
+    "there",
+    "that city",
+    "that place",
     "天气",
     "新闻",
     "节假日",
@@ -1259,12 +1265,19 @@ class GeocodingContextService:
         if place is None:
             return None
 
+        return self.build_place_context(place)
+
+    def build_place_context(self, place: str) -> str | None:
+        normalized_place = _normalize_place_candidate(place)
+        if normalized_place is None:
+            return None
+
         try:
-            geocode = _geocode_place(self.fetch_json, self.timeout_seconds, place)
+            geocode = _geocode_place(self.fetch_json, self.timeout_seconds, normalized_place)
         except Exception as exc:
             return (
                 "Live geocoding lookup status:\n"
-                f"- place: {place}\n"
+                f"- place: {normalized_place}\n"
                 f"- failed: {exc.__class__.__name__}: {exc}\n"
                 "- instruction: Do not invent coordinates or addresses."
             )
@@ -1272,7 +1285,7 @@ class GeocodingContextService:
         return "\n".join(
             (
                 "Live geocoding data:",
-                f"- query: {place}",
+                f"- query: {normalized_place}",
                 f"- location: {geocode['label']}",
                 f"- latitude: {_format_number(float(geocode['latitude']))}",
                 f"- longitude: {_format_number(float(geocode['longitude']))}",
@@ -1302,7 +1315,13 @@ class TimeContextService:
         place = _extract_time_place(user_text)
         if place is None:
             return None
-        return self._build_time_context(place)
+        return self.build_time_context(place)
+
+    def build_time_context(self, place: str) -> str | None:
+        normalized_place = _normalize_place_candidate(place)
+        if normalized_place is None:
+            return None
+        return self._build_time_context(normalized_place)
 
     def _build_time_context(self, place: str) -> str | None:
         try:

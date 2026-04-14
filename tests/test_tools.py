@@ -25,6 +25,8 @@ from whesper.tools import (
     _handle_get_local_area,
     _handle_get_local_time,
     _handle_get_local_weather,
+    _handle_lookup_place,
+    _handle_lookup_time,
     _handle_get_public_ip,
     _handle_get_weather_by_location,
     _handle_web_search,
@@ -32,7 +34,12 @@ from whesper.tools import (
     _matches_cup_scene_followup,
 )
 from whesper.agent_types import ToolExecutionMeta
-from whesper.live_data import FetchedTextResponse, SearchContextService
+from whesper.live_data import (
+    FetchedTextResponse,
+    GeocodingContextService,
+    SearchContextService,
+    TimeContextService,
+)
 
 CUP_DEFAULT_API_BASE_URL = f"{CUP_DEFAULT_BASE_URL}/api"
 
@@ -371,7 +378,7 @@ class ToolRegistryTests(unittest.TestCase):
 
         self.assertEqual(
             [tool["function"]["name"] for tool in tools],
-            ["get_local_area", "lookup_place", "lookup_time"],
+            ["get_local_area"],
         )
 
     def test_openai_tools_for_request_matches_local_time_intent(self) -> None:
@@ -384,7 +391,7 @@ class ToolRegistryTests(unittest.TestCase):
 
         self.assertEqual(
             [tool["function"]["name"] for tool in tools],
-            ["get_local_time", "lookup_time"],
+            ["get_local_time"],
         )
 
     def test_openai_tools_for_request_prefers_lookup_time_for_remote_city_query(self) -> None:
@@ -452,6 +459,45 @@ class ToolRegistryTests(unittest.TestCase):
             ["get_local_weather", "get_weather_by_location"],
         )
 
+    def test_openai_tools_for_request_exposes_related_time_tool_for_contextual_local_phrase(self) -> None:
+        registry = ToolRegistry.default()
+
+        tools = registry.openai_tools_for_request(
+            "当地时间",
+            route_mode="chat",
+        )
+
+        self.assertEqual(
+            [tool["function"]["name"] for tool in tools],
+            ["get_local_time", "lookup_time"],
+        )
+
+    def test_openai_tools_for_request_offers_lookup_time_for_contextual_city_reference(self) -> None:
+        registry = ToolRegistry.default()
+
+        tools = registry.openai_tools_for_request(
+            "那个城市的时区",
+            route_mode="chat",
+        )
+
+        self.assertEqual(
+            [tool["function"]["name"] for tool in tools],
+            ["lookup_time"],
+        )
+
+    def test_openai_tools_for_request_offers_lookup_place_for_contextual_place_reference(self) -> None:
+        registry = ToolRegistry.default()
+
+        tools = registry.openai_tools_for_request(
+            "那里经纬度",
+            route_mode="chat",
+        )
+
+        self.assertEqual(
+            [tool["function"]["name"] for tool in tools],
+            ["lookup_place"],
+        )
+
     def test_openai_tools_for_request_exposes_related_weather_tool_for_explicit_local_reference(self) -> None:
         registry = ToolRegistry.default()
 
@@ -462,7 +508,7 @@ class ToolRegistryTests(unittest.TestCase):
 
         self.assertEqual(
             [tool["function"]["name"] for tool in tools],
-            ["get_local_weather", "get_weather_by_location"],
+            ["get_local_weather"],
         )
 
     def test_openai_tools_for_request_keeps_general_web_summary_for_non_doc_url(self) -> None:
@@ -598,6 +644,52 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertEqual(payload["location"], "Tokyo, Tokyo, Japan")
         self.assertEqual(payload["current_condition"], "Mainly clear")
         self.assertEqual(payload["today"]["condition"], "Partly cloudy")
+
+    def test_handle_lookup_place_prefers_explicit_location_argument(self) -> None:
+        service = GeocodingContextService(
+            fetch_json=lambda url, timeout: {
+                "results": [
+                    {
+                        "name": "Singapore",
+                        "country": "Singapore",
+                        "latitude": 1.2897,
+                        "longitude": 103.85,
+                        "timezone": "Asia/Singapore",
+                    }
+                ]
+            }
+        )
+
+        payload = _handle_lookup_place(
+            {"query": "那个城市的经纬度", "location": "Singapore"},
+            service,
+        )
+
+        self.assertEqual(payload["location"], "Singapore")
+        self.assertIn("location: Singapore, Singapore", payload["context"])
+
+    def test_handle_lookup_time_prefers_explicit_location_argument(self) -> None:
+        service = TimeContextService(
+            fetch_json=lambda url, timeout: {
+                "results": [
+                    {
+                        "name": "Singapore",
+                        "country": "Singapore",
+                        "latitude": 1.2897,
+                        "longitude": 103.85,
+                        "timezone": "Asia/Singapore",
+                    }
+                ]
+            }
+        )
+
+        payload = _handle_lookup_time(
+            {"query": "那个城市的时区", "location": "Singapore"},
+            service,
+        )
+
+        self.assertEqual(payload["location"], "Singapore")
+        self.assertIn("timezone: Asia/Singapore", payload["context"])
 
     def test_handle_get_weather_by_location_normalizes_search_prefixed_place(self) -> None:
         from whesper import tools as tools_module

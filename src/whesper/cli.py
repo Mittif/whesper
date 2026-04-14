@@ -1315,6 +1315,53 @@ def handle_command(
                 return CommandOutcome(True, session, mode_override)
             print(f"Routing mode set to: {next_mode}", file=output_stream)
             return CommandOutcome(True, session, next_mode)
+        if parsed.name == "/session":
+            if not parsed.arg:
+                print(f"Current session: {session.session_id}", file=output_stream)
+                print(
+                    f"  messages: {len(session.messages)}  "
+                    f"created: {session.created_at}",
+                    file=output_stream,
+                )
+                print(
+                    "Tip: /session <session_id> to switch, /sessions to list all",
+                    file=output_stream,
+                )
+                return CommandOutcome(True, session, mode_override)
+            target_id = parsed.arg.strip()
+            if not target_id:
+                print_cli_error("Session ID cannot be empty.", output_stream=output_stream)
+                print_cli_hint("Usage: /session <session_id>", output_stream=output_stream)
+                return CommandOutcome(True, session, mode_override)
+            available = store.list_sessions()
+            if target_id not in available:
+                print_cli_error(
+                    f"Session not found: {target_id}",
+                    output_stream=output_stream,
+                )
+                hint = ", ".join(available) if available else "none"
+                print_cli_hint(
+                    f"available sessions: {hint}\n"
+                    "Tip: use /new <session_id> to create a new session",
+                    output_stream=output_stream,
+                )
+                return CommandOutcome(True, session, mode_override)
+            store.save(session)
+            next_session = store.load(target_id)
+            if ensure_valid_session_model(
+                config,
+                next_session,
+                output_stream=output_stream,
+            ):
+                store.save(next_session)
+            if refresh_completions is not None:
+                refresh_completions()
+            print(
+                f"Switched to session: {next_session.session_id} "
+                f"(pinned_model={next_session.pinned_model})",
+                file=output_stream,
+            )
+            return CommandOutcome(True, next_session, mode_override)
         if parsed.name == "/new":
             next_session_id = parsed.arg or config.app.default_session
             store.save(session)
@@ -1395,7 +1442,7 @@ def handle_command(
         return CommandOutcome(True, session, mode_override)
     except (FileExistsError, FileNotFoundError) as exc:
         print_cli_error(str(exc), output_stream=output_stream)
-        if parsed.name in {"/rename", "/delete-session"}:
+        if parsed.name in {"/session", "/rename", "/delete-session"}:
             available_sessions = ", ".join(store.list_sessions()) or "none"
             print_cli_hint(
                 f"available sessions: {available_sessions}",

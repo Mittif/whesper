@@ -143,6 +143,78 @@ OLLAMA_DEFAULT_PROFILE = ProviderProfile(
     tool_arguments_mode="object",
 )
 
+# ---------------------------------------------------------------------------
+# Grok (xAI)  —  OpenAI-compatible; no explicit thinking-disable field needed
+# ---------------------------------------------------------------------------
+GROK_DEFAULT_PROFILE = ProviderProfile(
+    profile_id="grok:default",
+    thinking_disable_field=None,
+)
+
+# ---------------------------------------------------------------------------
+# Gemini (Google)  —  `content` must be "" not null; no thinking-disable field
+# ---------------------------------------------------------------------------
+GEMINI_DEFAULT_PROFILE = ProviderProfile(
+    profile_id="gemini:default",
+    assistant_tool_content_null=False,
+    thinking_disable_field=None,
+)
+
+# ---------------------------------------------------------------------------
+# GLM / Zhipu AI  —  GLM-4 rejects null content; no thinking-disable field
+# ---------------------------------------------------------------------------
+GLM_DEFAULT_PROFILE = ProviderProfile(
+    profile_id="glm:default",
+    assistant_tool_content_null=False,
+    thinking_disable_field=None,
+)
+
+# ---------------------------------------------------------------------------
+# DeepSeek (native api.deepseek.com)
+# R1 / reasoner models surface reasoning_content but don't require it in input
+# ---------------------------------------------------------------------------
+DEEPSEEK_DEFAULT_PROFILE = ProviderProfile(
+    profile_id="deepseek:default",
+    thinking_disable_field=None,
+    text_tool_call_patterns=("function_calls", "tool_arg"),
+)
+
+DEEPSEEK_R1_PROFILE = ProviderProfile(
+    profile_id="deepseek:r1",
+    thinking_disable_field=None,
+    text_tool_call_patterns=("function_calls", "tool_arg"),
+)
+
+# ---------------------------------------------------------------------------
+# Claude (Anthropic, accessed via an OpenAI-compatible proxy such as LiteLLM)
+# ---------------------------------------------------------------------------
+CLAUDE_DEFAULT_PROFILE = ProviderProfile(
+    profile_id="claude:default",
+    thinking_disable_field=None,
+)
+
+# ---------------------------------------------------------------------------
+# Llama (Meta, served locally or via inference providers)
+# Safer to send "" rather than null for content; no thinking-disable field
+# ---------------------------------------------------------------------------
+LLAMA_DEFAULT_PROFILE = ProviderProfile(
+    profile_id="llama:default",
+    assistant_tool_content_null=False,
+    thinking_disable_field=None,
+)
+
+# ---------------------------------------------------------------------------
+# Qwen (Alibaba / DashScope native)  —  same thinking toggle as SiliconFlow Qwen
+# ---------------------------------------------------------------------------
+QWEN_DEFAULT_PROFILE = ProviderProfile(
+    profile_id="qwen:default",
+    thinking_enable_field="enable_thinking",
+    thinking_disable_field="enable_thinking",
+    thinking_disable_value=False,
+    thinking_accepts_string_value=False,
+    text_tool_call_patterns=("function_calls", "tool_arg"),
+)
+
 
 PROFILES: dict[tuple[str, str], ProviderProfile] = {
     ("openai", "default"): OPENAI_DEFAULT_PROFILE,
@@ -153,6 +225,14 @@ PROFILES: dict[tuple[str, str], ProviderProfile] = {
     ("siliconflow", "default"): SILICONFLOW_DEFAULT_PROFILE,
     ("ollama", "qwen"): OLLAMA_QWEN_PROFILE,
     ("ollama", "default"): OLLAMA_DEFAULT_PROFILE,
+    ("grok", "default"): GROK_DEFAULT_PROFILE,
+    ("gemini", "default"): GEMINI_DEFAULT_PROFILE,
+    ("glm", "default"): GLM_DEFAULT_PROFILE,
+    ("deepseek", "default"): DEEPSEEK_DEFAULT_PROFILE,
+    ("deepseek", "r1"): DEEPSEEK_R1_PROFILE,
+    ("claude", "default"): CLAUDE_DEFAULT_PROFILE,
+    ("llama", "default"): LLAMA_DEFAULT_PROFILE,
+    ("qwen", "default"): QWEN_DEFAULT_PROFILE,
 }
 
 
@@ -190,11 +270,30 @@ def _detect_openai_family(_: ModelConfig) -> str:
     return "default"
 
 
+def _detect_deepseek_family(model: ModelConfig) -> str:
+    name = model.model.casefold()
+    if "r1" in name or "reasoner" in name:
+        return "r1"
+    return "default"
+
+
+def _detect_single_family(_: ModelConfig) -> str:
+    """Fallback for providers that have only one profile family."""
+    return "default"
+
+
 FAMILY_DETECTORS: dict[str, Callable[[ModelConfig], str]] = {
     "openai": _detect_openai_family,
     "kimi": _detect_kimi_family,
     "siliconflow": _detect_siliconflow_family,
     "ollama": _detect_ollama_family,
+    "grok": _detect_single_family,
+    "gemini": _detect_single_family,
+    "glm": _detect_single_family,
+    "deepseek": _detect_deepseek_family,
+    "claude": _detect_single_family,
+    "llama": _detect_single_family,
+    "qwen": _detect_single_family,
 }
 
 
@@ -205,12 +304,27 @@ def _detect_provider_key(provider: ProviderConfig) -> str:
     if provider.kind == "ollama_native":
         return "ollama"
     signature = f"{provider.name} {provider.base_url}".casefold()
+    # Check more-specific signatures first to avoid false positives.
     if "moonshot" in signature or "kimi" in signature:
         return "kimi"
     if "siliconflow" in signature:
         return "siliconflow"
     if "ollama" in signature or ":11434" in signature:
         return "ollama"
+    if "x.ai" in signature or "grok" in signature:
+        return "grok"
+    if "googleapis.com" in signature or "gemini" in signature:
+        return "gemini"
+    if "bigmodel.cn" in signature or "zhipu" in signature or "chatglm" in signature or "glm" in signature:
+        return "glm"
+    if "deepseek.com" in signature or "deepseek" in signature:
+        return "deepseek"
+    if "anthropic.com" in signature or "claude" in signature:
+        return "claude"
+    if "dashscope" in signature or "aliyun" in signature or "qwen" in signature:
+        return "qwen"
+    if "meta.ai" in signature or "llama" in signature:
+        return "llama"
     return "openai"
 
 

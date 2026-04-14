@@ -263,6 +263,58 @@ class ConfigTests(unittest.TestCase):
         config = load_config(temp_path)
         self.assertEqual(config.hardware.cup.base_url, "http://127.0.0.1:3901")
 
+    def test_fails_with_invalid_provider_extra_headers_type(self) -> None:
+        content = textwrap.dedent(
+            """
+            [scheduler]
+            chat_model = "local"
+
+            [providers.main]
+            base_url = "http://localhost:11434/v1"
+            extra_headers = []
+
+            [models.local]
+            provider = "main"
+            model = "qwen"
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        with self.assertRaisesRegex(ConfigError, "providers.main.extra_headers"):
+            load_config(temp_path)
+
+    def test_fails_with_invalid_live_context_extra_headers_type(self) -> None:
+        content = textwrap.dedent(
+            """
+            [scheduler]
+            chat_model = "local"
+
+            [providers.main]
+            base_url = "http://localhost:11434/v1"
+
+            [models.local]
+            provider = "main"
+            model = "qwen"
+
+            [live_context.custom_api.device]
+            url_template = "https://example.com/status"
+            extra_headers = []
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        with self.assertRaisesRegex(
+            ConfigError,
+            "live_context.custom_api.device.extra_headers",
+        ):
+            load_config(temp_path)
+
 
 if __name__ == "__main__":
     unittest.main()

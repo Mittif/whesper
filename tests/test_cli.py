@@ -942,6 +942,78 @@ class CliTests(unittest.TestCase):
         self.assertIn("Renamed session to: renamed", rendered)
         self.assertIn("renamed", sessions)
 
+    def test_session_no_arg_prints_current_session_id(self) -> None:
+        config = build_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            session = store.load("main")
+            output = io.StringIO()
+
+            outcome = handle_command(
+                ParsedCommand(name="/session", arg=None),
+                config=config,
+                store=store,
+                chat_service=self.build_chat_service(config),
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertTrue(outcome.handled)
+        self.assertFalse(outcome.should_exit)
+        self.assertEqual(outcome.session.session_id, "main")
+        self.assertIn("Current session: main", rendered)
+        self.assertIn("messages:", rendered)
+        self.assertIn("/session <session_id>", rendered)
+
+    def test_session_command_switches_to_existing_session(self) -> None:
+        config = build_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            session = store.load("main")
+            store.load("other")
+            output = io.StringIO()
+
+            outcome = handle_command(
+                ParsedCommand(name="/session", arg="other"),
+                config=config,
+                store=store,
+                chat_service=self.build_chat_service(config),
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertTrue(outcome.handled)
+        self.assertEqual(outcome.session.session_id, "other")
+        self.assertIn("Switched to session: other", rendered)
+
+    def test_session_command_errors_when_session_not_found(self) -> None:
+        config = build_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStore(tmpdir)
+            session = store.load("main")
+            output = io.StringIO()
+
+            outcome = handle_command(
+                ParsedCommand(name="/session", arg="nonexistent"),
+                config=config,
+                store=store,
+                chat_service=self.build_chat_service(config),
+                session=session,
+                mode_override="auto",
+                output_stream=output,
+            )
+
+        rendered = output.getvalue()
+        self.assertTrue(outcome.handled)
+        self.assertEqual(outcome.session.session_id, "main")
+        self.assertIn("Session not found: nonexistent", rendered)
+        self.assertIn("available sessions:", rendered)
+        self.assertIn("/new", rendered)
+
     def test_delete_session_removes_named_session(self) -> None:
         config = build_config()
         with tempfile.TemporaryDirectory() as tmpdir:

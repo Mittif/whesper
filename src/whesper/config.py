@@ -246,6 +246,17 @@ def _optional_think(value: Any) -> bool | str | None:
     raise ConfigError("Expected 'think' to be a boolean or string.")
 
 
+def _parse_extra_headers(raw: Any, *, field_name: str) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{field_name} must be a table of header values.")
+    return {
+        str(key): str(value)
+        for key, value in raw.items()
+    }
+
+
 def _parse_shell_command_prefixes(raw: Any) -> tuple[tuple[str, ...], ...]:
     if raw is None:
         return ()
@@ -335,10 +346,10 @@ def _parse_live_context_endpoints(raw: Any, section_name: str) -> dict[str, Live
             api_key_env=str(item["api_key_env"]) if item.get("api_key_env") else None,
             api_key_header=str(item.get("api_key_header", "Authorization")),
             api_key_prefix=str(item.get("api_key_prefix", "Bearer ")),
-            extra_headers={
-                str(key): str(value)
-                for key, value in item.get("extra_headers", {}).items()
-            },
+            extra_headers=_parse_extra_headers(
+                item.get("extra_headers"),
+                field_name=f"live_context.{section_name}.{name}.extra_headers",
+            ),
         )
     return endpoints
 
@@ -510,10 +521,10 @@ def load_config(path: str | Path) -> AppConfig:
                 str(item["api_key_env"]) if item.get("api_key_env") is not None else None
             ),
             timeout_seconds=int(item.get("timeout_seconds", 120)),
-            extra_headers={
-                str(key): str(value)
-                for key, value in item.get("extra_headers", {}).items()
-            },
+            extra_headers=_parse_extra_headers(
+                item.get("extra_headers"),
+                field_name=f"providers.{name}.extra_headers",
+            ),
             profile_override=(
                 str(item["profile"]).strip()
                 if isinstance(item.get("profile"), str) and item["profile"].strip()
