@@ -1,13 +1,13 @@
 ---
 name: cup-hardware-control
-description: Use this skill when working in the whesper repository and the user wants the agent to inspect or control the CUP hardware through the local client API at http://localhost:3001/api/*. Covers status checks, motor speed changes, stop requests, LED mood adjustments, and relative intensity nudges such as “再刺激一点” or “温柔一点”.
+description: Use this skill when working in the whesper repository and the user wants the agent to inspect or control the CUP hardware through the device HTTP API at http://esp32-cup.local/api/*. Covers status checks, motor speed changes, stop requests, LED mood adjustments, and relative intensity nudges such as “再刺激一点” or “温柔一点”.
 ---
 
 # CUP Hardware Control
 
 This repo already exposes the device through the `control_cup` tool when `[hardware.cup]` is enabled in config.
 
-The runtime path should go through the local client API at `http://localhost:3001/api/*`. In config, prefer `base_url = "http://localhost:3001"`. The code also tolerates `http://localhost:3001/api`.
+The runtime path should go through the device HTTP API at `http://esp32-cup.local/api/*`. In config, prefer `base_url = "http://esp32-cup.local"`. The code also tolerates `http://esp32-cup.local/api`.
 
 ## Use This Skill When
 

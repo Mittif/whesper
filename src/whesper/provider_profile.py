@@ -110,7 +110,14 @@ SILICONFLOW_QWEN_PROFILE = ProviderProfile(
     thinking_disable_value=False,
     thinking_accepts_string_value=False,
     tool_arguments_mode="object",
-    text_tool_call_patterns=("function_calls", "tool_arg"),
+    text_tool_call_patterns=(
+        "function_calls",
+        "tool_arg",
+        "action_json",
+        "box_tool_call",
+        "hermes_tool_call",
+        "json_tool_call",
+    ),
 )
 
 SILICONFLOW_DEEPSEEK_PROFILE = ProviderProfile(
@@ -119,7 +126,13 @@ SILICONFLOW_DEEPSEEK_PROFILE = ProviderProfile(
     thinking_disable_field="enable_thinking",
     thinking_disable_value=False,
     thinking_accepts_string_value=False,
-    text_tool_call_patterns=("function_calls", "tool_arg"),
+    text_tool_call_patterns=(
+        "function_calls",
+        "tool_arg",
+        "box_tool_call",
+        "hermes_tool_call",
+        "json_tool_call",
+    ),
 )
 
 SILICONFLOW_DEFAULT_PROFILE = ProviderProfile(
@@ -128,19 +141,36 @@ SILICONFLOW_DEFAULT_PROFILE = ProviderProfile(
     thinking_disable_field="enable_thinking",
     thinking_disable_value=False,
     thinking_accepts_string_value=False,
+    text_tool_call_patterns=(
+        "function_calls",
+        "tool_arg",
+        "box_tool_call",
+        "hermes_tool_call",
+        "json_tool_call",
+    ),
 )
 
 OLLAMA_QWEN_PROFILE = ProviderProfile(
     profile_id="ollama:qwen",
     thinking_disable_field=None,
     tool_arguments_mode="object",
-    text_tool_call_patterns=("function_calls", "tool_arg"),
+    text_tool_call_patterns=("function_calls", "tool_arg", "action_json", "box_tool_call"),
 )
 
 OLLAMA_DEFAULT_PROFILE = ProviderProfile(
     profile_id="ollama:default",
     thinking_disable_field=None,
     tool_arguments_mode="object",
+    text_tool_call_patterns=(
+        "function_calls",
+        "tool_arg",
+        "hermes_tool_call",
+        "llama_python_tag",
+        "mistral_tool_calls",
+        "action_json",
+        "box_tool_call",
+        "json_tool_call",
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -149,6 +179,7 @@ OLLAMA_DEFAULT_PROFILE = ProviderProfile(
 GROK_DEFAULT_PROFILE = ProviderProfile(
     profile_id="grok:default",
     thinking_disable_field=None,
+    text_tool_call_patterns=("function_calls", "tool_arg", "hermes_tool_call", "json_tool_call"),
 )
 
 # ---------------------------------------------------------------------------
@@ -158,6 +189,7 @@ GEMINI_DEFAULT_PROFILE = ProviderProfile(
     profile_id="gemini:default",
     assistant_tool_content_null=False,
     thinking_disable_field=None,
+    text_tool_call_patterns=("function_calls", "tool_arg", "hermes_tool_call", "json_tool_call"),
 )
 
 # ---------------------------------------------------------------------------
@@ -167,6 +199,14 @@ GLM_DEFAULT_PROFILE = ProviderProfile(
     profile_id="glm:default",
     assistant_tool_content_null=False,
     thinking_disable_field=None,
+    text_tool_call_patterns=(
+        "function_calls",
+        "tool_arg",
+        "box_tool_call",
+        "glm_function",
+        "hermes_tool_call",
+        "json_tool_call",
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -176,13 +216,13 @@ GLM_DEFAULT_PROFILE = ProviderProfile(
 DEEPSEEK_DEFAULT_PROFILE = ProviderProfile(
     profile_id="deepseek:default",
     thinking_disable_field=None,
-    text_tool_call_patterns=("function_calls", "tool_arg"),
+    text_tool_call_patterns=("function_calls", "tool_arg", "hermes_tool_call", "json_tool_call"),
 )
 
 DEEPSEEK_R1_PROFILE = ProviderProfile(
     profile_id="deepseek:r1",
     thinking_disable_field=None,
-    text_tool_call_patterns=("function_calls", "tool_arg"),
+    text_tool_call_patterns=("function_calls", "tool_arg", "hermes_tool_call", "json_tool_call"),
 )
 
 # ---------------------------------------------------------------------------
@@ -191,6 +231,7 @@ DEEPSEEK_R1_PROFILE = ProviderProfile(
 CLAUDE_DEFAULT_PROFILE = ProviderProfile(
     profile_id="claude:default",
     thinking_disable_field=None,
+    text_tool_call_patterns=("function_calls", "tool_arg", "hermes_tool_call", "json_tool_call"),
 )
 
 # ---------------------------------------------------------------------------
@@ -201,6 +242,12 @@ LLAMA_DEFAULT_PROFILE = ProviderProfile(
     profile_id="llama:default",
     assistant_tool_content_null=False,
     thinking_disable_field=None,
+    text_tool_call_patterns=(
+        "function_calls",
+        "llama_python_tag",
+        "hermes_tool_call",
+        "json_tool_call",
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -212,7 +259,15 @@ QWEN_DEFAULT_PROFILE = ProviderProfile(
     thinking_disable_field="enable_thinking",
     thinking_disable_value=False,
     thinking_accepts_string_value=False,
-    text_tool_call_patterns=("function_calls", "tool_arg"),
+    text_tool_call_patterns=(
+        "function_calls",
+        "tool_arg",
+        "action_json",
+        "box_tool_call",
+        "plugin",
+        "hermes_tool_call",
+        "json_tool_call",
+    ),
 )
 
 

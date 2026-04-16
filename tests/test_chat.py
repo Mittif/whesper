@@ -484,6 +484,62 @@ class KimiThinkingToolClient:
         raise AssertionError("streaming should not be called in this test")
 
 
+class KimiToolChoiceDisableThinkingClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def create_chat_completion(
+        self,
+        provider,
+        model,
+        messages,
+        *,
+        tools=None,
+        tool_choice=None,
+        disable_thinking=False,
+    ):
+        from whesper.client import ProviderError
+
+        self.calls.append(
+            {
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "disable_thinking": disable_thinking,
+            }
+        )
+        if len(self.calls) in {1, 3}:
+            if tool_choice != "required" or disable_thinking:
+                raise AssertionError("expected required tool_choice with thinking enabled first")
+            raise ProviderError(
+                "Provider 'kimi' returned HTTP 400: "
+                "{\"error\":{\"message\":\"tool_choice 'required' is incompatible "
+                "with thinking enabled\",\"type\":\"invalid_request_error\"}}"
+            )
+        if len(self.calls) == 2:
+            if tool_choice != "required" or not disable_thinking:
+                raise AssertionError("expected retry with disable_thinking while keeping required")
+            return CompletionResult(
+                content="",
+                raw_response={},
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="call_cup_1",
+                        name="control_cup",
+                        arguments_json='{"action":"set_led","color":"暖白"}',
+                    ),
+                ),
+            )
+        if len(self.calls) == 4:
+            if tool_choice != "required" or not disable_thinking:
+                raise AssertionError("expected follow-up retry with disable_thinking")
+            return CompletionResult(content="已经帮你调成更温馨的颜色。", raw_response={})
+        raise AssertionError("unexpected extra completion call")
+
+    def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
+        raise AssertionError("streaming should not be called in this test")
+
+
 class KimiLegacyToolCallIdClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -1363,6 +1419,72 @@ class ChatTests(unittest.TestCase):
             session.messages[1].reasoning_content,
             "先搜索最新 release notes，再整理成简短答案。",
         )
+
+    def test_send_retries_kimi_required_tool_choice_with_disable_thinking(self) -> None:
+        config = make_kimi_thinking_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            messages=[
+                ChatMessage(
+                    role="user",
+                    content="把灯变蓝",
+                    created_at="2026-01-01T00:00:00+00:00",
+                ),
+                ChatMessage(
+                    role="assistant",
+                    content="已经帮你把灯调成蓝色。",
+                    created_at="2026-01-01T00:00:01+00:00",
+                    model_alias="chat",
+                ),
+                ChatMessage(
+                    role="tool",
+                    name="control_cup",
+                    content='{"ok": true, "action": "set_led"}',
+                    created_at="2026-01-01T00:00:02+00:00",
+                ),
+            ],
+        )
+        client = KimiToolChoiceDisableThinkingClient()
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="control_cup",
+                    description="Control the CUP hardware",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"action": {"type": "string"}},
+                        "required": ["action"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: {"ok": True, "requested": arguments},
+                    should_offer=lambda user_text, route_mode: _matches_cup_control_intent(
+                        user_text
+                    ),
+                    execution_meta=ToolExecutionMeta(side_effectful=True),
+                ),
+            )
+        )
+        service = ChatService(
+            config,
+            client=client,
+            tool_registry=registry,
+        )
+
+        result = service.send(session, "我想要温馨一点的颜色")
+
+        self.assertEqual(result.assistant_message.content, "已经帮你调成更温馨的颜色。")
+        self.assertEqual(len(client.calls), 4)
+        self.assertFalse(client.calls[0]["disable_thinking"])
+        self.assertEqual(client.calls[0]["tool_choice"], "required")
+        self.assertTrue(client.calls[1]["disable_thinking"])
+        self.assertEqual(client.calls[1]["tool_choice"], "required")
+        self.assertFalse(client.calls[2]["disable_thinking"])
+        self.assertEqual(client.calls[2]["tool_choice"], "required")
+        self.assertTrue(client.calls[3]["disable_thinking"])
+        self.assertEqual(client.calls[3]["tool_choice"], "required")
+        self.assertEqual(session.messages[-2].role, "tool")
 
     def test_send_enables_kimi_builtin_web_search(self) -> None:
         config = make_kimi_thinking_config()

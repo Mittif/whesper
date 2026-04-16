@@ -804,7 +804,7 @@ def handle_cup_debug_command(
     except ToolExecutionError as exc:
         print_cli_error(str(exc), output_stream=output_stream)
         print_cli_hint(
-            "Tip: check [hardware.cup] base_url/token and make sure the local client API is running.",
+            "Tip: check [hardware.cup] base_url/token and make sure the device is reachable (default: http://esp32-cup.local).",
             output_stream=output_stream,
         )
         return True

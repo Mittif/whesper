@@ -1512,6 +1512,7 @@ _CONTROL_VERBS = (
     "设成",
     "调成",
     "改成",
+    "变",
     "变成",
     "弄成",
     "开",
@@ -1530,6 +1531,8 @@ _CUP_DEVICE_KEYWORDS = (
     "转速",
     "震动",
     "振动",
+    "灯",
+    "led",
 )
 _CUP_CONTROL_KEYWORDS = (
     "status",

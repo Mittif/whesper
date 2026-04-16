@@ -140,6 +140,11 @@ class ToolRegistryTests(unittest.TestCase):
     def test_cup_control_intent_matches_explicit_request(self) -> None:
         self.assertTrue(_matches_cup_control_intent("把飞机杯转快一点"))
 
+    def test_cup_control_intent_matches_led_color_request(self) -> None:
+        self.assertTrue(_matches_cup_control_intent("把灯变蓝"))
+        self.assertTrue(_matches_cup_control_intent("把灯调成红色"))
+        self.assertTrue(_matches_cup_control_intent("灯变绿"))
+
     def test_cup_scene_followup_matches_intensity_request(self) -> None:
         self.assertTrue(_matches_cup_scene_followup("再刺激一点"))
 

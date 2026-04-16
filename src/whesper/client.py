@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
 from typing import Iterable
 from urllib import error, request
 
@@ -269,6 +270,14 @@ def _iter_json_lines(lines: Iterable[bytes]) -> Iterable[dict]:
             raise ProviderError("Ollama returned invalid JSON in the stream.") from exc
 
 
+def _raise_provider_connection_error(provider: ProviderConfig, exc: BaseException) -> None:
+    detail = str(exc).strip() or exc.__class__.__name__
+    raise ProviderError(
+        f"Provider '{provider.name}' connection failed: {detail}. "
+        "Please verify the base_url and whether the provider is reachable."
+    ) from exc
+
+
 def list_provider_models(provider: ProviderConfig) -> list[str]:
     """Query a provider's API for available model IDs.
 
@@ -293,6 +302,8 @@ def list_provider_models(provider: ProviderConfig) -> list[str]:
         raise ProviderError(
             f"Provider '{provider.name}' is unreachable: {exc.reason}"
         ) from exc
+    except (ConnectionError, TimeoutError, socket.timeout) as exc:
+        _raise_provider_connection_error(provider, exc)
 
     if provider.kind == "ollama_native":
         models = raw.get("models", [])
@@ -347,6 +358,8 @@ class OpenAICompatibleClient:
                 "Please verify the base_url and whether the endpoint supports "
                 "OpenAI-compatible /chat/completions requests."
             ) from exc
+        except (ConnectionError, TimeoutError, socket.timeout) as exc:
+            _raise_provider_connection_error(provider, exc)
 
         tool_calls = _extract_tool_calls(provider, raw)
 
@@ -439,3 +452,5 @@ class OpenAICompatibleClient:
                 "Please verify the base_url and whether the endpoint supports "
                 "OpenAI-compatible /chat/completions requests."
             ) from exc
+        except (ConnectionError, TimeoutError, socket.timeout) as exc:
+            _raise_provider_connection_error(provider, exc)

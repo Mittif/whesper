@@ -4,7 +4,8 @@ import json
 import unittest
 
 from whesper.config import ModelConfig, ProviderConfig
-from whesper.history_normalizer import HistoryNormalizer, _strip_tool_call_xml
+from whesper.history_normalizer import HistoryNormalizer
+from whesper.tool_protocol import sanitize_tool_call_artifacts
 from whesper.provider_profile import (
     CLAUDE_DEFAULT_PROFILE,
     DEEPSEEK_DEFAULT_PROFILE,
@@ -15,6 +16,7 @@ from whesper.provider_profile import (
     KIMI_DEFAULT_PROFILE,
     KIMI_K25_PROFILE,
     LLAMA_DEFAULT_PROFILE,
+    OLLAMA_DEFAULT_PROFILE,
     OLLAMA_QWEN_PROFILE,
     OPENAI_DEFAULT_PROFILE,
     QWEN_DEFAULT_PROFILE,
@@ -488,7 +490,7 @@ class MiniMaxToolCallTests(unittest.TestCase):
 
     def test_strip_tool_call_xml_removes_minimax_block(self) -> None:
         dirty = f"我来帮你查一下。\n{self._MINIMAX_BLOCK}"
-        clean = _strip_tool_call_xml(dirty)
+        clean = sanitize_tool_call_artifacts(dirty)
         self.assertNotIn("minimax:tool_call", clean)
         self.assertNotIn("invoke", clean)
         self.assertIn("我来帮你查一下", clean)
@@ -502,7 +504,7 @@ class MiniMaxToolCallTests(unittest.TestCase):
             "</invoke>\n"
             "</function_calls>"
         )
-        clean = _strip_tool_call_xml(dirty)
+        clean = sanitize_tool_call_artifacts(dirty)
         self.assertNotIn("function_calls", clean)
         self.assertNotIn("invoke", clean)
 
@@ -533,6 +535,232 @@ class MiniMaxToolCallTests(unittest.TestCase):
         payloads = normalizer.normalize([dirty_message])
         self.assertIn("好的，我来搜索", payloads[0]["content"])
         self.assertNotIn("minimax:tool_call", payloads[0]["content"])
+
+
+class UniversalToolCallParserTests(unittest.TestCase):
+    """Ensure every known text tool-call dialect is extractable + sanitizable."""
+
+    def _adapter(self):
+        from whesper.tool_protocol import DefaultToolProtocolAdapter
+
+        return DefaultToolProtocolAdapter()
+
+    # ---- Hermes / NousResearch / OpenChat ------------------------------
+
+    def test_hermes_tool_call_extracts_with_nested_arguments(self) -> None:
+        adapter = self._adapter()
+        content = (
+            'I will search.\n'
+            '<tool_call>{"name": "web_search", "arguments": {"query": "btc price"}}</tool_call>'
+        )
+        calls = adapter.extract_tool_calls_from_text(
+            content,
+            profile=LLAMA_DEFAULT_PROFILE,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "web_search")
+        args = json.loads(calls[0].arguments_json)
+        self.assertEqual(args, {"query": "btc price"})
+
+    def test_hermes_tool_call_multiple_blocks(self) -> None:
+        adapter = self._adapter()
+        content = (
+            '<tool_call>{"name":"a","arguments":{"x":1}}</tool_call>\n'
+            '<tool_call>{"name":"b","arguments":{"y":2}}</tool_call>'
+        )
+        calls = adapter.extract_tool_calls_from_text(
+            content,
+            profile=LLAMA_DEFAULT_PROFILE,
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].name, "a")
+        self.assertEqual(calls[1].name, "b")
+
+    def test_hermes_artifact_sanitized_from_history(self) -> None:
+        normalizer = HistoryNormalizer(OPENAI_DEFAULT_PROFILE)
+        dirty = ChatMessage(
+            role="assistant",
+            content='好的。\n<tool_call>{"name":"web_search","arguments":{"query":"a"}}</tool_call>',
+            created_at="2026-04-15T00:00:00+00:00",
+            source_profile="openai:default",
+        )
+        payloads = normalizer.normalize([dirty])
+        self.assertIn("好的", payloads[0]["content"])
+        self.assertNotIn("tool_call", payloads[0]["content"])
+
+    # ---- Llama 3.x <|python_tag|> --------------------------------------
+
+    def test_llama_python_tag_extracts(self) -> None:
+        adapter = self._adapter()
+        content = (
+            '<|python_tag|>{"name": "web_search", "parameters": {"query": "今日金价"}}<|eom_id|>'
+        )
+        calls = adapter.extract_tool_calls_from_text(
+            content,
+            profile=LLAMA_DEFAULT_PROFILE,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "web_search")
+        args = json.loads(calls[0].arguments_json)
+        self.assertEqual(args, {"query": "今日金价"})
+
+    def test_llama_python_tag_tolerates_missing_closer(self) -> None:
+        adapter = self._adapter()
+        content = '<|python_tag|>{"name": "calc", "arguments": {"a": 1}}'
+        calls = adapter.extract_tool_calls_from_text(
+            content,
+            profile=LLAMA_DEFAULT_PROFILE,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "calc")
+
+    def test_llama_python_tag_sanitized_from_history(self) -> None:
+        normalizer = HistoryNormalizer(OPENAI_DEFAULT_PROFILE)
+        dirty = ChatMessage(
+            role="assistant",
+            content='好的。\n<|python_tag|>{"name":"a","arguments":{}}<|eom_id|>',
+            created_at="2026-04-15T00:00:00+00:00",
+            source_profile="openai:default",
+        )
+        payloads = normalizer.normalize([dirty])
+        self.assertNotIn("python_tag", payloads[0]["content"])
+        self.assertNotIn("eom_id", payloads[0]["content"])
+
+    # ---- Mistral [TOOL_CALLS][…] ---------------------------------------
+
+    def test_mistral_tool_calls_extracts_list(self) -> None:
+        adapter = self._adapter()
+        content = (
+            '[TOOL_CALLS][{"name": "web_search", "arguments": {"query": "x"}}]'
+        )
+        calls = adapter.extract_tool_calls_from_text(
+            content,
+            profile=OLLAMA_DEFAULT_PROFILE,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "web_search")
+
+    def test_mistral_tool_calls_sanitized_from_history(self) -> None:
+        normalizer = HistoryNormalizer(OPENAI_DEFAULT_PROFILE)
+        dirty = ChatMessage(
+            role="assistant",
+            content='[TOOL_CALLS][{"name":"a","arguments":{}}]',
+            created_at="2026-04-15T00:00:00+00:00",
+            source_profile="openai:default",
+        )
+        payloads = normalizer.normalize([dirty])
+        self.assertNotIn("TOOL_CALLS", payloads[0]["content"])
+
+    # ---- Bare JSON fallback -------------------------------------------
+
+    def test_bare_json_tool_call_requires_arguments_field(self) -> None:
+        adapter = self._adapter()
+        # A JSON with only "name" and no args-like field should NOT be treated
+        # as a tool call — this protects against false positives from user
+        # chatter about names or records.
+        content = 'Here is a user record: {"name": "John"}'
+        calls = adapter.extract_tool_calls_from_text(
+            content,
+            profile=OLLAMA_DEFAULT_PROFILE,
+        )
+        self.assertEqual(len(calls), 0)
+
+    def test_bare_json_tool_call_accepts_name_plus_arguments(self) -> None:
+        adapter = self._adapter()
+        content = '{"name": "web_search", "arguments": {"query": "x"}}'
+        calls = adapter.extract_tool_calls_from_text(
+            content,
+            profile=OLLAMA_DEFAULT_PROFILE,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "web_search")
+
+    def test_bare_json_tool_call_accepts_name_plus_parameters(self) -> None:
+        adapter = self._adapter()
+        content = '{"name": "web_search", "parameters": {"query": "x"}}'
+        calls = adapter.extract_tool_calls_from_text(
+            content,
+            profile=OLLAMA_DEFAULT_PROFILE,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "web_search")
+
+    def test_bare_json_tool_call_accepts_tool_field(self) -> None:
+        adapter = self._adapter()
+        content = '{"tool": "web_search", "arguments": {"query": "x"}}'
+        calls = adapter.extract_tool_calls_from_text(
+            content,
+            profile=OLLAMA_DEFAULT_PROFILE,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "web_search")
+
+    # ---- Cross-format mix / ordering ----------------------------------
+
+    def test_specific_patterns_run_before_json_fallback(self) -> None:
+        """If a well-formed Hermes block is present, the Hermes extractor
+        must win over the bare-JSON fallback (tested by ordering the profile
+        patterns accordingly).  Asserting the tool name lets us detect any
+        regression in the priority order.
+        """
+        adapter = self._adapter()
+        content = (
+            '<tool_call>{"name": "hermes_call", "arguments": {"q": 1}}</tool_call>\n'
+            '{"name": "bare_call", "arguments": {"q": 2}}'
+        )
+        calls = adapter.extract_tool_calls_from_text(
+            content,
+            profile=LLAMA_DEFAULT_PROFILE,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "hermes_call")
+
+    def test_all_artifact_patterns_stripped_in_combination(self) -> None:
+        normalizer = HistoryNormalizer(OPENAI_DEFAULT_PROFILE)
+        dirty = ChatMessage(
+            role="assistant",
+            content=(
+                "prose before\n"
+                '<tool_call>{"name":"a","arguments":{}}</tool_call>\n'
+                "middle text\n"
+                '<|python_tag|>{"name":"b","arguments":{}}<|eom_id|>\n'
+                "tail text\n"
+                '[TOOL_CALLS][{"name":"c","arguments":{}}]'
+            ),
+            created_at="2026-04-15T00:00:00+00:00",
+            source_profile="openai:default",
+        )
+        payloads = normalizer.normalize([dirty])
+        rendered = payloads[0]["content"]
+        self.assertIn("prose before", rendered)
+        self.assertIn("middle text", rendered)
+        self.assertIn("tail text", rendered)
+        self.assertNotIn("tool_call", rendered)
+        self.assertNotIn("python_tag", rendered)
+        self.assertNotIn("TOOL_CALLS", rendered)
+
+    def test_code_fenced_tool_call_examples_are_preserved(self) -> None:
+        """Models often quote tool-call syntax in fenced code blocks while
+        explaining them.  Those quoted examples must NOT be stripped, or the
+        assistant's educational content gets mutilated.
+        """
+        normalizer = HistoryNormalizer(OPENAI_DEFAULT_PROFILE)
+        message = ChatMessage(
+            role="assistant",
+            content=(
+                "Here's how you'd invoke a tool:\n"
+                "```\n"
+                '<tool_call>{"name":"web_search","arguments":{"q":"x"}}</tool_call>\n'
+                "```\n"
+                "That's the syntax."
+            ),
+            created_at="2026-04-15T00:00:00+00:00",
+            source_profile="openai:default",
+        )
+        payloads = normalizer.normalize([message])
+        rendered = payloads[0]["content"]
+        self.assertIn("```", rendered)
+        self.assertIn("tool_call", rendered)  # preserved inside fence
 
 
 if __name__ == "__main__":

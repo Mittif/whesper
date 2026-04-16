@@ -4,7 +4,7 @@ import json
 
 from whesper.provider_profile import ProviderProfile
 from whesper.session import ChatMessage
-from whesper.tool_protocol import TOOL_CALL_XML_BLOCK_PATTERNS
+from whesper.tool_protocol import sanitize_tool_call_artifacts
 
 
 class HistoryNormalizer:
@@ -38,7 +38,7 @@ class HistoryNormalizer:
         payload: dict[str, object] = {"role": message.role}
 
         content = (
-            _strip_tool_call_xml(message.content)
+            sanitize_tool_call_artifacts(message.content)
             if message.role == "assistant" and message.tool_calls is None
             else message.content
         )
@@ -258,18 +258,3 @@ def _format_builtin_call_summary(tool_call: dict[str, object]) -> str:
     if arguments_text:
         return f"[previous {name} call: {arguments_text}]"
     return f"[previous {name} call]"
-
-
-def _strip_tool_call_xml(content: str) -> str:
-    """Remove leaked tool-call XML blocks from assistant message content.
-
-    When a model emits tool calls in text format (e.g. MiniMax's
-    <minimax:tool_call> wrapper) and the harness fails to extract them,
-    the raw XML is stored as the message content.  Replaying that XML
-    verbatim to subsequent models causes them to reproduce the same
-    pattern (prompt contamination).  This helper strips any such blocks
-    so the stored content stays clean.
-    """
-    for pattern in TOOL_CALL_XML_BLOCK_PATTERNS:
-        content = pattern.sub("", content)
-    return content.strip()

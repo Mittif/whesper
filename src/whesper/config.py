@@ -12,7 +12,7 @@ class ConfigError(ValueError):
     pass
 
 
-CUP_DEFAULT_BASE_URL = "http://localhost:3001"
+CUP_DEFAULT_BASE_URL = "http://esp32-cup.local"
 _CONFIG_VARIABLE_PATTERN = re.compile(
     r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)"
 )

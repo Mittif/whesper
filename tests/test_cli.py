@@ -469,7 +469,7 @@ class CliTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertTrue(outcome.handled)
         self.assertIn("control_cup tool is not available", rendered)
-        self.assertIn("local client API", rendered)
+        self.assertIn("esp32-cup.local", rendered)
 
     def test_history_command_renders_colored_cards_for_roles(self) -> None:
         config = build_config()

@@ -21,7 +21,7 @@ reasoning_keywords = ["分析", "总结", "比较", "计划", "设计", "为什�
 # Optional config-local variables for values you want to change in one place.
 #
 # [variables]
-# cup_api_base_url = "http://localhost:3001"
+# cup_api_base_url = "http://esp32-cup.local"
 
 # Optional live-context endpoints. Keep them empty if you want the companion
 # to stay intentionally narrow by default.

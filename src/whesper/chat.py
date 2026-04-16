@@ -7,6 +7,7 @@ from whesper.agent_harness import (
     AGENTIC_PLANNING_PROMPT,
     AgentHarness,
     StepCallback,
+    TOOLLESS_CONTINUE_PROMPT,
     parse_ask_user_action,
 )
 from whesper.agent_types import AskUserAction
@@ -19,7 +20,7 @@ from whesper.provider_profile import ProviderProfile, resolve_profile
 from whesper.router import RouteDecision, select_model
 from whesper.session import ChatMessage, ConversationSession, utc_now_iso
 from whesper.tool_executor import ToolExecutor
-from whesper.tool_protocol import DefaultToolProtocolAdapter
+from whesper.tool_protocol import DefaultToolProtocolAdapter, sanitize_tool_call_artifacts
 from whesper.trace import TraceStore, make_trace_event
 from whesper.tools import (
     ToolRegistry,
@@ -208,6 +209,22 @@ class ChatService:
                 messages=messages,
                 streamed=False,
             )
+            if self.harness.should_continue_tool_loop(
+                completion.content, route_mode=decision.mode, round_index=0,
+            ):
+                messages = [
+                    *messages,
+                    {"role": "assistant", "content": completion.content},
+                    {"role": "user", "content": TOOLLESS_CONTINUE_PROMPT},
+                ]
+                completion = self._client_create_chat_completion(
+                    session_id=session.session_id,
+                    decision=decision,
+                    provider=provider_config,
+                    model=model_config,
+                    messages=messages,
+                    streamed=False,
+                )
             ask_user = parse_ask_user_action(completion.content)
         return self._append_assistant_message(
             session,
@@ -255,7 +272,7 @@ class ChatService:
             ensure_reasoning_content=needs_reasoning,
         )
         if tools is None:
-            return self._stream_final_answer(
+            result = self._stream_final_answer(
                 session,
                 decision,
                 provider=provider_config,
@@ -264,6 +281,26 @@ class ChatService:
                 on_chunk=on_chunk,
                 target_profile=target_profile,
             )
+            if self.harness.should_continue_tool_loop(
+                result.assistant_message.content, route_mode=decision.mode, round_index=0,
+            ):
+                messages = [
+                    *messages,
+                    {"role": "assistant", "content": result.assistant_message.content},
+                    {"role": "user", "content": TOOLLESS_CONTINUE_PROMPT},
+                ]
+                if on_chunk is not None:
+                    on_chunk("\n\n")
+                result = self._stream_final_answer(
+                    session,
+                    decision,
+                    provider=provider_config,
+                    model=model_config,
+                    messages=messages,
+                    on_chunk=on_chunk,
+                    target_profile=target_profile,
+                )
+            return result
         run_result = self.harness.run_until_final(
             session,
             decision,
@@ -394,6 +431,7 @@ class ChatService:
         streamed: bool,
         structured_tool_arguments: bool = False,
         allow_disable_thinking: bool = True,
+        force_disable_thinking: bool = False,
     ) -> CompletionResult:
         messages = self.tool_protocol_adapter.messages_with_normalized_tool_call_ids(messages)
         self._append_trace(
@@ -412,7 +450,11 @@ class ChatService:
                 request_kwargs["tools"] = tools
             if tool_choice is not None:
                 request_kwargs["tool_choice"] = tool_choice
-            if allow_disable_thinking and self._should_disable_thinking_for_request(provider, model, tools):
+            if force_disable_thinking:
+                request_kwargs["disable_thinking"] = True
+            elif allow_disable_thinking and self._should_disable_thinking_for_request(
+                provider, model, tools
+            ):
                 request_kwargs["disable_thinking"] = True
             completion = self.client.create_chat_completion(
                 provider=provider,
@@ -510,6 +552,37 @@ class ChatService:
                 and tools is not None
                 and "tool_choice" in str(exc).casefold()
             ):
+                error_text = str(exc).casefold()
+                if (
+                    not request_kwargs.get("disable_thinking")
+                    and "thinking enabled" in error_text
+                ):
+                    self._append_trace(
+                        kind="fallback",
+                        session_id=session_id,
+                        decision=decision,
+                        provider_name=provider.name,
+                        streamed=streamed,
+                        tools_enabled=True,
+                        tool_choice=self._stringify_tool_choice(tool_choice),
+                        note=(
+                            "provider rejected tool_choice with thinking enabled; "
+                            f"retrying with disable_thinking ({exc})"
+                        ),
+                    )
+                    return self._client_create_chat_completion(
+                        session_id=session_id,
+                        decision=decision,
+                        provider=provider,
+                        model=model,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        streamed=streamed,
+                        structured_tool_arguments=structured_tool_arguments,
+                        allow_disable_thinking=False,
+                        force_disable_thinking=True,
+                    )
                 self._append_trace(
                     kind="fallback",
                     session_id=session_id,
@@ -934,6 +1007,10 @@ class ChatService:
         ask_user: AskUserAction | None = None,
         target_profile: ProviderProfile | None = None,
     ) -> ChatTurnResult:
+        # Sanitise any model-specific tool-call text artifacts that may have
+        # leaked through when text-based extraction failed.  This prevents
+        # stored content from confusing a different model on subsequent turns.
+        content = sanitize_tool_call_artifacts(content)
         source_profile_id = target_profile.profile_id if target_profile is not None else None
         assistant_message = ChatMessage(
             role="assistant",

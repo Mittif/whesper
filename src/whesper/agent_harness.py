@@ -101,14 +101,33 @@ INTERIM_TOOL_RESPONSE_MARKERS = (
     "让我看看",
     "让我查",
     "让我先搜索",
+    "让我搜索",
+    "为你搜索",
+    "帮你搜索",
+    "帮你查一下",
+    "搜索一下",
+    "正在搜索",
+    "正在查找",
+    "马上帮你",
+    "马上为你",
     "稍等",
     "稍等一下",
     "正在帮你",
     "i'll check",
+    "i'll search",
+    "i'll look",
     "let me check",
     "let me look",
     "let me search",
+    "let me find",
     "one moment",
+    "searching for",
+)
+
+TOOLLESS_CONTINUE_PROMPT = (
+    "You do not have search or browsing tools in this session. "
+    "Please answer the user's question directly based on your existing knowledge. "
+    "Do not say you will search or check — provide the answer now."
 )
 
 _ASK_USER_TAG_PATTERN = re.compile(r"<ask_user>\s*(\{.*?\})\s*</ask_user>", re.DOTALL)
