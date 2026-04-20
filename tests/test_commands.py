@@ -33,11 +33,11 @@ def make_config():
 
 class CommandTests(unittest.TestCase):
     def test_parse_command_with_arg(self) -> None:
-        command = parse_command("/model local_chat")
+        command = parse_command("/mode chat")
         self.assertIsNotNone(command)
         assert command is not None
-        self.assertEqual(command.name, "/model")
-        self.assertEqual(command.arg, "local_chat")
+        self.assertEqual(command.name, "/mode")
+        self.assertEqual(command.arg, "chat")
 
     def test_parse_search_with_arg_is_treated_as_chat_input(self) -> None:
         self.assertIsNone(parse_command("/search latest release notes"))
@@ -63,10 +63,8 @@ class CommandTests(unittest.TestCase):
             self.assertIn("/clear", completions)
             self.assertIn("/search", completions)
             self.assertIn("/trace", completions)
-            self.assertIn("/model", completions)
-            self.assertIn("chat", completions["/model"])
-            self.assertIn("/use", completions)
-            self.assertIn("chat", completions["/use"])
+            self.assertNotIn("/model", completions)
+            self.assertNotIn("/use", completions)
             self.assertIn("/status", completions)
             self.assertIn("/info", completions)
             self.assertIn("/retry", completions)

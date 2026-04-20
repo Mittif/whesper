@@ -1,7 +1,10 @@
 [app]
 storage_dir = ".whesper"
 default_session = "main"
-history_limit = 16
+history_limit = 16          # only used when context_strategy = "full_transcript"
+context_strategy = "memory_first"
+recent_history_limit = 4    # recent transcript messages kept in model context
+tool_exposure_strategy = "model_first"  # let the model infer tool use from intent; use "matched_only" for strict keyword gating
 
 [persona]
 name = "Whesper"

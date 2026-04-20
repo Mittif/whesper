@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import time
 from typing import Callable
 
 from whesper.agent_harness import (
@@ -10,7 +12,8 @@ from whesper.agent_harness import (
     TOOLLESS_CONTINUE_PROMPT,
     parse_ask_user_action,
 )
-from whesper.agent_types import AskUserAction
+from whesper.agent_types import AskUserAction, AskUserOption
+from whesper.agent_types import ToolInvocation
 from whesper.client import CompletionResult, OpenAICompatibleClient, ProviderError, ToolCall
 from whesper.config import AppConfig
 from whesper.live_data import LiveContextService
@@ -24,6 +27,7 @@ from whesper.tool_protocol import DefaultToolProtocolAdapter, sanitize_tool_call
 from whesper.trace import TraceStore, make_trace_event
 from whesper.tools import (
     ToolRegistry,
+    ToolExecutionError,
     _matches_cup_control_intent,
     _matches_cup_scene_followup,
 )
@@ -34,6 +38,22 @@ class ChatTurnResult:
     decision: RouteDecision
     assistant_message: ChatMessage
     ask_user: AskUserAction | None = None
+
+
+@dataclass(slots=True)
+class CupPreflightResult:
+    prompt: str | None = None
+    status_payload: dict[str, object] | None = None
+
+
+@dataclass(slots=True)
+class CupStatusSnapshot:
+    connected: bool
+    motor_target: float | None
+    motor_enabled: bool | None
+    led_color: str | None
+    led_blink_hz: float | None
+    led_blink_mode: int | None
 
 
 class GenerationInterrupted(RuntimeError):
@@ -77,6 +97,8 @@ class ChatService:
             tool_choice_builder=self._tool_choice_for_request,
             reasoning_content_resolver=self._tool_message_reasoning_content,
             trace_emitter=self._append_trace,
+            tool_result_observer=self._capture_tool_result_memory,
+            tool_call_guard=self._guard_tool_call,
             max_rounds=self.MAX_AGENT_ROUNDS,
         )
 
@@ -156,6 +178,7 @@ class ChatService:
         mode_override: str = "auto",
         on_step: StepCallback | None = None,
     ) -> ChatTurnResult:
+        turn_start_index = len(session.messages)
         decision = select_model(
             self.config,
             user_text,
@@ -166,6 +189,12 @@ class ChatService:
         model_config = self.config.get_model(decision.model_alias)
         provider_config = self.config.get_provider(model_config.provider)
         target_profile = resolve_profile(provider_config, model_config)
+        cup_preflight = self._cup_preflight(
+            session_id=session.session_id,
+            decision=decision,
+            provider_name=provider_config.name,
+        )
+        cup_preflight_prompt = cup_preflight.prompt
         tools = self._tools_for_request(
             session=session,
             provider=provider_config,
@@ -181,7 +210,9 @@ class ChatService:
             target_profile=target_profile,
             user_text=user_text,
             route_mode=decision.mode,
+            preflight_prompt=cup_preflight_prompt,
             include_live_context=tools is None,
+            include_tool_prompt=tools is not None,
             ensure_reasoning_content=needs_reasoning,
         )
         if tools is not None:
@@ -195,6 +226,7 @@ class ChatService:
                 route_mode=decision.mode,
                 tools=tools,
                 target_profile=target_profile,
+                preflight_prompt=cup_preflight_prompt,
                 on_step=on_step,
                 ensure_reasoning_content=needs_reasoning,
             )
@@ -226,12 +258,19 @@ class ChatService:
                     streamed=False,
                 )
             ask_user = parse_ask_user_action(completion.content)
-        return self._append_assistant_message(
+        turn_result = self._append_assistant_message(
             session,
             decision,
             ask_user.prompt if ask_user is not None else completion.content,
             ask_user=ask_user,
             target_profile=target_profile,
+        )
+        return self._finalize_cup_turn_feedback(
+            session,
+            user_text=user_text,
+            turn_start_index=turn_start_index,
+            preflight_status_payload=cup_preflight.status_payload,
+            turn_result=turn_result,
         )
 
     def _complete_turn_stream(
@@ -243,7 +282,7 @@ class ChatService:
         on_chunk: Callable[[str], None] | None = None,
         on_step: StepCallback | None = None,
     ) -> ChatTurnResult:
-
+        turn_start_index = len(session.messages)
         decision = select_model(
             self.config,
             user_text,
@@ -254,6 +293,12 @@ class ChatService:
         model_config = self.config.get_model(decision.model_alias)
         provider_config = self.config.get_provider(model_config.provider)
         target_profile = resolve_profile(provider_config, model_config)
+        cup_preflight = self._cup_preflight(
+            session_id=session.session_id,
+            decision=decision,
+            provider_name=provider_config.name,
+        )
+        cup_preflight_prompt = cup_preflight.prompt
         tools = self._tools_for_request(
             session=session,
             provider=provider_config,
@@ -268,7 +313,9 @@ class ChatService:
             target_profile=target_profile,
             user_text=user_text,
             route_mode=decision.mode,
+            preflight_prompt=cup_preflight_prompt,
             include_live_context=tools is None,
+            include_tool_prompt=tools is not None,
             ensure_reasoning_content=needs_reasoning,
         )
         if tools is None:
@@ -300,7 +347,14 @@ class ChatService:
                     on_chunk=on_chunk,
                     target_profile=target_profile,
                 )
-            return result
+            return self._finalize_cup_turn_feedback(
+                session,
+                user_text=user_text,
+                turn_start_index=turn_start_index,
+                preflight_status_payload=cup_preflight.status_payload,
+                turn_result=result,
+                on_chunk=on_chunk,
+            )
         run_result = self.harness.run_until_final(
             session,
             decision,
@@ -311,11 +365,12 @@ class ChatService:
             route_mode=decision.mode,
             tools=tools,
             target_profile=target_profile,
+            preflight_prompt=cup_preflight_prompt,
             on_step=on_step,
             ensure_reasoning_content=needs_reasoning,
         )
         if run_result.final_messages is not None:
-            return self._stream_final_answer(
+            result = self._stream_final_answer(
                 session,
                 decision,
                 provider=provider_config,
@@ -324,25 +379,49 @@ class ChatService:
                 on_chunk=on_chunk,
                 target_profile=target_profile,
             )
+            return self._finalize_cup_turn_feedback(
+                session,
+                user_text=user_text,
+                turn_start_index=turn_start_index,
+                preflight_status_payload=cup_preflight.status_payload,
+                turn_result=result,
+                on_chunk=on_chunk,
+            )
         completion = run_result.completion
         ask_user = run_result.ask_user
         if ask_user is not None:
             if on_chunk is not None and ask_user.prompt:
                 on_chunk(ask_user.prompt)
-            return self._append_assistant_message(
+            result = self._append_assistant_message(
                 session,
                 decision,
                 ask_user.prompt,
                 ask_user=ask_user,
                 target_profile=target_profile,
             )
+            return self._finalize_cup_turn_feedback(
+                session,
+                user_text=user_text,
+                turn_start_index=turn_start_index,
+                preflight_status_payload=cup_preflight.status_payload,
+                turn_result=result,
+                on_chunk=on_chunk,
+            )
         if on_chunk is not None and completion.content:
             on_chunk(completion.content)
-        return self._append_assistant_message(
+        result = self._append_assistant_message(
             session,
             decision,
             completion.content,
             target_profile=target_profile,
+        )
+        return self._finalize_cup_turn_feedback(
+            session,
+            user_text=user_text,
+            turn_start_index=turn_start_index,
+            preflight_status_payload=cup_preflight.status_payload,
+            turn_result=result,
+            on_chunk=on_chunk,
         )
 
     def _last_user_index(self, session: ConversationSession) -> int | None:
@@ -399,8 +478,10 @@ class ChatService:
         target_profile: ProviderProfile,
         user_text: str,
         route_mode: str,
+        preflight_prompt: str | None = None,
         include_planning_prompt: bool = True,
         include_live_context: bool = True,
+        include_tool_prompt: bool = True,
         ensure_reasoning_content: bool = False,
     ) -> list[dict[str, object]]:
         planning_prompt = AGENTIC_PLANNING_PROMPT if include_planning_prompt else None
@@ -411,8 +492,287 @@ class ChatService:
             user_text=user_text,
             route_mode=route_mode,
             planning_prompt=planning_prompt,
+            preflight_prompt=preflight_prompt,
             include_live_context=include_live_context,
+            include_tool_prompt=include_tool_prompt,
             ensure_reasoning_content=ensure_reasoning_content,
+        )
+
+    def _cup_preflight(
+        self,
+        *,
+        session_id: str,
+        decision: RouteDecision,
+        provider_name: str,
+    ) -> CupPreflightResult:
+        if self.tool_registry.spec_for_name("control_cup") is None:
+            return CupPreflightResult()
+        try:
+            result = self.tool_executor.execute(
+                ToolInvocation(
+                    tool_call_id=f"cup-preflight-{time.time_ns()}",
+                    name="control_cup",
+                    arguments_json='{"action":"status"}',
+                )
+            )
+        except ToolExecutionError as exc:
+            self._append_trace(
+                kind="cup_preflight",
+                session_id=session_id,
+                decision=decision,
+                provider_name=provider_name,
+                streamed=False,
+                tools_enabled=True,
+                note="disconnected",
+                preview=str(exc),
+            )
+            return CupPreflightResult()
+
+        try:
+            payload = json.loads(result.content)
+        except json.JSONDecodeError:
+            self._append_trace(
+                kind="cup_preflight",
+                session_id=session_id,
+                decision=decision,
+                provider_name=provider_name,
+                streamed=False,
+                tools_enabled=True,
+                note="invalid_payload",
+                preview=result.content,
+            )
+            return CupPreflightResult()
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            self._append_trace(
+                kind="cup_preflight",
+                session_id=session_id,
+                decision=decision,
+                provider_name=provider_name,
+                streamed=False,
+                tools_enabled=True,
+                note="not_connected",
+                preview=result.content,
+            )
+            return CupPreflightResult()
+
+        preflight_prompt = self._cup_connected_preflight_prompt(payload)
+        self._append_trace(
+            kind="cup_preflight",
+            session_id=session_id,
+            decision=decision,
+            provider_name=provider_name,
+            streamed=False,
+            tools_enabled=True,
+            note="connected",
+            preview=preflight_prompt,
+        )
+        return CupPreflightResult(
+            prompt=preflight_prompt,
+            status_payload=payload,
+        )
+
+    def _cup_preflight_prompt(
+        self,
+        *,
+        session_id: str,
+        decision: RouteDecision,
+        provider_name: str,
+    ) -> str | None:
+        return self._cup_preflight(
+            session_id=session_id,
+            decision=decision,
+            provider_name=provider_name,
+        ).prompt
+
+    def _cup_connected_preflight_prompt(self, payload: dict[str, object]) -> str:
+        device = payload.get("device")
+        motor_snapshot = payload.get("motor")
+        motor_target = self._first_numeric_value(
+            motor_snapshot,
+            keys=("target", "target_velocity", "vel", "velocity"),
+        )
+        motor_enabled = self._first_bool_value(
+            motor_snapshot,
+            keys=("enabled", "running", "on"),
+        )
+
+        lines = [
+            "CUP preflight: device connection check succeeded via status API right before this turn.",
+            "CUP is currently reachable, so map semantically similar ambiguous intent to possible CUP control actions when context fits.",
+            "Semantic mapping hints: '刺激一点/更猛/再快一点' -> nudge_intensity up; '温柔点/慢一点/缓一缓' -> nudge_intensity down; mood/light color requests -> set_led or apply_scene.",
+            "If the user appears to only chat (not control hardware), keep it conversational and do not force tool calls.",
+        ]
+        if isinstance(device, str) and device.strip():
+            lines.append(f"- connected_device: {device.strip()}")
+        if motor_target is not None:
+            lines.append(f"- current_motor_target_velocity: {motor_target:g}")
+        if motor_enabled is not None:
+            lines.append(
+                f"- current_motor_enabled: {'true' if motor_enabled else 'false'}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _first_numeric_value(
+        payload: object,
+        *,
+        keys: tuple[str, ...],
+    ) -> float | None:
+        if not isinstance(payload, dict):
+            return None
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                normalized = value.strip()
+                if not normalized:
+                    continue
+                try:
+                    return float(normalized)
+                except ValueError:
+                    continue
+        return None
+
+    @staticmethod
+    def _first_bool_value(
+        payload: object,
+        *,
+        keys: tuple[str, ...],
+    ) -> bool | None:
+        if not isinstance(payload, dict):
+            return None
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, int) and value in {0, 1}:
+                return bool(value)
+            if isinstance(value, str):
+                normalized = value.strip().casefold()
+                if normalized in {"true", "1", "on", "enabled", "running"}:
+                    return True
+                if normalized in {"false", "0", "off", "disabled", "stopped"}:
+                    return False
+        return None
+
+    def _capture_tool_result_memory(
+        self,
+        session_id: str,
+        tool_name: str,
+        content: str,
+    ) -> None:
+        if self.memory_service is None:
+            return
+        self.memory_service.capture_tool_result(session_id, tool_name, content)
+
+    def _guard_tool_call(
+        self,
+        session: ConversationSession,
+        tool_call: ToolCall,
+        user_text: str,
+        route_mode: str,
+    ) -> AskUserAction | None:
+        spec = self.tool_registry.spec_for_name(tool_call.name)
+        if spec is None or not spec.execution_meta.side_effectful:
+            return None
+        if tool_call.name == "control_cup":
+            if self._should_require_cup_followup_tool_choice(session, user_text):
+                return None
+            return self._confirm_cup_control_action(tool_call, user_text)
+        if spec.should_offer is None or spec.should_offer(user_text, route_mode):
+            return None
+        return self._confirm_side_effectful_action(tool_call.name, user_text)
+
+    def _confirm_cup_control_action(
+        self,
+        tool_call: ToolCall,
+        user_text: str,
+    ) -> AskUserAction:
+        normalized_request = " ".join(user_text.split()) or "刚才那句请求"
+        confirm_value = self._cup_confirmation_value(tool_call, normalized_request)
+        return AskUserAction(
+            prompt="你是想让我直接调节 CUP 设备吗？如果确认，我就按你刚才的意思执行。",
+            options=(
+                AskUserOption(
+                    label="确认执行",
+                    value=confirm_value,
+                    description="立即按刚才的意思控制设备",
+                ),
+                AskUserOption(
+                    label="先看状态",
+                    value="先查看 CUP 设备当前状态，再告诉我。",
+                    description="先查状态，不直接改动设备",
+                ),
+                AskUserOption(
+                    label="先别执行",
+                    value="先不要控制 CUP 设备，只用文字回复我。",
+                    description="不改设备，只继续聊天",
+                ),
+            ),
+            allow_free_text=True,
+            field_name="cup_control_confirmation",
+        )
+
+    def _cup_confirmation_value(
+        self,
+        tool_call: ToolCall,
+        normalized_request: str,
+    ) -> str:
+        try:
+            arguments = tool_call.arguments()
+        except Exception:
+            arguments = {}
+        action = str(arguments.get("action", "")).strip().casefold()
+        if action == "status":
+            return f"请直接查看 CUP 设备状态，按我刚才这句理解：{normalized_request}"
+        if action == "set_led":
+            return f"请直接调整 CUP 设备灯光，按我刚才这句执行：{normalized_request}"
+        if action == "set_motor":
+            target = arguments.get("target_velocity")
+            if isinstance(target, (int, float)):
+                return f"请直接把 CUP 速度设到 {target:g}，并执行。"
+            return f"请直接设置 CUP 速度，按我刚才这句执行：{normalized_request}"
+        if action == "stop":
+            return "请直接停止 CUP 设备。"
+        if action == "apply_scene":
+            scene = str(arguments.get("scene", "")).strip()
+            if scene:
+                return f"请直接把 CUP 切到 {scene} 模式。"
+            return f"请直接切换 CUP 模式，按我刚才这句执行：{normalized_request}"
+        if action == "nudge_intensity":
+            direction = str(arguments.get("direction", "")).strip().casefold()
+            if direction == "up":
+                return f"请直接把 CUP 调快一点、更刺激一点，按我刚才这句执行：{normalized_request}"
+            if direction == "down":
+                return f"请直接把 CUP 放缓一点、轻一点，按我刚才这句执行：{normalized_request}"
+            return f"请直接调整 CUP 强度，按我刚才这句执行：{normalized_request}"
+        return f"请直接控制 CUP 设备，按我刚才这句执行：{normalized_request}"
+
+    def _confirm_side_effectful_action(
+        self,
+        tool_name: str,
+        user_text: str,
+    ) -> AskUserAction:
+        normalized_request = " ".join(user_text.split()) or "刚才那句请求"
+        return AskUserAction(
+            prompt=f"你是想让我直接执行 {tool_name} 这个操作吗？",
+            options=(
+                AskUserOption(
+                    label="确认执行",
+                    value=f"请直接执行 {tool_name}，按我刚才这句执行：{normalized_request}",
+                    description="继续执行这个操作",
+                ),
+                AskUserOption(
+                    label="先别执行",
+                    value=f"先不要执行 {tool_name}，只用文字回复我。",
+                    description="先不触发外部操作",
+                ),
+            ),
+            allow_free_text=True,
+            field_name="side_effect_confirmation",
         )
 
     def _tool_call_payload(self, tool_call: ToolCall) -> dict[str, object]:
@@ -743,7 +1103,10 @@ class ChatService:
         if not _matches_cup_scene_followup(user_text):
             return False
         recent_messages = session.messages[-6:]
-        context_keywords = ("cup", "飞机杯", "motor", "转速", "震动", "振动", "马达", "电机")
+        context_keywords = (
+            "cup", "飞机杯", "motor", "转速", "震动", "振动", "马达", "电机",
+            "灯", "led", "灯光", "颜色", "灯色",
+        )
         for message in reversed(recent_messages):
             if message.role == "tool" and message.name == "control_cup":
                 return True
@@ -757,6 +1120,445 @@ class ChatService:
             if any(keyword in normalized for keyword in context_keywords):
                 return True
         return False
+
+    def _finalize_cup_turn_feedback(
+        self,
+        session: ConversationSession,
+        *,
+        user_text: str,
+        turn_start_index: int,
+        preflight_status_payload: dict[str, object] | None,
+        turn_result: ChatTurnResult,
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> ChatTurnResult:
+        del user_text
+        feedback = self._cup_turn_feedback_text(
+            session,
+            turn_start_index=turn_start_index,
+            preflight_status_payload=preflight_status_payload,
+        )
+        if feedback is None:
+            return turn_result
+        current_content = turn_result.assistant_message.content.strip()
+        next_content = feedback if not current_content else f"{current_content}\n\n{feedback}"
+        turn_result.assistant_message.content = next_content
+        self._update_transcript_assistant_content(
+            session,
+            assistant_message=turn_result.assistant_message,
+            content=next_content,
+        )
+        if on_chunk is not None:
+            on_chunk(f"\n\n{feedback}")
+        model_config = self.config.get_model(turn_result.decision.model_alias)
+        provider_config = self.config.get_provider(model_config.provider)
+        self._append_trace(
+            kind="cup_verification",
+            session_id=session.session_id,
+            decision=turn_result.decision,
+            provider_name=provider_config.name,
+            streamed=False,
+            tools_enabled=True,
+            preview=feedback,
+        )
+        return turn_result
+
+    def _cup_turn_feedback_text(
+        self,
+        session: ConversationSession,
+        *,
+        turn_start_index: int,
+        preflight_status_payload: dict[str, object] | None,
+    ) -> str | None:
+        control_tool_messages = [
+            message
+            for message in session.messages[turn_start_index:]
+            if message.role == "tool" and message.name == "control_cup"
+        ]
+        if not control_tool_messages:
+            return None
+
+        parsed_payloads: list[dict[str, object]] = []
+        raw_failures: list[str] = []
+        for message in control_tool_messages:
+            content = message.content.strip()
+            if not content:
+                continue
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError:
+                raw_failures.append(self._short_preview(content))
+                continue
+            if not isinstance(payload, dict):
+                raw_failures.append(self._short_preview(content))
+                continue
+            parsed_payloads.append(payload)
+            if payload.get("ok") is not True:
+                raw_failures.append(
+                    self._short_preview(
+                        str(payload.get("error") or payload.get("message") or content)
+                    )
+                )
+
+        side_effect_payloads = [
+            payload
+            for payload in parsed_payloads
+            if isinstance(payload.get("action"), str)
+            and str(payload.get("action")).strip().casefold() != "status"
+        ]
+        if not side_effect_payloads:
+            if raw_failures:
+                first_error = raw_failures[0]
+                return (
+                    "设备执行结果：执行失败。"
+                    f"工具返回错误：{first_error}"
+                )
+            return None
+
+        pre_snapshot = self._cup_status_snapshot_from_payload(preflight_status_payload)
+        post_status_payload, post_error = self._cup_fetch_status_payload()
+        post_snapshot = self._cup_status_snapshot_from_payload(post_status_payload)
+
+        evaluations: list[tuple[str, str]] = []
+        if raw_failures:
+            evaluations.append(
+                (
+                    "failure",
+                    f"工具返回错误：{raw_failures[0]}",
+                )
+            )
+        for payload in side_effect_payloads:
+            evaluations.append(
+                self._evaluate_cup_action_payload(
+                    payload,
+                    pre_snapshot=pre_snapshot,
+                    post_snapshot=post_snapshot,
+                )
+            )
+
+        if post_error is not None:
+            evaluations.append(("unknown", f"执行后状态读取失败：{post_error}"))
+
+        statuses = {status for status, _ in evaluations}
+        details = "; ".join(detail for _, detail in evaluations if detail)[:360]
+        if "failure" in statuses:
+            if details:
+                return f"设备执行结果：未达预期。{details}"
+            return "设备执行结果：未达预期。"
+        if statuses == {"success"}:
+            if details:
+                return f"设备执行结果：执行前后状态校验通过。{details}"
+            return "设备执行结果：执行前后状态校验通过。"
+        if details:
+            return f"设备执行结果：已发送指令，但状态校验信息不足。{details}"
+        return "设备执行结果：已发送指令，但状态校验信息不足。"
+
+    def _cup_fetch_status_payload(self) -> tuple[dict[str, object] | None, str | None]:
+        if self.tool_registry.spec_for_name("control_cup") is None:
+            return None, "control_cup tool unavailable"
+        try:
+            result = self.tool_executor.execute(
+                ToolInvocation(
+                    tool_call_id=f"cup-verify-{time.time_ns()}",
+                    name="control_cup",
+                    arguments_json='{"action":"status"}',
+                )
+            )
+        except ToolExecutionError as exc:
+            return None, self._short_preview(str(exc), limit=160)
+        try:
+            payload = json.loads(result.content)
+        except json.JSONDecodeError:
+            return None, "status payload is not valid JSON"
+        if not isinstance(payload, dict):
+            return None, "status payload is not an object"
+        if payload.get("ok") is not True:
+            return None, self._short_preview(str(payload), limit=160)
+        return payload, None
+
+    def _cup_status_snapshot_from_payload(
+        self,
+        payload: dict[str, object] | None,
+    ) -> CupStatusSnapshot | None:
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("ok") is not True:
+            return None
+        system = payload.get("system")
+        motor = payload.get("motor")
+        connected = True
+        if isinstance(system, dict):
+            connected_value = self._first_bool_value(
+                system,
+                keys=("connected", "online", "reachable"),
+            )
+            if connected_value is not None:
+                connected = connected_value
+        motor_target = self._first_numeric_value(
+            motor,
+            keys=("target", "target_velocity", "vel", "velocity"),
+        )
+        motor_enabled = self._first_bool_value(
+            motor,
+            keys=("enabled", "running", "on"),
+        )
+        led_color = None
+        led_blink_hz = None
+        led_blink_mode = None
+        if isinstance(system, dict):
+            led_color = self._first_hex_color_value(
+                system,
+                keys=("led_color", "color"),
+            )
+            led_blink_hz = self._first_numeric_value(
+                system,
+                keys=("led_blink_hz", "blink_hz", "blinkHz"),
+            )
+            blink_mode_value = self._first_numeric_value(
+                system,
+                keys=("led_blink_mode", "blink_mode", "blinkMode"),
+            )
+            if blink_mode_value is not None:
+                led_blink_mode = int(round(blink_mode_value))
+        return CupStatusSnapshot(
+            connected=connected,
+            motor_target=motor_target,
+            motor_enabled=motor_enabled,
+            led_color=led_color,
+            led_blink_hz=led_blink_hz,
+            led_blink_mode=led_blink_mode,
+        )
+
+    def _evaluate_cup_action_payload(
+        self,
+        payload: dict[str, object],
+        *,
+        pre_snapshot: CupStatusSnapshot | None,
+        post_snapshot: CupStatusSnapshot | None,
+    ) -> tuple[str, str]:
+        action = str(payload.get("action", "")).strip().casefold()
+        if payload.get("ok") is not True:
+            return "failure", f"{action or 'control_cup'} 返回 ok=false"
+        if post_snapshot is None:
+            return "unknown", "执行后状态不可用，无法校验"
+        if not post_snapshot.connected:
+            return "failure", "执行后设备离线"
+
+        if action in {"set_motor", "stop", "nudge_intensity"}:
+            return self._evaluate_cup_motor_outcome(
+                payload,
+                action=action,
+                pre_snapshot=pre_snapshot,
+                post_snapshot=post_snapshot,
+            )
+        if action == "apply_scene":
+            motor_status, motor_detail = self._evaluate_cup_motor_outcome(
+                payload,
+                action=action,
+                pre_snapshot=pre_snapshot,
+                post_snapshot=post_snapshot,
+            )
+            scene_led_payload = {"requested": payload.get("led")}
+            led_status, led_detail = self._evaluate_cup_led_outcome(
+                scene_led_payload,
+                post_snapshot=post_snapshot,
+            )
+            statuses = {motor_status, led_status}
+            if "failure" in statuses:
+                if motor_status == "failure":
+                    return "failure", motor_detail
+                return "failure", led_detail
+            if statuses == {"success"}:
+                return "success", f"{motor_detail}; {led_detail}"
+            if motor_status == "unknown" and led_status == "success":
+                return "unknown", motor_detail
+            if led_status == "unknown" and motor_status == "success":
+                return "unknown", led_detail
+            return "unknown", f"{motor_detail}; {led_detail}"
+        if action == "set_led":
+            return self._evaluate_cup_led_outcome(payload, post_snapshot=post_snapshot)
+        return "unknown", f"{action or 'control_cup'} 已执行，但暂无匹配校验规则"
+
+    def _evaluate_cup_motor_outcome(
+        self,
+        payload: dict[str, object],
+        *,
+        action: str,
+        pre_snapshot: CupStatusSnapshot | None,
+        post_snapshot: CupStatusSnapshot,
+    ) -> tuple[str, str]:
+        if action == "stop":
+            stopped = (
+                post_snapshot.motor_enabled is False
+                or (
+                    post_snapshot.motor_target is not None
+                    and post_snapshot.motor_target <= 1.0
+                )
+            )
+            if stopped:
+                return "success", "电机已停下"
+            return "failure", "电机仍在运行"
+
+        requested = payload.get("requested")
+        if not isinstance(requested, dict):
+            requested = payload.get("motor") if isinstance(payload.get("motor"), dict) else {}
+        expected_target = self._first_numeric_value(
+            requested,
+            keys=("target_velocity", "target", "vel"),
+        )
+        expected_enabled = self._first_bool_value(
+            requested,
+            keys=("enabled", "running", "on"),
+        )
+        if action == "nudge_intensity":
+            expected_target = self._first_numeric_value(
+                payload,
+                keys=("target_velocity",),
+            ) or expected_target
+
+        if expected_enabled is not None:
+            if post_snapshot.motor_enabled is None:
+                return "unknown", "电机开关状态不可用"
+            if post_snapshot.motor_enabled != expected_enabled:
+                return (
+                    "failure",
+                    f"电机开关不符合预期（expected={expected_enabled}, actual={post_snapshot.motor_enabled}）",
+                )
+        if expected_target is not None:
+            if post_snapshot.motor_target is None:
+                return "unknown", "电机目标转速不可用"
+            if abs(post_snapshot.motor_target - expected_target) > 3.5:
+                return (
+                    "failure",
+                    f"电机目标转速不符合预期（expected≈{expected_target:g}, actual={post_snapshot.motor_target:g}）",
+                )
+            return "success", f"电机目标转速已到 {post_snapshot.motor_target:g}"
+
+        if (
+            action == "nudge_intensity"
+            and pre_snapshot is not None
+            and pre_snapshot.motor_target is not None
+            and post_snapshot.motor_target is not None
+        ):
+            direction = str(payload.get("direction", "")).strip().casefold()
+            delta = post_snapshot.motor_target - pre_snapshot.motor_target
+            if direction == "up":
+                if delta >= 0.8:
+                    return "success", f"电机转速已上调到 {post_snapshot.motor_target:g}"
+                return (
+                    "failure",
+                    f"电机转速未明显上调（before={pre_snapshot.motor_target:g}, after={post_snapshot.motor_target:g}）",
+                )
+            if direction == "down":
+                if delta <= -0.8:
+                    return "success", f"电机转速已下调到 {post_snapshot.motor_target:g}"
+                return (
+                    "failure",
+                    f"电机转速未明显下调（before={pre_snapshot.motor_target:g}, after={post_snapshot.motor_target:g}）",
+                )
+        return "unknown", f"{action} 已执行，但电机参数不足以校验"
+
+    def _evaluate_cup_led_outcome(
+        self,
+        payload: dict[str, object],
+        *,
+        post_snapshot: CupStatusSnapshot,
+    ) -> tuple[str, str]:
+        requested = payload.get("requested")
+        if not isinstance(requested, dict):
+            requested = {}
+        expected_color = self._first_hex_color_value(requested, keys=("color", "led_color"))
+        expected_blink_hz = self._first_numeric_value(
+            requested,
+            keys=("blink_hz", "blinkHz", "led_blink_hz"),
+        )
+        expected_blink_mode = self._first_numeric_value(
+            requested,
+            keys=("blink_mode", "blinkMode", "led_blink_mode"),
+        )
+
+        checks: list[tuple[bool, str]] = []
+        if expected_color is not None:
+            if post_snapshot.led_color is None:
+                return "unknown", "LED 颜色状态不可用"
+            checks.append(
+                (
+                    post_snapshot.led_color.casefold() == expected_color.casefold(),
+                    f"LED 颜色 expected={expected_color}, actual={post_snapshot.led_color}",
+                )
+            )
+        if expected_blink_hz is not None:
+            if post_snapshot.led_blink_hz is None:
+                return "unknown", "LED 闪烁频率状态不可用"
+            checks.append(
+                (
+                    abs(post_snapshot.led_blink_hz - expected_blink_hz) <= 0.15,
+                    f"LED 闪烁频率 expected≈{expected_blink_hz:g}, actual={post_snapshot.led_blink_hz:g}",
+                )
+            )
+        if expected_blink_mode is not None:
+            expected_mode = int(round(expected_blink_mode))
+            if post_snapshot.led_blink_mode is None:
+                return "unknown", "LED 闪烁模式状态不可用"
+            checks.append(
+                (
+                    post_snapshot.led_blink_mode == expected_mode,
+                    f"LED 模式 expected={expected_mode}, actual={post_snapshot.led_blink_mode}",
+                )
+            )
+
+        if not checks:
+            return "unknown", "set_led 已执行，但缺少可校验参数"
+        failures = [detail for ok, detail in checks if not ok]
+        if failures:
+            return "failure", failures[0]
+        return "success", "LED 状态已按预期更新"
+
+    def _update_transcript_assistant_content(
+        self,
+        session: ConversationSession,
+        *,
+        assistant_message: ChatMessage,
+        content: str,
+    ) -> None:
+        for message in reversed(session.transcript_messages):
+            if message.role != "assistant":
+                continue
+            if message.created_at != assistant_message.created_at:
+                continue
+            message.content = content
+            return
+
+    @staticmethod
+    def _first_hex_color_value(
+        payload: object,
+        *,
+        keys: tuple[str, ...],
+    ) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                if 0 <= value <= 0xFFFFFF:
+                    return f"#{value:06x}"
+            if not isinstance(value, str):
+                continue
+            normalized = value.strip().casefold()
+            if not normalized:
+                continue
+            if normalized.startswith("0x"):
+                try:
+                    numeric = int(normalized, 16)
+                except ValueError:
+                    continue
+                if 0 <= numeric <= 0xFFFFFF:
+                    return f"#{numeric:06x}"
+                continue
+            if normalized.startswith("#"):
+                normalized = normalized[1:]
+            if len(normalized) == 6 and all(ch in "0123456789abcdef" for ch in normalized):
+                return f"#{normalized}"
+        return None
 
     @staticmethod
     def _kimi_web_search_tool() -> dict[str, object]:

@@ -236,6 +236,32 @@ class AskUserFollowupClient:
         raise AssertionError("streaming should not be called in this test")
 
 
+class CupConfirmationClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
+        self.calls.append(
+            {"messages": messages, "tools": tools, "tool_choice": tool_choice}
+        )
+        if len(self.calls) in {1, 2}:
+            return CompletionResult(
+                content="",
+                raw_response={},
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id=f"cup_call_{len(self.calls)}",
+                        name="control_cup",
+                        arguments_json='{"action":"nudge_intensity","direction":"up"}',
+                    ),
+                ),
+            )
+        return CompletionResult(content="已经帮你调快一点。", raw_response={})
+
+    def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
+        raise AssertionError("streaming should not be called in this test")
+
+
 class KimiBuiltinWebSearchClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -447,6 +473,30 @@ class OllamaStructuredArgumentsClient:
         if not isinstance(arguments, dict):
             raise AssertionError("tool arguments should be normalized to an object")
         return CompletionResult(content="ollama follow-up ok", raw_response={})
+
+    def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
+        raise AssertionError("streaming should not be called in this test")
+
+
+class CupVerificationClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def create_chat_completion(self, provider, model, messages, *, tools=None, tool_choice=None):
+        self.calls += 1
+        if self.calls == 1:
+            return CompletionResult(
+                content="",
+                raw_response={},
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="cup_verify_1",
+                        name="control_cup",
+                        arguments_json='{"action":"set_motor","target_velocity":65,"enabled":true}',
+                    ),
+                ),
+            )
+        return CompletionResult(content="已帮你调整速度。", raw_response={})
 
     def create_chat_completion_stream(self, provider, model, messages, *, tools=None, tool_choice=None):
         raise AssertionError("streaming should not be called in this test")
@@ -725,7 +775,8 @@ def make_cup_registry() -> ToolRegistry:
                 ),
                 execution_meta=ToolExecutionMeta(side_effectful=True),
             ),
-        )
+        ),
+        exposure_strategy="matched_only",
     )
 
 
@@ -875,6 +926,101 @@ class ChatTests(unittest.TestCase):
         self.assertIn("Live weather data for the user's current local area", system_prompt)
         self.assertIn("- location: Shanghai", system_prompt)
 
+    def test_send_stream_injects_cup_connected_preflight_prompt(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        preflight_arguments: list[dict[str, object]] = []
+
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="control_cup",
+                    description="Control the CUP hardware",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"action": {"type": "string"}},
+                        "required": ["action"],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda arguments: (
+                        preflight_arguments.append(arguments) or {
+                            "ok": True,
+                            "device": "http://esp32-cup.local",
+                            "action": "status",
+                            "system": {"connected": True},
+                            "motor": {"target": 48, "enabled": True},
+                        }
+                    ),
+                    should_offer=lambda user_text, route_mode: _matches_cup_control_intent(
+                        user_text
+                    ),
+                    execution_meta=ToolExecutionMeta(side_effectful=True),
+                ),
+            )
+        )
+        client = CapturingClient()
+        service = ChatService(config, client=client, tool_registry=registry)
+
+        service.send_stream(session, "我们聊聊天吧")
+
+        self.assertEqual(preflight_arguments, [{"action": "status"}])
+        assert client.last_messages is not None
+        system_prompt = client.last_messages[0]["content"]
+        self.assertIn(
+            "CUP preflight: device connection check succeeded via status API right before this turn.",
+            system_prompt,
+        )
+        self.assertIn("Semantic mapping hints", system_prompt)
+        self.assertIn("- current_motor_target_velocity: 48", system_prompt)
+        self.assertIn("- current_motor_enabled: true", system_prompt)
+
+    def test_send_stream_skips_cup_connected_preflight_prompt_when_status_fails(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        preflight_call_count = 0
+
+        def failing_handler(arguments: dict[str, object]) -> dict[str, object]:
+            nonlocal preflight_call_count
+            preflight_call_count += 1
+            raise RuntimeError("connection refused")
+
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="control_cup",
+                    description="Control the CUP hardware",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"action": {"type": "string"}},
+                        "required": ["action"],
+                        "additionalProperties": False,
+                    },
+                    handler=failing_handler,
+                    should_offer=lambda user_text, route_mode: _matches_cup_control_intent(
+                        user_text
+                    ),
+                    execution_meta=ToolExecutionMeta(side_effectful=True),
+                ),
+            )
+        )
+        client = CapturingClient()
+        service = ChatService(config, client=client, tool_registry=registry)
+
+        service.send_stream(session, "我们聊聊天吧")
+
+        self.assertEqual(preflight_call_count, 1)
+        assert client.last_messages is not None
+        system_prompt = client.last_messages[0]["content"]
+        self.assertNotIn("CUP preflight", system_prompt)
+
     def test_send_stream_skips_live_context_in_system_prompt_when_tools_are_available(self) -> None:
         config = make_config()
         session = ConversationSession(
@@ -981,12 +1127,16 @@ class ChatTests(unittest.TestCase):
         service.send_stream(session, "再总结一下", on_chunk=lambda chunk: None)
 
         assert client.last_messages is not None
+        system_prompt = client.last_messages[0]["content"]
         non_system_messages = client.last_messages[1:]
+        self.assertIn("Historical conversation context (quoted and compressed).", system_prompt)
+        self.assertIn('[USER] "帮我查一下油价"', system_prompt)
+        self.assertIn('[ASSISTANT] "之前我查到油价有波动。"', system_prompt)
+        self.assertNotIn("old search result", system_prompt)
         self.assertEqual(
             [message["role"] for message in non_system_messages],
-            ["user", "assistant", "user"],
+            ["user"],
         )
-        self.assertNotIn("tool_calls", non_system_messages[1])
 
     def test_send_stream_executes_tool_calls_and_streams_final_answer(self) -> None:
         config = make_config()
@@ -1100,6 +1250,197 @@ class ChatTests(unittest.TestCase):
 
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(client.calls[0]["tool_choice"], "required")
+
+    def test_send_asks_confirmation_for_ambiguous_cup_control_in_model_first_mode(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = CupConfirmationClient()
+        registry = ToolRegistry(
+            specs=make_cup_registry().specs,
+            exposure_strategy="model_first",
+        )
+        service = ChatService(config, client=client, tool_registry=registry)
+
+        result = service.send(session, "气氛再往上走一点")
+
+        self.assertIsNotNone(result.ask_user)
+        assert result.ask_user is not None
+        self.assertIn("直接调节 CUP 设备", result.ask_user.prompt)
+        self.assertEqual(result.ask_user.options[0].label, "确认执行")
+        self.assertIsNotNone(session.pending_ask_user)
+        self.assertEqual(len(client.calls), 1)
+        self.assertFalse(any(message.role == "tool" for message in session.messages))
+
+    def test_send_executes_cup_control_after_confirmation_reply(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = CupConfirmationClient()
+        registry = ToolRegistry(
+            specs=make_cup_registry().specs,
+            exposure_strategy="model_first",
+        )
+        service = ChatService(config, client=client, tool_registry=registry)
+
+        first = service.send(session, "气氛再往上走一点")
+        self.assertIsNotNone(first.ask_user)
+
+        second = service.send(session, "1")
+
+        self.assertIsNone(second.ask_user)
+        self.assertEqual(second.assistant_message.content, "已经帮你调快一点。")
+        self.assertIsNone(session.pending_ask_user)
+        self.assertEqual(len(client.calls), 3)
+        self.assertTrue(any(message.role == "tool" for message in session.messages))
+
+    def test_send_executes_explicit_cup_control_without_confirmation(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = CupConfirmationClient()
+        registry = ToolRegistry(
+            specs=make_cup_registry().specs,
+            exposure_strategy="model_first",
+        )
+        service = ChatService(config, client=client, tool_registry=registry)
+
+        result = service.send(session, "帮我把飞机杯调刺激一点")
+
+        self.assertIsNone(result.ask_user)
+        self.assertEqual(result.assistant_message.content, "已经帮你调快一点。")
+        self.assertGreaterEqual(len(client.calls), 2)
+        self.assertTrue(any(message.role == "tool" for message in session.messages))
+
+    def test_send_appends_cup_success_feedback_after_status_verification(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = CupVerificationClient()
+        status_targets = [35.0, 65.0]
+
+        def handler(arguments: dict[str, object]) -> dict[str, object]:
+            action = str(arguments.get("action", ""))
+            if action == "status":
+                target = status_targets.pop(0) if status_targets else 65.0
+                return {
+                    "ok": True,
+                    "action": "status",
+                    "device": "http://esp32-cup.local",
+                    "system": {
+                        "connected": True,
+                        "led_color": "#40c4ff",
+                        "led_blink_hz": 0.9,
+                        "led_blink_mode": 1,
+                    },
+                    "motor": {"target": target, "enabled": True},
+                }
+            if action == "set_motor":
+                return {
+                    "ok": True,
+                    "action": "set_motor",
+                    "requested": {"target_velocity": 65.0, "enabled": True},
+                    "result": {"target": 65.0, "enabled": True},
+                }
+            raise AssertionError(f"unexpected action: {action}")
+
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="control_cup",
+                    description="Control the CUP hardware",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"action": {"type": "string"}},
+                        "required": ["action"],
+                        "additionalProperties": False,
+                    },
+                    handler=handler,
+                    should_offer=lambda user_text, route_mode: _matches_cup_control_intent(
+                        user_text
+                    ),
+                    execution_meta=ToolExecutionMeta(side_effectful=True),
+                ),
+            ),
+            exposure_strategy="model_first",
+        )
+        service = ChatService(config, client=client, tool_registry=registry)
+
+        result = service.send(session, "把速度调快一点")
+
+        self.assertIn("已帮你调整速度。", result.assistant_message.content)
+        self.assertIn("设备执行结果：执行前后状态校验通过", result.assistant_message.content)
+        self.assertIn("电机目标转速已到 65", result.assistant_message.content)
+        self.assertEqual(session.transcript_messages[-1].content, result.assistant_message.content)
+
+    def test_send_appends_cup_failure_feedback_when_post_status_not_updated(self) -> None:
+        config = make_config()
+        session = ConversationSession(
+            session_id="demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        client = CupVerificationClient()
+        status_targets = [35.0, 35.0]
+
+        def handler(arguments: dict[str, object]) -> dict[str, object]:
+            action = str(arguments.get("action", ""))
+            if action == "status":
+                target = status_targets.pop(0) if status_targets else 35.0
+                return {
+                    "ok": True,
+                    "action": "status",
+                    "device": "http://esp32-cup.local",
+                    "system": {"connected": True},
+                    "motor": {"target": target, "enabled": True},
+                }
+            if action == "set_motor":
+                return {
+                    "ok": True,
+                    "action": "set_motor",
+                    "requested": {"target_velocity": 65.0, "enabled": True},
+                    "result": {"target": 65.0, "enabled": True},
+                }
+            raise AssertionError(f"unexpected action: {action}")
+
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="control_cup",
+                    description="Control the CUP hardware",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {"action": {"type": "string"}},
+                        "required": ["action"],
+                        "additionalProperties": False,
+                    },
+                    handler=handler,
+                    should_offer=lambda user_text, route_mode: _matches_cup_control_intent(
+                        user_text
+                    ),
+                    execution_meta=ToolExecutionMeta(side_effectful=True),
+                ),
+            ),
+            exposure_strategy="model_first",
+        )
+        service = ChatService(config, client=client, tool_registry=registry)
+
+        result = service.send(session, "把速度调快一点")
+
+        self.assertIn("设备执行结果：未达预期", result.assistant_message.content)
+        self.assertIn("expected≈65", result.assistant_message.content)
 
     def test_tools_for_request_omits_side_effectful_tools_for_unrelated_input(self) -> None:
         config = make_config()

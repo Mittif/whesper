@@ -34,6 +34,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.get_provider("main").base_url, "http://localhost:11434/v1")
         self.assertEqual(config.get_model("local").model, "qwen")
         self.assertEqual(config.live_context.custom_api, {})
+        self.assertEqual(config.app.context_strategy, "memory_first")
+        self.assertEqual(config.app.recent_history_limit, 4)
+        self.assertEqual(config.app.tool_exposure_strategy, "matched_only")
 
     def test_fails_with_helpful_message_when_no_models_are_defined(self) -> None:
         content = textwrap.dedent(
@@ -205,6 +208,63 @@ class ConfigTests(unittest.TestCase):
             (("pwd",), ("git", "status"), ("rg",)),
         )
 
+    def test_loads_optional_memory_first_context_config(self) -> None:
+        content = textwrap.dedent(
+            """
+            [app]
+            context_strategy = "memory_first"
+            recent_history_limit = 2
+            tool_exposure_strategy = "model_first"
+
+            [scheduler]
+            chat_model = "local"
+
+            [providers.main]
+            base_url = "http://localhost:11434/v1"
+
+            [models.local]
+            provider = "main"
+            model = "qwen"
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        config = load_config(temp_path)
+        self.assertEqual(config.app.context_strategy, "memory_first")
+        self.assertEqual(config.app.recent_history_limit, 2)
+        self.assertEqual(config.app.tool_exposure_strategy, "model_first")
+
+    def test_rejects_invalid_tool_exposure_strategy(self) -> None:
+        content = textwrap.dedent(
+            """
+            [app]
+            tool_exposure_strategy = "semantic_magic"
+
+            [scheduler]
+            chat_model = "local"
+
+            [providers.main]
+            base_url = "http://localhost:11434/v1"
+
+            [models.local]
+            provider = "main"
+            model = "qwen"
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        with self.assertRaisesRegex(
+            ConfigError,
+            "app.tool_exposure_strategy must be either 'matched_only' or 'model_first'",
+        ):
+            load_config(temp_path)
+
     def test_loads_optional_cup_hardware_config(self) -> None:
         content = textwrap.dedent(
             """
@@ -325,7 +385,7 @@ class ConfigTests(unittest.TestCase):
 
             [providers.ollama_local]
             kind = "ollama_native"
-            base_url = "${WHESPER_OLLAMA_BASE_URL:-http://localhost:11434}"
+            base_url = "${TEST_WHESPER_OLLAMA_BASE_URL:-http://localhost:11434}"
 
             [models.local]
             provider = "ollama_local"
@@ -352,7 +412,7 @@ class ConfigTests(unittest.TestCase):
 
             [providers.ollama_local]
             kind = "ollama_native"
-            base_url = "${WHESPER_OLLAMA_BASE_URL:-http://localhost:11434}"
+            base_url = "${TEST_WHESPER_OLLAMA_BASE_URL:-http://localhost:11434}"
 
             [models.local]
             provider = "ollama_local"
@@ -366,7 +426,7 @@ class ConfigTests(unittest.TestCase):
 
         with mock.patch.dict(
             os.environ,
-            {"WHESPER_OLLAMA_BASE_URL": "http://family.zhoudians.com:41434"},
+            {"TEST_WHESPER_OLLAMA_BASE_URL": "http://family.zhoudians.com:41434"},
             clear=False,
         ):
             config = load_config(temp_path)

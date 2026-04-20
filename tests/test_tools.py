@@ -145,8 +145,54 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertTrue(_matches_cup_control_intent("把灯调成红色"))
         self.assertTrue(_matches_cup_control_intent("灯变绿"))
 
+    def test_cup_control_intent_matches_standalone_intensity_phrase(self) -> None:
+        self.assertTrue(_matches_cup_control_intent("要不咱们刺激一点"))
+        self.assertTrue(_matches_cup_control_intent("舒缓点吧"))
+        self.assertTrue(_matches_cup_control_intent("再猛一点"))
+        self.assertTrue(_matches_cup_control_intent("温柔点"))
+
+    def test_cup_control_intent_matches_stop_single_token(self) -> None:
+        self.assertTrue(_matches_cup_control_intent("停"))
+        self.assertTrue(_matches_cup_control_intent("停。"))
+        self.assertTrue(_matches_cup_control_intent("停！"))
+        # Should not misfire on compound words that merely start with 停
+        self.assertFalse(_matches_cup_control_intent("停车"))
+        self.assertFalse(_matches_cup_control_intent("停了一会儿"))
+
+    def test_cup_control_intent_matches_motor_speed_adjustments(self) -> None:
+        # Explicit device + adjustment verb
+        self.assertTrue(_matches_cup_control_intent("把转速调到80"))
+        self.assertTrue(_matches_cup_control_intent("转速降到30"))
+        self.assertTrue(_matches_cup_control_intent("电机升到100"))
+        # Standalone speed phrases
+        self.assertTrue(_matches_cup_control_intent("加快"))
+        self.assertTrue(_matches_cup_control_intent("放慢"))
+        self.assertTrue(_matches_cup_control_intent("降速"))
+        self.assertTrue(_matches_cup_control_intent("提速"))
+        self.assertTrue(_matches_cup_control_intent("全速"))
+        self.assertTrue(_matches_cup_control_intent("最大速度"))
+        # Standalone superlatives (whole-message only)
+        self.assertTrue(_matches_cup_control_intent("最快"))
+        self.assertTrue(_matches_cup_control_intent("最慢"))
+        # Should not fire inside unrelated sentences
+        self.assertFalse(_matches_cup_control_intent("你跑得最快"))
+        self.assertFalse(_matches_cup_control_intent("最大音量"))
+
+    def test_cup_control_intent_matches_motor_status_queries(self) -> None:
+        self.assertTrue(_matches_cup_control_intent("转速多少"))
+        self.assertTrue(_matches_cup_control_intent("当前转速"))
+        self.assertTrue(_matches_cup_control_intent("电机参数"))
+
+    def test_cup_control_intent_matches_intensity_pressure_phrases(self) -> None:
+        self.assertTrue(_matches_cup_control_intent("用力一点"))
+        self.assertTrue(_matches_cup_control_intent("大力一点"))
+        self.assertTrue(_matches_cup_control_intent("轻一点"))
+        self.assertTrue(_matches_cup_control_intent("松一点"))
+
     def test_cup_scene_followup_matches_intensity_request(self) -> None:
         self.assertTrue(_matches_cup_scene_followup("再刺激一点"))
+        self.assertTrue(_matches_cup_scene_followup("停"))
+        self.assertTrue(_matches_cup_scene_followup("舒缓点吧"))
 
     def test_default_tool_choice_requires_side_effectful_cup_request(self) -> None:
         registry = ToolRegistry(
@@ -227,6 +273,74 @@ class ToolRegistryTests(unittest.TestCase):
         )
 
         self.assertEqual(tools, [])
+
+    def test_openai_tools_for_request_returns_all_visible_tools_in_model_first_mode(self) -> None:
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="control_cup",
+                    description="Control the CUP hardware",
+                    parameters_schema={"type": "object"},
+                    handler=lambda arguments: {"ok": True},
+                    should_offer=lambda user_text, route_mode: _matches_cup_control_intent(
+                        user_text
+                    ),
+                    execution_meta=ToolExecutionMeta(side_effectful=True),
+                ),
+                ToolSpec(
+                    name="web_search",
+                    description="Search the web",
+                    parameters_schema={"type": "object"},
+                    handler=lambda arguments: {"ok": True},
+                    should_offer=lambda user_text, route_mode: "搜索" in user_text,
+                ),
+            ),
+            exposure_strategy="model_first",
+        )
+
+        tools = registry.openai_tools_for_request(
+            "今天天气怎么样",
+            route_mode="chat",
+        )
+
+        self.assertEqual(
+            [tool["function"]["name"] for tool in tools],
+            ["control_cup", "web_search"],
+        )
+
+    def test_openai_tools_for_request_prioritizes_matched_tools_in_model_first_mode(self) -> None:
+        registry = ToolRegistry(
+            specs=(
+                ToolSpec(
+                    name="control_cup",
+                    description="Control the CUP hardware",
+                    parameters_schema={"type": "object"},
+                    handler=lambda arguments: {"ok": True},
+                    should_offer=lambda user_text, route_mode: _matches_cup_control_intent(
+                        user_text
+                    ),
+                    execution_meta=ToolExecutionMeta(side_effectful=True),
+                ),
+                ToolSpec(
+                    name="web_search",
+                    description="Search the web",
+                    parameters_schema={"type": "object"},
+                    handler=lambda arguments: {"ok": True},
+                    should_offer=lambda user_text, route_mode: "搜索" in user_text,
+                ),
+            ),
+            exposure_strategy="model_first",
+        )
+
+        tools = registry.openai_tools_for_request(
+            "帮我把飞机杯调刺激一点",
+            route_mode="chat",
+        )
+
+        self.assertEqual(
+            [tool["function"]["name"] for tool in tools],
+            ["control_cup", "web_search"],
+        )
 
     def test_handle_get_public_ip_returns_ip_payload(self) -> None:
         from whesper import tools as tools_module
@@ -959,6 +1073,46 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertIn("tool: get_weather_by_location", prompt)
         self.assertIn("argument location", prompt)
         self.assertIn('"location":"嘉定区","time_expression":"明天"}', prompt)
+
+    def test_cup_tool_prompt_encourages_semantic_intent_mapping(self) -> None:
+        config = AppConfig(
+            app=AppSettings(tool_exposure_strategy="model_first"),
+            persona=PersonaConfig(),
+            scheduler=SchedulerConfig(chat_model="local_chat"),
+            live_context=LiveContextSettings(),
+            shell_sandbox=ShellSandboxSettings(),
+            providers={
+                "local": ProviderConfig(
+                    name="local",
+                    kind="ollama_native",
+                    base_url="http://localhost:11434",
+                )
+            },
+            models={
+                "local_chat": ModelConfig(
+                    name="local_chat",
+                    provider="local",
+                    model="qwen",
+                )
+            },
+            source_path=Path("whesper.toml"),
+            hardware=HardwareSettings(
+                cup=CupHardwareSettings(
+                    enabled=True,
+                    base_url=CUP_DEFAULT_BASE_URL,
+                    timeout_seconds=5,
+                )
+            ),
+        )
+
+        registry = ToolRegistry.default(config)
+        prompt = registry.tool_prompt()
+
+        self.assertIn("tool: control_cup", prompt)
+        self.assertIn("Infer tool use from user intent semantically", prompt)
+        self.assertIn("The user does not need to know action names", prompt)
+        self.assertIn('"action":"nudge_intensity","direction":"up"}', prompt)
+        self.assertIn('"action":"set_motor","target_velocity":80,"enabled":true}', prompt)
 
 
 if __name__ == "__main__":

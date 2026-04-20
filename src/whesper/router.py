@@ -49,71 +49,67 @@ def select_model(
     mode_override: str = "auto",
 ) -> RouteDecision:
     text = user_text.strip()
+    model_alias = config.scheduler.chat_model
+    model_reason = "default chat model"
+    if pinned_model and pinned_model != "auto":
+        config.get_model(pinned_model)
+        model_alias = pinned_model
+        model_reason = "generation configured model"
 
-    if mode_override == "search" and config.scheduler.search_model:
+    if mode_override == "search":
         return RouteDecision(
-            model_alias=config.scheduler.search_model,
+            model_alias=model_alias,
             mode="search",
-            reason="explicit search mode",
+            reason=f"explicit search mode ({model_reason})",
         )
 
-    if mode_override == "reasoning" and config.scheduler.reasoning_model:
+    if mode_override == "reasoning":
         return RouteDecision(
-            model_alias=config.scheduler.reasoning_model,
+            model_alias=model_alias,
             mode="reasoning",
-            reason="explicit reasoning mode",
+            reason=f"explicit reasoning mode ({model_reason})",
         )
 
     if mode_override == "chat":
         return RouteDecision(
-            model_alias=config.scheduler.chat_model,
+            model_alias=model_alias,
             mode="chat",
-            reason="explicit chat mode",
+            reason=f"explicit chat mode ({model_reason})",
         )
 
-    if text.startswith("/search ") and config.scheduler.search_model:
+    if text.startswith("/search "):
         return RouteDecision(
-            model_alias=config.scheduler.search_model,
+            model_alias=model_alias,
             mode="search",
-            reason="slash search shortcut",
-        )
-
-    if pinned_model and pinned_model != "auto":
-        config.get_model(pinned_model)
-        return RouteDecision(
-            model_alias=pinned_model,
-            mode="manual",
-            reason="session pinned model",
+            reason=f"slash search shortcut ({model_reason})",
         )
 
     matched_search_keyword = _matched_search_keyword(text)
-    if matched_search_keyword and config.scheduler.search_model:
+    if matched_search_keyword:
         return RouteDecision(
-            model_alias=config.scheduler.search_model,
+            model_alias=model_alias,
             mode="search",
-            reason=f"matched search keyword: {matched_search_keyword}",
+            reason=f"matched search keyword: {matched_search_keyword} ({model_reason})",
         )
 
     if len(text) >= config.scheduler.long_message_chars:
-        alias = config.scheduler.reasoning_model or config.scheduler.chat_model
         return RouteDecision(
-            model_alias=alias,
+            model_alias=model_alias,
             mode="reasoning",
-            reason="long input heuristic",
+            reason=f"long input heuristic ({model_reason})",
         )
 
     lowered = text.casefold()
     for keyword in config.scheduler.reasoning_keywords:
         if keyword.casefold() in lowered:
-            alias = config.scheduler.reasoning_model or config.scheduler.chat_model
             return RouteDecision(
-                model_alias=alias,
+                model_alias=model_alias,
                 mode="reasoning",
-                reason=f"matched keyword: {keyword}",
+                reason=f"matched keyword: {keyword} ({model_reason})",
             )
 
     return RouteDecision(
-        model_alias=config.scheduler.chat_model,
+        model_alias=model_alias,
         mode="chat",
-        reason="default chat model",
+        reason=f"default chat mode ({model_reason})",
     )

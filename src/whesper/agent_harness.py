@@ -45,6 +45,8 @@ TraceEmitter = Callable[..., None]
 ToolChoiceBuilder = Callable[..., str | dict[str, object] | None]
 ReasoningContentResolver = Callable[[RouteDecision, AgentCompletion], str | None]
 ToolCallPayloadBuilder = Callable[[ToolInvocation], dict[str, object]]
+ToolResultObserver = Callable[[str, str, str], None]
+ToolCallGuard = Callable[[ConversationSession, ToolInvocation, str, str], AskUserAction | None]
 
 # Injected after tool errors so the model can adapt its strategy.
 _ERROR_RECOVERY_PROMPT = (
@@ -207,6 +209,8 @@ class AgentHarness:
         tool_choice_builder: ToolChoiceBuilder,
         reasoning_content_resolver: ReasoningContentResolver,
         trace_emitter: TraceEmitter | None = None,
+        tool_result_observer: ToolResultObserver | None = None,
+        tool_call_guard: ToolCallGuard | None = None,
         max_rounds: int = 10,
     ) -> None:
         self.message_builder = message_builder
@@ -216,6 +220,8 @@ class AgentHarness:
         self.tool_choice_builder = tool_choice_builder
         self.reasoning_content_resolver = reasoning_content_resolver
         self.trace_emitter = trace_emitter
+        self.tool_result_observer = tool_result_observer
+        self.tool_call_guard = tool_call_guard
         self.max_rounds = max_rounds
 
     def run_until_final(
@@ -230,6 +236,7 @@ class AgentHarness:
         route_mode: str,
         target_profile,
         tools: list[dict[str, object]],
+        preflight_prompt: str | None = None,
         on_step: StepCallback | None = None,
         ensure_reasoning_content: bool = False,
     ) -> HarnessRunResult:
@@ -241,6 +248,7 @@ class AgentHarness:
                 user_text=user_text,
                 route_mode=route_mode,
                 planning_prompt=f"{AGENTIC_PLANNING_PROMPT}\n\n{ASK_USER_FORMAT_PROMPT}",
+                preflight_prompt=preflight_prompt,
                 include_live_context=False,
                 ensure_reasoning_content=ensure_reasoning_content,
             ),
@@ -267,7 +275,7 @@ class AgentHarness:
             state.last_completion = completion
 
             if completion.tool_calls:
-                should_stop = self._handle_tool_calls(
+                should_stop, ask_user = self._handle_tool_calls(
                     session,
                     state,
                     decision,
@@ -279,8 +287,16 @@ class AgentHarness:
                     user_text=user_text,
                     route_mode=route_mode,
                     target_profile=target_profile,
+                    preflight_prompt=preflight_prompt,
                     on_step=on_step,
                 )
+                if ask_user is not None:
+                    return HarnessRunResult(
+                        completion=completion,
+                        used_tools=state.used_tools,
+                        ask_user=ask_user,
+                        steps=state.steps,
+                    )
                 if should_stop:
                     break
                 continue
@@ -431,8 +447,9 @@ class AgentHarness:
         user_text: str,
         route_mode: str,
         target_profile,
+        preflight_prompt: str | None,
         on_step: StepCallback | None,
-    ) -> bool:
+    ) -> tuple[bool, AskUserAction | None]:
         state.used_tools = True
         source_profile_id = (
             getattr(target_profile, "profile_id", None)
@@ -468,6 +485,38 @@ class AgentHarness:
                 ),
                 on_step=on_step,
             )
+            if self.tool_call_guard is None:
+                continue
+            ask_user = self.tool_call_guard(
+                session,
+                tool_call,
+                user_text,
+                route_mode,
+            )
+            if ask_user is None:
+                continue
+            self._emit_trace(
+                kind="ask_user",
+                session_id=session.session_id,
+                decision=decision,
+                provider_name=provider_name,
+                streamed=False,
+                tools_enabled=True,
+                tool_choice=self._stringify_tool_choice(state.tool_choice),
+                note=f"confirmation_required:{tool_call.name}",
+                preview=ask_user.prompt,
+            )
+            self._record_step(
+                state,
+                AgentStep(
+                    round_index=round_index,
+                    kind="ask_user",
+                    tool_name=tool_call.name,
+                    summary=ask_user.prompt,
+                ),
+                on_step=on_step,
+            )
+            return True, ask_user
 
         has_error = False
         for message in self._execute_tool_calls(
@@ -504,7 +553,7 @@ class AgentHarness:
                 ),
                 on_step=on_step,
             )
-            return True
+            return True, None
 
         state.working_messages = self.message_builder.build_messages(
             session,
@@ -513,6 +562,7 @@ class AgentHarness:
             user_text=user_text,
             route_mode=route_mode,
             planning_prompt=f"{AGENTIC_PLANNING_PROMPT}\n\n{ASK_USER_FORMAT_PROMPT}",
+            preflight_prompt=preflight_prompt,
             include_live_context=False,
             ensure_reasoning_content=state.ensure_reasoning_content,
         )
@@ -530,7 +580,7 @@ class AgentHarness:
                 ),
                 on_step=on_step,
             )
-        return False
+        return False, None
 
     def _append_assistant_tool_message(
         self,
@@ -584,6 +634,8 @@ class AgentHarness:
             )
             session.append(message)
             tool_messages.append(message)
+            if self.tool_result_observer is not None:
+                self.tool_result_observer(session.session_id, name, content)
             self._emit_trace(
                 kind="tool_result",
                 session_id=session.session_id,

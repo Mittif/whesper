@@ -5,6 +5,8 @@ import tempfile
 import unittest
 
 from whesper.cli import (
+    CupHeartbeatMonitor,
+    CupHeartbeatSnapshot,
     apply_pinned_model_override,
     build_footer_meta,
     ensure_valid_session_model,
@@ -214,7 +216,7 @@ class CliTests(unittest.TestCase):
             tool_registry=registry,
         )
 
-    def test_invalid_model_alias_is_handled_without_crash(self) -> None:
+    def test_in_session_model_switch_command_is_disabled(self) -> None:
         config = build_config()
         with tempfile.TemporaryDirectory() as tmpdir:
             store = SessionStore(tmpdir)
@@ -235,8 +237,8 @@ class CliTests(unittest.TestCase):
         self.assertTrue(outcome.handled)
         self.assertFalse(outcome.should_exit)
         self.assertEqual(outcome.session.pinned_model, "auto")
-        self.assertIn("Unknown model alias: missing-model", rendered)
-        self.assertIn("available models: local_chat", rendered)
+        self.assertIn("In-session model switching is disabled.", rendered)
+        self.assertIn("whesper chat --model", rendered)
 
     def test_invalid_mode_is_handled_without_crash(self) -> None:
         config = build_config()
@@ -281,9 +283,8 @@ class CliTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertTrue(changed)
         self.assertEqual(session.pinned_model, "auto")
-        self.assertIn("missing-model", rendered)
-        self.assertIn("no longer available", rendered)
-        self.assertIn("Session model was reset to auto.", rendered)
+        self.assertIn("Session-scoped model switching is disabled", rendered)
+        self.assertIn("reset model override to auto", rendered)
 
     def test_invalid_startup_model_override_keeps_auto(self) -> None:
         config = build_config()
@@ -303,7 +304,7 @@ class CliTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertEqual(session.pinned_model, "auto")
         self.assertIn("missing-model", rendered)
-        self.assertIn("Starting with session model: auto.", rendered)
+        self.assertIn("Starting with scheduler.chat_model", rendered)
 
     def test_status_command_renders_current_state(self) -> None:
         config = build_config()
@@ -470,6 +471,22 @@ class CliTests(unittest.TestCase):
         self.assertTrue(outcome.handled)
         self.assertIn("control_cup tool is not available", rendered)
         self.assertIn("esp32-cup.local", rendered)
+
+    def test_cup_heartbeat_toolbar_infers_running_from_target_velocity_without_enabled(self) -> None:
+        config = build_config()
+        monitor = CupHeartbeatMonitor(self.build_chat_service(config))
+        monitor._set_snapshot(  # noqa: SLF001 - test-only direct state injection
+            CupHeartbeatSnapshot(
+                connected=True,
+                motor_target=40.0,
+                motor_enabled=None,
+            )
+        )
+
+        _, label = monitor.toolbar_fragment()
+
+        self.assertIn("cup online", label)
+        self.assertIn("v40", label)
 
     def test_history_command_renders_colored_cards_for_roles(self) -> None:
         config = build_config()

@@ -93,6 +93,7 @@ KIMI_K25_PROFILE = ProviderProfile(
     temperature_override=_kimi_k25_temperature,
     builtin_tools=("$web_search",),
     thinking_disable_value={"type": "disabled"},
+    text_tool_call_patterns=("function_calls", "tool_arg", "hermes_tool_call", "json_tool_call"),
 )
 
 KIMI_DEFAULT_PROFILE = ProviderProfile(
@@ -101,6 +102,7 @@ KIMI_DEFAULT_PROFILE = ProviderProfile(
     reasoning_content_empty_placeholder=" ",
     tool_arguments_mode="string",
     thinking_disable_value={"type": "disabled"},
+    text_tool_call_patterns=("function_calls", "tool_arg", "hermes_tool_call", "json_tool_call"),
 )
 
 SILICONFLOW_QWEN_PROFILE = ProviderProfile(

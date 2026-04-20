@@ -23,11 +23,15 @@ class StubMessageBuilder:
         user_text: str,
         route_mode: str,
         planning_prompt: str | None = None,
+        preflight_prompt: str | None = None,
         include_live_context: bool = True,
         ensure_reasoning_content: bool = False,
     ) -> list[dict[str, object]]:
+        system_parts = [model_system_prompt or "system"]
+        if preflight_prompt:
+            system_parts.append(preflight_prompt)
         messages: list[dict[str, object]] = [
-            {"role": "system", "content": model_system_prompt or "system"}
+            {"role": "system", "content": "\n\n".join(system_parts)}
         ]
         for message in session.messages:
             payload: dict[str, object] = {

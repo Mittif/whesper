@@ -46,35 +46,41 @@ class RouterTests(unittest.TestCase):
         config = make_config()
         decision = select_model(config, "你好")
         self.assertEqual(decision.model_alias, "chat")
+        self.assertEqual(decision.mode, "chat")
 
     def test_reasoning_keyword_route(self) -> None:
         config = make_config()
         decision = select_model(config, "帮我分析一下这段对话")
-        self.assertEqual(decision.model_alias, "reasoning")
+        self.assertEqual(decision.model_alias, "chat")
+        self.assertEqual(decision.mode, "reasoning")
 
     def test_search_shortcut_route(self) -> None:
         config = make_config()
         decision = select_model(config, "/search latest release notes")
-        self.assertEqual(decision.model_alias, "search")
+        self.assertEqual(decision.model_alias, "chat")
+        self.assertEqual(decision.mode, "search")
 
-    def test_search_shortcut_overrides_pinned_model(self) -> None:
+    def test_search_shortcut_keeps_generation_configured_model(self) -> None:
         config = make_config()
         decision = select_model(
             config,
             "/search latest release notes",
-            pinned_model="chat",
+            pinned_model="reasoning",
         )
-        self.assertEqual(decision.model_alias, "search")
+        self.assertEqual(decision.model_alias, "reasoning")
+        self.assertEqual(decision.mode, "search")
 
-    def test_explicit_search_intent_routes_to_search_model(self) -> None:
+    def test_explicit_search_intent_routes_to_search_mode(self) -> None:
         config = make_config()
         decision = select_model(config, "帮我查一下 OpenAI release notes")
-        self.assertEqual(decision.model_alias, "search")
+        self.assertEqual(decision.model_alias, "chat")
+        self.assertEqual(decision.mode, "search")
 
-    def test_current_info_keywords_route_to_search_model(self) -> None:
+    def test_current_info_keywords_route_to_search_mode(self) -> None:
         config = make_config()
         decision = select_model(config, "OpenAI 最新新闻")
-        self.assertEqual(decision.model_alias, "search")
+        self.assertEqual(decision.model_alias, "chat")
+        self.assertEqual(decision.mode, "search")
 
 
 if __name__ == "__main__":

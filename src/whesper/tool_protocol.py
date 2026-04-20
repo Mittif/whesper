@@ -14,11 +14,13 @@ FUNCTION_CALLS_BLOCK_PATTERN = re.compile(
     re.DOTALL,
 )
 
-# DeepSeek-style: <tool>name</tool>\n<arg>{"key": "value"}</arg>
-_TOOL_ARG_PATTERN = re.compile(
-    r"<tool>\s*(\S+?)\s*</tool>\s*<arg>\s*(.*?)\s*</arg>",
+# DeepSeek/Kimi-style: <tool>name</tool> followed by either
+# <arg>{"key": "value"}</arg> or a raw JSON object.
+_TOOL_TAG_PATTERN = re.compile(
+    r"<tool>\s*(\S+?)\s*</tool>",
     re.DOTALL,
 )
+_TOOL_ARG_WRAPPER_PATTERN = re.compile(r"<arg>\s*(.*?)\s*</arg>", re.DOTALL)
 
 _BOX_TOOL_CALL_PATTERN = re.compile(
     r"<tool_call>\s*([A-Za-z_][\w-]*)\s*\(\s*query\s*=\s*([\"'])(.*?)\2\s*\)\s*<\|end_of_box\|>",
@@ -185,6 +187,7 @@ def sanitize_tool_call_artifacts(content: str) -> str:
 
     for pattern in TOOL_CALL_ARTIFACT_PATTERNS:
         protected = pattern.sub("", protected)
+    protected = _strip_inline_tool_tag_calls(protected)
 
     # Restore fenced code blocks.
     for key, value in placeholders.items():
@@ -193,6 +196,47 @@ def sanitize_tool_call_artifacts(content: str) -> str:
     # Collapse excessive blank lines left by removals.
     protected = re.sub(r"\n{3,}", "\n\n", protected)
     return protected.strip()
+
+
+def _strip_inline_tool_tag_calls(content: str) -> str:
+    decoder = json.JSONDecoder()
+    cleaned_parts: list[str] = []
+    cursor = 0
+
+    for match in _TOOL_TAG_PATTERN.finditer(content):
+        start, end = match.span()
+        cleaned_parts.append(content[cursor:start])
+
+        trailing = content[end:]
+        whitespace_prefix = len(trailing) - len(trailing.lstrip())
+        trailing = trailing.lstrip()
+        consumed = _consume_tool_tag_arguments(trailing, decoder)
+        if consumed is None:
+            cleaned_parts.append(content[start:end])
+            cursor = end
+            continue
+        cursor = end + whitespace_prefix + consumed
+
+    cleaned_parts.append(content[cursor:])
+    return "".join(cleaned_parts)
+
+
+def _consume_tool_tag_arguments(
+    content: str,
+    decoder: json.JSONDecoder,
+) -> int | None:
+    if content.startswith("<arg>"):
+        arg_match = _TOOL_ARG_WRAPPER_PATTERN.match(content)
+        if arg_match is None:
+            return None
+        return arg_match.end()
+    if not content.startswith(("{", "[")):
+        return None
+    try:
+        _, offset = decoder.raw_decode(content)
+    except json.JSONDecodeError:
+        return None
+    return offset
 
 
 class DefaultToolProtocolAdapter:
@@ -311,18 +355,33 @@ class DefaultToolProtocolAdapter:
         return tuple(tool_calls)
 
     def _extract_tool_arg_pairs(self, content: str) -> tuple[ToolInvocation, ...]:
-        matches = _TOOL_ARG_PATTERN.findall(content)
-        if not matches:
-            return ()
+        decoder = json.JSONDecoder()
         tool_calls: list[ToolInvocation] = []
-        for index, (name, args_text) in enumerate(matches):
-            try:
-                arguments = json.loads(args_text)
-            except json.JSONDecodeError:
-                arguments = {"input": args_text}
+        for match in _TOOL_TAG_PATTERN.finditer(content):
+            name = match.group(1)
+            trailing = content[match.end():].lstrip()
+            arguments: object | None = None
+            if trailing.startswith("<arg>"):
+                arg_match = _TOOL_ARG_WRAPPER_PATTERN.match(trailing)
+                if arg_match is None:
+                    continue
+                args_text = arg_match.group(1)
+                try:
+                    arguments = json.loads(args_text)
+                except json.JSONDecodeError:
+                    arguments = {"input": args_text}
+            elif trailing.startswith(("{", "[")):
+                try:
+                    arguments, _ = decoder.raw_decode(trailing)
+                except json.JSONDecodeError:
+                    continue
+            else:
+                continue
+            if not isinstance(arguments, dict):
+                arguments = {"input": arguments}
             tool_calls.append(
                 ToolInvocation(
-                    tool_call_id=f"text-tool-call-{index}",
+                    tool_call_id=f"text-tool-call-{len(tool_calls)}",
                     name=name,
                     arguments_json=json.dumps(arguments, ensure_ascii=False),
                     tool_type="function",

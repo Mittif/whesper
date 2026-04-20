@@ -70,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument(
         "--model",
         default=None,
-        help="Pin the session to a model alias immediately.",
+        help="Use a specific model alias for this CLI run (no in-session switching).",
     )
 
     subparsers.add_parser("models", help="List configured models")
@@ -371,6 +371,7 @@ def run_trace_debug_turn(
         user_text=user_text,
         route_mode=decision.mode,
         include_live_context=tools is None,
+        include_tool_prompt=tools is not None,
         ensure_reasoning_content=needs_reasoning,
     )
     tool_choice = chat_service._tool_choice_for_request(
@@ -409,11 +410,146 @@ def run_trace_debug_turn(
         output_stream=output_stream,
     )
 
-    result = chat_service._complete_turn(
-        shadow_session,
-        user_text,
-        mode_override=mode_override,
-    )
+    print(divider("Live Trace", color=SLATE), file=output_stream)
+    print(file=output_stream)
+
+    llm_round = 0
+    original_harness_completion_requester = chat_service.harness.completion_requester
+    original_tool_execute = chat_service.tool_executor.execute
+    had_client_create_override = "_client_create_chat_completion" in chat_service.__dict__
+    previous_client_create_override = chat_service.__dict__.get("_client_create_chat_completion")
+
+    def traced_completion_requester(**kwargs):
+        nonlocal llm_round
+        llm_round += 1
+
+        model = kwargs.get("model")
+        provider = kwargs.get("provider")
+        messages_payload = kwargs.get("messages")
+        tools_payload = kwargs.get("tools")
+        tool_choice_payload = kwargs.get("tool_choice")
+        streamed_payload = kwargs.get("streamed")
+
+        print_command_payload(
+            f"LLM Round {llm_round} Request",
+            {
+                "provider": getattr(provider, "name", None),
+                "model_alias": getattr(model, "name", None),
+                "model_id": getattr(model, "model", None),
+                "streamed": streamed_payload,
+                "tool_choice": tool_choice_payload,
+                "tools": tools_payload,
+                "messages": messages_payload,
+            },
+            output_stream=output_stream,
+        )
+
+        completion = original_harness_completion_requester(**kwargs)
+        tool_calls_payload: list[dict[str, object]] = []
+        for tool_call in completion.tool_calls:
+            arguments: object
+            try:
+                arguments = tool_call.arguments()
+            except Exception:
+                arguments = tool_call.arguments_json
+            tool_calls_payload.append(
+                {
+                    "tool_call_id": tool_call.tool_call_id,
+                    "name": tool_call.name,
+                    "arguments": arguments,
+                }
+            )
+        print_command_payload(
+            f"LLM Round {llm_round} Response",
+            {
+                "content": completion.content,
+                "reasoning_content": completion.reasoning_content,
+                "tool_calls": tool_calls_payload,
+            },
+            output_stream=output_stream,
+        )
+        return completion
+
+    def traced_tool_execute(tool_call: ToolInvocation):
+        tool_arguments: object
+        try:
+            tool_arguments = tool_call.arguments()
+        except Exception:
+            tool_arguments = tool_call.arguments_json
+        print_command_payload(
+            "Tool Execute",
+            {
+                "tool_call_id": tool_call.tool_call_id,
+                "name": tool_call.name,
+                "arguments": tool_arguments,
+            },
+            output_stream=output_stream,
+        )
+        try:
+            result = original_tool_execute(tool_call)
+        except Exception as exc:
+            print_command_payload(
+                "Tool Error",
+                {
+                    "tool_call_id": tool_call.tool_call_id,
+                    "name": tool_call.name,
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                },
+                output_stream=output_stream,
+            )
+            raise
+
+        tool_result_payload: object
+        try:
+            tool_result_payload = json.loads(result.content)
+        except json.JSONDecodeError:
+            tool_result_payload = result.content
+        print_command_payload(
+            "Tool Result",
+            {
+                "tool_call_id": result.tool_call_id,
+                "name": result.name,
+                "result": tool_result_payload,
+            },
+            output_stream=output_stream,
+        )
+        return result
+
+    def handle_step(step: AgentStep) -> None:
+        summary = step.summary.strip()
+        pieces = [f"round={step.round_index}", f"kind={step.kind}"]
+        if step.tool_name:
+            pieces.append(f"tool={step.tool_name}")
+        if summary:
+            pieces.append(f"summary={summary}")
+        if step.is_error:
+            pieces.append("error=true")
+        print(
+            colorize("step> " + " | ".join(pieces), SLATE, DIM),
+            file=output_stream,
+        )
+
+    chat_service.harness.completion_requester = traced_completion_requester
+    chat_service.tool_executor.execute = traced_tool_execute  # type: ignore[assignment]
+    chat_service._client_create_chat_completion = traced_completion_requester  # type: ignore[assignment]
+
+    try:
+        result = chat_service._complete_turn(
+            shadow_session,
+            user_text,
+            mode_override=mode_override,
+            on_step=handle_step,
+        )
+    finally:
+        chat_service.harness.completion_requester = original_harness_completion_requester
+        chat_service.tool_executor.execute = original_tool_execute  # type: ignore[assignment]
+        if had_client_create_override:
+            chat_service._client_create_chat_completion = previous_client_create_override  # type: ignore[assignment]
+        else:
+            try:
+                delattr(chat_service, "_client_create_chat_completion")
+            except AttributeError:
+                pass
 
     print_trace(
         trace_store,
@@ -590,7 +726,7 @@ def print_status(
     print(divider("Status", color=SLATE), file=output_stream)
     print(f"session: {session.session_id}", file=output_stream)
     print(f"messages: {len(session.messages)}", file=output_stream)
-    print(f"pinned model: {session.pinned_model}", file=output_stream)
+    print(f"generation model override: {session.pinned_model}", file=output_stream)
     print(f"route mode: {mode_override}", file=output_stream)
     print(f"effective model: {decision.model_alias}", file=output_stream)
     print(f"provider: {provider_config.name} ({provider_config.kind})", file=output_stream)
@@ -676,6 +812,179 @@ def execute_control_cup_tool(
     if not isinstance(payload, dict):
         raise ToolExecutionError("control_cup returned a non-object payload.")
     return payload
+
+
+def _coerce_number(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return None
+        try:
+            return float(normalized)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "on", "enabled", "running", "online"}:
+            return True
+        if normalized in {"false", "0", "off", "disabled", "stopped", "offline"}:
+            return False
+    return None
+
+
+@dataclass(slots=True)
+class CupHeartbeatSnapshot:
+    connected: bool | None
+    checked_at: float | None = None
+    device: str | None = None
+    motor_target: float | None = None
+    motor_enabled: bool | None = None
+    error: str | None = None
+
+
+class CupHeartbeatMonitor:
+    def __init__(
+        self,
+        chat_service: ChatService,
+        *,
+        interval_seconds: float = 2.0,
+    ) -> None:
+        self.chat_service = chat_service
+        self.interval_seconds = max(0.5, interval_seconds)
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._paused = False
+        self._thread: threading.Thread | None = None
+        self._snapshot = CupHeartbeatSnapshot(connected=None)
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="whesper-cup-heartbeat",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def pause(self) -> None:
+        with self._lock:
+            self._paused = True
+
+    def resume(self) -> None:
+        with self._lock:
+            self._paused = False
+
+    def snapshot(self) -> CupHeartbeatSnapshot:
+        with self._lock:
+            return CupHeartbeatSnapshot(
+                connected=self._snapshot.connected,
+                checked_at=self._snapshot.checked_at,
+                device=self._snapshot.device,
+                motor_target=self._snapshot.motor_target,
+                motor_enabled=self._snapshot.motor_enabled,
+                error=self._snapshot.error,
+            )
+
+    def toolbar_fragment(self) -> tuple[str, str]:
+        snapshot = self.snapshot()
+        if snapshot.connected is True:
+            motor_label = "unknown"
+            if snapshot.motor_enabled is True:
+                if snapshot.motor_target is not None and snapshot.motor_target > 0.8:
+                    motor_label = f"v{snapshot.motor_target:g}"
+                else:
+                    motor_label = "running"
+            elif snapshot.motor_enabled is False:
+                motor_label = "stopped"
+            elif snapshot.motor_target is not None:
+                if snapshot.motor_target > 0.8:
+                    motor_label = f"v{snapshot.motor_target:g}"
+                else:
+                    motor_label = "stopped"
+            return "class:cup_online", f" cup online {motor_label} "
+        if snapshot.connected is False:
+            return "class:cup_offline", " cup offline "
+        if snapshot.error:
+            return "class:cup_unknown", " cup unknown "
+        return "class:cup_unknown", " cup checking "
+
+    def _run(self) -> None:
+        self._poll_once()
+        while not self._stop_event.wait(self.interval_seconds):
+            with self._lock:
+                paused = self._paused
+            if paused:
+                continue
+            self._poll_once()
+
+    def _poll_once(self) -> None:
+        try:
+            payload = execute_control_cup_tool(self.chat_service, {"action": "status"})
+        except ToolExecutionError as exc:
+            self._set_snapshot(
+                CupHeartbeatSnapshot(
+                    connected=False,
+                    checked_at=time.time(),
+                    error=str(exc),
+                )
+            )
+            return
+
+        system = payload.get("system")
+        motor = payload.get("motor")
+        connected = bool(payload.get("ok") is True)
+        if isinstance(system, dict):
+            connected_value = _coerce_bool(system.get("connected"))
+            if connected_value is not None:
+                connected = connected_value
+        motor_target = None
+        motor_enabled = None
+        if isinstance(motor, dict):
+            for key in ("target", "target_velocity", "vel", "velocity"):
+                motor_target = _coerce_number(motor.get(key))
+                if motor_target is not None:
+                    break
+            for key in ("enabled", "running", "on"):
+                motor_enabled = _coerce_bool(motor.get(key))
+                if motor_enabled is not None:
+                    break
+        self._set_snapshot(
+            CupHeartbeatSnapshot(
+                connected=connected,
+                checked_at=time.time(),
+                device=(
+                    payload.get("device")
+                    if isinstance(payload.get("device"), str)
+                    else None
+                ),
+                motor_target=motor_target,
+                motor_enabled=motor_enabled,
+                error=None,
+            )
+        )
+
+    def _set_snapshot(self, snapshot: CupHeartbeatSnapshot) -> None:
+        with self._lock:
+            self._snapshot = snapshot
 
 
 def _parse_required_float(token: str, *, field_name: str) -> float:
@@ -990,33 +1299,24 @@ def ensure_valid_session_model(
     *,
     output_stream: object = sys.stdout,
 ) -> bool:
-    pinned_model = session.pinned_model or "auto"
+    del config
+    pinned_model = (session.pinned_model or "auto").strip() or "auto"
     if pinned_model == "auto":
         if session.pinned_model != "auto":
             session.pinned_model = "auto"
             return True
         return False
 
-    try:
-        config.get_model(pinned_model)
-    except ConfigError:
-        if "/" in pinned_model:
-            provider_name = pinned_model.split("/", 1)[0]
-            model_id = pinned_model.split("/", 1)[1]
-            try:
-                config.register_model(pinned_model, provider_name, model_id)
-                return False
-            except ConfigError:
-                pass
-        print_cli_error(
-            f"Saved session model '{pinned_model}' is no longer available.",
-            output_stream=output_stream,
-        )
-        print_cli_hint("Session model was reset to auto.", output_stream=output_stream)
-        session.pinned_model = "auto"
-        return True
-
-    return False
+    print_cli_hint(
+        "Session-scoped model switching is disabled; reset model override to auto.",
+        output_stream=output_stream,
+    )
+    print_cli_hint(
+        "Use `whesper chat --model <alias|provider/model>` to configure model for this run.",
+        output_stream=output_stream,
+    )
+    session.pinned_model = "auto"
+    return True
 
 
 def apply_pinned_model_override(
@@ -1027,26 +1327,35 @@ def apply_pinned_model_override(
     *,
     output_stream: object = sys.stdout,
 ) -> None:
+    normalized = pinned_model.strip()
+    if not normalized or normalized == "auto":
+        session.pinned_model = "auto"
+        store.save(session)
+        return
+
     try:
-        config.get_model(pinned_model)
+        config.get_model(normalized)
     except ConfigError:
-        if "/" in pinned_model:
-            provider_name = pinned_model.split("/", 1)[0]
-            model_id = pinned_model.split("/", 1)[1]
+        if "/" in normalized:
+            provider_name = normalized.split("/", 1)[0]
+            model_id = normalized.split("/", 1)[1]
             try:
-                config.register_model(pinned_model, provider_name, model_id)
-                session.pinned_model = pinned_model
+                config.register_model(normalized, provider_name, model_id)
+                session.pinned_model = normalized
                 store.save(session)
                 return
             except ConfigError:
                 pass
         print_cli_error(
-            f"Model '{pinned_model}' is not available.",
+            f"Model '{normalized}' is not available.",
             output_stream=output_stream,
         )
-        print_cli_hint("Starting with session model: auto.", output_stream=output_stream)
+        print_cli_hint(
+            "Starting with scheduler.chat_model (session override: auto).",
+            output_stream=output_stream,
+        )
     else:
-        session.pinned_model = pinned_model
+        session.pinned_model = normalized
         store.save(session)
 
 
@@ -1132,7 +1441,7 @@ def handle_command(
                         marker = " [configured]" if configured else ""
                         print(f"  - {alias}{marker}", file=output_stream)
                     print(
-                        f"\nTip: use /model {provider_name}/<model_id> to switch",
+                        f"\nTip: restart with `whesper chat --model {provider_name}/<model_id>` to test one model for this run",
                         file=output_stream,
                     )
             else:
@@ -1246,53 +1555,18 @@ def handle_command(
             print(f"Web search provider set to: {provider}", file=output_stream)
             return CommandOutcome(True, session, mode_override)
         if parsed.name in {"/model", "/use"}:
-            if not parsed.arg:
-                current = session.pinned_model or "auto"
-                print(f"Current model: {current}", file=output_stream)
-                if current != "auto":
-                    try:
-                        m = config.get_model(current)
-                        p = config.get_provider(m.provider)
-                        print(
-                            f"  provider={p.name}  model={m.model}  "
-                            f"temperature={m.temperature}",
-                            file=output_stream,
-                        )
-                    except ConfigError:
-                        pass
-                print(
-                    "Tip: /model <alias|provider/model|auto> to switch",
-                    file=output_stream,
-                )
-                return CommandOutcome(True, session, mode_override)
-            alias = parsed.arg
-            if alias != "auto":
-                # Support provider/model_id format — auto-register if needed
-                if "/" in alias and alias not in config.models:
-                    parts = alias.split("/", 1)
-                    provider_name, model_id = parts[0], parts[1]
-                    try:
-                        config.get_provider(provider_name)
-                    except ConfigError:
-                        print_cli_error(
-                            f"Unknown provider: {provider_name}",
-                            output_stream=output_stream,
-                        )
-                        print_cli_hint(
-                            f"available providers: {', '.join(sorted(config.providers.keys()))}",
-                            output_stream=output_stream,
-                        )
-                        return CommandOutcome(True, session, mode_override)
-                    config.register_model(alias, provider_name, model_id)
-                    print(
-                        f"Auto-registered model: {alias} (provider={provider_name}, model={model_id})",
-                        file=output_stream,
-                    )
-                else:
-                    config.get_model(alias)
-            session.pinned_model = alias
-            store.save(session)
-            print(f"Session model set to: {alias}", file=output_stream)
+            print_cli_error(
+                "In-session model switching is disabled.",
+                output_stream=output_stream,
+            )
+            print_cli_hint(
+                "Use `whesper chat --model <alias|provider/model>` before generation.",
+                output_stream=output_stream,
+            )
+            print_cli_hint(
+                f"Current session override: {session.pinned_model or 'auto'}",
+                output_stream=output_stream,
+            )
             return CommandOutcome(True, session, mode_override)
         if parsed.name == "/mode":
             if not parsed.arg:
@@ -1358,7 +1632,7 @@ def handle_command(
                 refresh_completions()
             print(
                 f"Switched to session: {next_session.session_id} "
-                f"(pinned_model={next_session.pinned_model})",
+                f"(model_override={next_session.pinned_model})",
                 file=output_stream,
             )
             return CommandOutcome(True, next_session, mode_override)
@@ -1376,7 +1650,7 @@ def handle_command(
                 refresh_completions()
             print(
                 f"Switched session to: {next_session.session_id} "
-                f"(pinned_model={next_session.pinned_model})",
+                f"(model_override={next_session.pinned_model})",
                 file=output_stream,
             )
             return CommandOutcome(True, next_session, mode_override)
@@ -1431,12 +1705,6 @@ def handle_command(
         return CommandOutcome(True, session, mode_override)
     except ConfigError as exc:
         print_cli_error(str(exc), output_stream=output_stream)
-        if parsed.name in {"/model", "/use"}:
-            print_cli_hint(
-                "Tip: run /models to inspect configured aliases, "
-                "or /models <provider> to browse available models.",
-                output_stream=output_stream,
-            )
         if parsed.name in {"/status", "/info"}:
             print_cli_hint("Tip: check /models and /mode for the current routing state.", output_stream=output_stream)
         return CommandOutcome(True, session, mode_override)
@@ -1572,6 +1840,9 @@ def interactive_chat(
             "prompt": "bold #7cc7ff",
             "brand": "bold #f5d76e",
             "status": "fg:#b8c7d9 bg:#1c2433",
+            "cup_online": "fg:#d6ffd1 bg:#1c2433",
+            "cup_offline": "fg:#ffb3b3 bg:#1c2433",
+            "cup_unknown": "fg:#e6d08c bg:#1c2433",
             "hint": "fg:#8fa1b8 bg:#1c2433",
             "assistant": "#dce7f7",
             "meta": "#7f91aa",
@@ -1589,16 +1860,26 @@ def interactive_chat(
         complete_in_thread=True,
         reserve_space_for_menu=8,
     )
+    cup_heartbeat_monitor: CupHeartbeatMonitor | None = None
+    if control_cup_tool_available(chat_service):
+        cup_heartbeat_monitor = CupHeartbeatMonitor(chat_service)
+        cup_heartbeat_monitor.start()
 
     def toolbar() -> FormattedText:
         awaiting_followup = " yes " if session.pending_ask_user is not None else " no "
+        cup_style = "class:cup_unknown"
+        cup_label = " cup n/a "
+        if cup_heartbeat_monitor is not None:
+            cup_style, cup_label = cup_heartbeat_monitor.toolbar_fragment()
         return FormattedText(
             [
                 ("class:status", f" session {session.session_id} "),
                 ("class:hint", "  "),
-                ("class:status", f" model {session.pinned_model} "),
+                ("class:status", f" model_override {session.pinned_model} "),
                 ("class:hint", "  "),
                 ("class:status", f" route {mode_override} "),
+                ("class:hint", "  "),
+                (cup_style, cup_label),
                 ("class:hint", "  "),
                 ("class:status", f" follow-up{awaiting_followup}"),
                 ("class:hint", "  Tab complete  Ctrl+R history  / commands "),
@@ -1608,7 +1889,7 @@ def interactive_chat(
     print()
     print("Whesper CLI")
     print(
-        f"Session: {session.session_id} | pinned_model: {session.pinned_model} | "
+        f"Session: {session.session_id} | model_override: {session.pinned_model} | "
         "Type /help for commands"
     )
     print()
@@ -1618,57 +1899,74 @@ def interactive_chat(
         render_ask_user_prompt(session.pending_ask_user, output_stream=sys.stdout)
         print()
 
-    while True:
-        try:
-            prompt_label = "answer" if session.pending_ask_user is not None else "you"
-            user_text = prompt_session.prompt(
-                HTML(f"<prompt>{prompt_label}</prompt> <brand>></brand> "),
-                bottom_toolbar=toolbar,
-                style=style,
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nBye.")
-            store.save(session)
-            return 0
-
-        if not user_text:
-            continue
-
-        parsed = parse_command(user_text)
-        if parsed is not None:
-            outcome = handle_command(
-                parsed,
-                config=config,
-                store=store,
-                chat_service=chat_service,
-                memory_store=memory_store,
-                trace_store=trace_store,
-                session=session,
-                mode_override=mode_override,
-                refresh_completions=lambda: setattr(
-                    prompt_session,
-                    "completer",
-                    NestedCompleter.from_nested_dict(
-                        command_completions(config, store, memory_store)
-                    ),
-                ),
-            )
-            session = outcome.session
-            mode_override = outcome.mode_override
-            if outcome.should_exit:
+    try:
+        while True:
+            try:
+                prompt_label = "answer" if session.pending_ask_user is not None else "you"
+                user_text = prompt_session.prompt(
+                    HTML(f"<prompt>{prompt_label}</prompt> <brand>></brand> "),
+                    bottom_toolbar=toolbar,
+                    style=style,
+                    refresh_interval=0.5,
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nBye.")
+                store.save(session)
                 return 0
-            if outcome.handled:
+
+            if not user_text:
                 continue
 
-        render_user_message(user_text)
-        run_streaming_turn(
-            chat_service,
-            store,
-            session,
-            user_text=user_text,
-            mode_override=mode_override,
-            output_stream=sys.stdout,
-        )
+            parsed = parse_command(user_text)
+            if parsed is not None:
+                if cup_heartbeat_monitor is not None:
+                    cup_heartbeat_monitor.pause()
+                try:
+                    outcome = handle_command(
+                        parsed,
+                        config=config,
+                        store=store,
+                        chat_service=chat_service,
+                        memory_store=memory_store,
+                        trace_store=trace_store,
+                        session=session,
+                        mode_override=mode_override,
+                        refresh_completions=lambda: setattr(
+                            prompt_session,
+                            "completer",
+                            NestedCompleter.from_nested_dict(
+                                command_completions(config, store, memory_store)
+                            ),
+                        ),
+                    )
+                finally:
+                    if cup_heartbeat_monitor is not None:
+                        cup_heartbeat_monitor.resume()
+                session = outcome.session
+                mode_override = outcome.mode_override
+                if outcome.should_exit:
+                    return 0
+                if outcome.handled:
+                    continue
+
+            render_user_message(user_text)
+            if cup_heartbeat_monitor is not None:
+                cup_heartbeat_monitor.pause()
+            try:
+                run_streaming_turn(
+                    chat_service,
+                    store,
+                    session,
+                    user_text=user_text,
+                    mode_override=mode_override,
+                    output_stream=sys.stdout,
+                )
+            finally:
+                if cup_heartbeat_monitor is not None:
+                    cup_heartbeat_monitor.resume()
+    finally:
+        if cup_heartbeat_monitor is not None:
+            cup_heartbeat_monitor.stop()
 
 
 def main(argv: list[str] | None = None) -> None:

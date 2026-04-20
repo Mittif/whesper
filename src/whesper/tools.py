@@ -97,10 +97,12 @@ class ToolRegistry:
         specs: tuple[ToolSpec, ...],
         *,
         search_service: SearchContextService | None = None,
+        exposure_strategy: str = "matched_only",
     ) -> None:
         self.specs = specs
         self._by_name = {spec.name: spec for spec in specs}
         self.search_service = search_service
+        self.exposure_strategy = exposure_strategy
 
     @classmethod
     def default(cls, config: AppConfig | None = None) -> "ToolRegistry":
@@ -540,9 +542,11 @@ class ToolRegistry:
                 ToolSpec(
                     name="control_cup",
                     description=(
-                        "Control the configured CUP client API over HTTP. Use it to inspect "
-                        "status, change motor speed, stop the motor, adjust LED mood cues, "
-                        "or apply higher-level intensity scenes."
+                        "Control the CUP device over HTTP from natural-language user intent. "
+                        "Map requests semantically to one of these actions: status (device + "
+                        "motor telemetry), set_led (change LED color/blink), set_motor (set "
+                        "an exact speed), stop (emergency stop), apply_scene (preset mode), "
+                        "or nudge_intensity (relative speed change up/down)."
                     ),
                     parameters_schema={
                         "type": "object",
@@ -558,7 +562,8 @@ class ToolRegistry:
                                 "type": "number",
                                 "description": (
                                     "Target motor velocity for set_motor in the device's "
-                                    "native units."
+                                    "native units. Use this for direct exact-speed requests "
+                                    "like '设为 80' or '固定到 100'."
                                 ),
                             },
                             "enabled": {
@@ -571,7 +576,8 @@ class ToolRegistry:
                                 "type": "string",
                                 "description": (
                                     "Optional LED color for set_led, such as warmwhite, "
-                                    "red, 粉色, or #ff6600."
+                                    "red, 粉色, or #ff6600. Infer common color words from "
+                                    "the user's phrasing."
                                 ),
                             },
                             "blink_hz": {
@@ -591,20 +597,24 @@ class ToolRegistry:
                                 "type": "string",
                                 "description": (
                                     "Scene name for apply_scene, such as gentle, steady, "
-                                    "intense, or cooldown."
+                                    "intense, or cooldown. Use scenes for broad mood/mode "
+                                    "requests rather than precise numeric control."
                                 ),
                             },
                             "direction": {
                                 "type": "string",
                                 "description": (
                                     "Direction for nudge_intensity: up to intensify or "
-                                    "down to soften."
+                                    "down to soften. Good for requests like '快一点', "
+                                    "'刺激一点', '缓一点', or '慢慢降下来'."
                                 ),
                             },
                             "step": {
                                 "type": "number",
                                 "description": (
-                                    "Optional intensity delta for nudge_intensity."
+                                    "Optional intensity delta for nudge_intensity. Use only "
+                                    "when the user implies a stronger/weaker-than-default "
+                                    "change."
                                 ),
                             },
                         },
@@ -618,21 +628,65 @@ class ToolRegistry:
                         timeout_seconds=cup_settings.timeout_seconds,
                     ),
                     usage_guidance=(
-                        "Use only when the user clearly asks to inspect or change the CUP "
-                        "hardware, or when there is obvious ongoing CUP-control context. "
-                        "Prefer nudge_intensity for requests like '再刺激一点' or '温柔一点', "
-                        "apply_scene for broad mode changes, and stop for any pause or "
-                        "safety-oriented request."
+                        "Use when the user asks to inspect or change the CUP device, "
+                        "including LED color/blink, motor speed, scene/mood, and gradual "
+                        "intensity changes. The user does not need to know action names; infer "
+                        "the closest action from intent. "
+                        "Use set_led for color / blink / atmosphere requests like '把灯变蓝' or "
+                        "'温馨一点的颜色'. "
+                        "Use status for inspection requests like '查看状态' or 'cup怎么样'. "
+                        "Use set_motor only for direct exact-speed requests. "
+                        "Use nudge_intensity for relative requests like '快一点', '刺激一点', "
+                        "'缓一点', or '再轻一点'. "
+                        "For gradually easing down, prefer one or more nudge_intensity "
+                        "direction=down calls instead of stop unless the user explicitly wants "
+                        "to stop. "
+                        "Use apply_scene for broad mode changes such as gentle, steady, intense, "
+                        "or cooldown. "
+                        "Use stop only for explicit stop/pause requests."
                     ),
                     examples=(
                         ('用户说: "看看飞机杯现在的状态"', '{"action":"status"}'),
+                        ('用户说: "cup怎么样"', '{"action":"status"}'),
+                        (
+                            '用户说: "把灯变蓝"',
+                            '{"action":"set_led","color":"blue"}',
+                        ),
+                        (
+                            '用户说: "灯光换成红色"',
+                            '{"action":"set_led","color":"red"}',
+                        ),
                         (
                             '用户说: "把 CUP 转快一点"',
                             '{"action":"nudge_intensity","direction":"up"}',
                         ),
                         (
+                            '用户说: "我想要快一点的速度"',
+                            '{"action":"nudge_intensity","direction":"up"}',
+                        ),
+                        (
+                            '用户说: "再刺激一点"',
+                            '{"action":"nudge_intensity","direction":"up"}',
+                        ),
+                        (
+                            '用户说: "缓一点，慢慢降下来"',
+                            '{"action":"nudge_intensity","direction":"down"}',
+                        ),
+                        (
+                            '用户说: "把速度固定到 80"',
+                            '{"action":"set_motor","target_velocity":80,"enabled":true}',
+                        ),
+                        (
                             '用户说: "切到温柔一点的模式"',
                             '{"action":"apply_scene","scene":"gentle"}',
+                        ),
+                        (
+                            '用户说: "给我来个放松一点的模式"',
+                            '{"action":"apply_scene","scene":"cooldown"}',
+                        ),
+                        (
+                            '用户说: "我想要温馨一点的颜色"',
+                            '{"action":"set_led","color":"warmwhite"}',
                         ),
                     ),
                     should_offer=lambda user_text, route_mode: _matches_cup_control_intent(
@@ -774,7 +828,16 @@ class ToolRegistry:
                 )
             )
 
-        return cls(specs=tuple(specs), search_service=search_service)
+        exposure_strategy = (
+            config.app.tool_exposure_strategy
+            if config is not None
+            else "matched_only"
+        )
+        return cls(
+            specs=tuple(specs),
+            search_service=search_service,
+            exposure_strategy=exposure_strategy,
+        )
 
     def openai_tools(self) -> list[dict[str, object]]:
         return [
@@ -782,6 +845,9 @@ class ToolRegistry:
             for spec in self.specs
             if spec.execution_meta.visible_to_model
         ]
+
+    def spec_for_name(self, name: str) -> ToolSpec | None:
+        return self._by_name.get(name)
 
     def openai_tools_for_request(
         self,
@@ -807,6 +873,7 @@ class ToolRegistry:
             f"- available_tools: {tool_names}",
             "- Use tools when you need fresh factual data, external pages, or project-specific live endpoints.",
             "- Prefer high-level tools that accept raw user phrases. Keep time expressions and user wording natural unless a tool explicitly needs normalization.",
+            "- Infer tool use from user intent semantically, not only from literal keyword matches or examples.",
             "- Use conversation context to resolve references like '当地', '这里', 'here', 'that city', or a previously shared URL/topic. If two related tools are available, choose the one whose description best matches the user's intent and referenced entity.",
             "- Do not invent arguments that the user did not imply. If a location, URL, or code is missing, ask naturally instead of guessing.",
             "- Only use side-effectful tools when the user clearly asked you to inspect or change the external device or system.",
@@ -854,6 +921,24 @@ class ToolRegistry:
             for spec in visible_specs
             if spec.should_offer is not None and spec.should_offer(user_text, route_mode)
         )
+        if self.exposure_strategy == "model_first":
+            if not matched_specs:
+                return visible_specs
+            matched_names = {spec.name for spec in matched_specs}
+            selected_names = set(matched_names)
+            for spec in matched_specs:
+                if (
+                    spec.related_tools_when is None
+                    or spec.related_tools_when(user_text, route_mode)
+                ):
+                    selected_names.update(spec.related_tools)
+            prioritized_specs = [
+                spec for spec in visible_specs if spec.name in selected_names
+            ]
+            fallback_specs = [
+                spec for spec in visible_specs if spec.name not in selected_names
+            ]
+            return tuple([*prioritized_specs, *fallback_specs])
         if matched_specs:
             selected_names = {spec.name for spec in matched_specs}
             for spec in matched_specs:
@@ -1503,6 +1588,14 @@ _CONTROL_VERBS = (
     "tune",
     "make",
     "turn",
+    "check",
+    "get",
+    "show",
+    "查",
+    "看",
+    "查看",
+    "查询",
+    "获取",
     "调",
     "调整",
     "切换",
@@ -1517,6 +1610,21 @@ _CONTROL_VERBS = (
     "弄成",
     "开",
     "关",
+    # Adjust-to-value verbs; only act with a device keyword co-present
+    "调到",
+    "调成",
+    "降到",
+    "升到",
+    "提到",
+    "设到",
+    "改到",
+    "定到",
+    "增到",
+    "降",
+    "升",
+    "提",
+    "加",
+    "减",
 )
 
 
@@ -1529,19 +1637,35 @@ _CUP_DEVICE_KEYWORDS = (
     "电机",
     "motor",
     "转速",
+    "速度",
     "震动",
     "振动",
     "灯",
     "led",
+    # LED-identifying terms: these alone unambiguously refer to the device's LED
+    "灯光",
+    "颜色",
+    "灯色",
 )
 _CUP_CONTROL_KEYWORDS = (
     "status",
     "状态",
+    "怎么样",
+    "如何",
+    "情况",
+    "多少",
+    "当前",
+    "目前",
+    "现在",
+    "目标",
+    "参数",
     "启动",
     "开始",
     "停止",
     "停下",
     "停一下",
+    "停转",
+    "停机",
     "暂停",
     "恢复",
     "快一点",
@@ -1553,6 +1677,28 @@ _CUP_CONTROL_KEYWORDS = (
     "柔和一点",
     "加速",
     "减速",
+    "加快",
+    "放慢",
+    "减慢",
+    "降速",
+    "提速",
+    "增速",
+    "全速",
+    "满速",
+    "最大速度",
+    "最大速",
+    "最快",
+    "最慢",
+    "最高速",
+    "最大",
+    "最低",
+    # Adjustment prefixes used in CUP sessions
+    "调到",
+    "降到",
+    "升到",
+    "提到",
+    "设到",
+    "改到",
     "intensity",
     "speed",
     "faster",
@@ -1561,6 +1707,8 @@ _CUP_CONTROL_KEYWORDS = (
     "led",
     "灯光",
     "颜色",
+    "灯色",
+    "色",
 )
 _CUP_SCENE_KEYWORDS = (
     "gentle",
@@ -1569,6 +1717,7 @@ _CUP_SCENE_KEYWORDS = (
     "cooldown",
     "轻柔",
     "温柔",
+    "舒缓",
     "稳一点",
     "刺激",
     "猛烈",
@@ -1576,8 +1725,57 @@ _CUP_SCENE_KEYWORDS = (
     "冷静一下",
 )
 
+# High-confidence intensity/scene phrases. In a CUP companion app these
+# unambiguously target the device even without an explicit device keyword,
+# so they qualify as control intents on their own.
+_CUP_STRONG_INTENT_PHRASES: tuple[str, ...] = (
+    "刺激一点", "刺激点", "再刺激", "更刺激",
+    "温柔一点", "温柔点", "再温柔",
+    "舒缓一点", "舒缓点", "再舒缓",
+    "轻柔一点", "轻柔点",
+    "柔和一点", "柔和点",
+    "猛一点", "猛点", "再猛", "更猛",
+    "快一点", "快点", "再快", "更快",
+    "加速", "加快",
+    "慢一点", "慢点", "再慢", "更慢",
+    "减速", "减慢", "放慢",
+    "降速", "提速", "增速",
+    "强一点", "强点", "再强", "更强",
+    "弱一点", "弱点", "再弱", "更弱",
+    "用力一点", "用力点", "再用力", "更用力", "大力一点", "大力点",
+    "轻一点", "轻点", "再轻", "更轻",
+    "松一点", "松点",
+    "全速", "满速", "最大速度", "最高速",
+    "停下", "停止", "停一下", "暂停", "停转", "停机",
+    "缓一缓", "冷静一下",
+)
+
+# Whole-message commands. Matched by exact equality after stripping trailing
+# punctuation so "停"/"最快"/"最慢" as standalone utterances count while
+# "停车" or "你跑得最快" do not.
+_CUP_STRONG_INTENT_WHOLE_MESSAGES: tuple[str, ...] = (
+    "停",
+    "最快",
+    "最慢",
+    "最大",
+    "最小",
+    "最低",
+    "最强",
+    "最弱",
+)
+
+
+def _matches_cup_strong_intent(user_text: str) -> bool:
+    lowered = user_text.casefold()
+    if any(phrase in lowered for phrase in _CUP_STRONG_INTENT_PHRASES):
+        return True
+    stripped = user_text.strip().rstrip("。.！!？?，,、 ")
+    return stripped in _CUP_STRONG_INTENT_WHOLE_MESSAGES
+
 
 def _matches_cup_control_intent(user_text: str) -> bool:
+    if _matches_cup_strong_intent(user_text):
+        return True
     lowered = user_text.casefold()
     return any(keyword in lowered for keyword in _CUP_DEVICE_KEYWORDS) and any(
         keyword in lowered
@@ -1590,6 +1788,8 @@ def _matches_cup_control_intent(user_text: str) -> bool:
 
 
 def _matches_cup_scene_followup(user_text: str) -> bool:
+    if _matches_cup_strong_intent(user_text):
+        return True
     lowered = user_text.casefold()
     return any(
         keyword in lowered

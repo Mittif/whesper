@@ -72,6 +72,9 @@ class AppSettings:
     storage_dir: str = ".whesper"
     default_session: str = "main"
     history_limit: int = 16
+    context_strategy: str = "memory_first"
+    recent_history_limit: int = 4
+    tool_exposure_strategy: str = "matched_only"
 
 
 @dataclass(slots=True)
@@ -277,6 +280,28 @@ def _parse_shell_command_prefixes(raw: Any) -> tuple[tuple[str, ...], ...]:
     return tuple(prefixes)
 
 
+def _parse_context_strategy(raw: Any) -> str:
+    if raw is None:
+        return "memory_first"
+    value = str(raw).strip().lower()
+    if value not in {"memory_first", "full_transcript"}:
+        raise ConfigError(
+            "app.context_strategy must be either 'memory_first' or 'full_transcript'."
+        )
+    return value
+
+
+def _parse_tool_exposure_strategy(raw: Any) -> str:
+    if raw is None:
+        return "matched_only"
+    value = str(raw).strip().lower()
+    if value not in {"matched_only", "model_first"}:
+        raise ConfigError(
+            "app.tool_exposure_strategy must be either 'matched_only' or 'model_first'."
+        )
+    return value
+
+
 def _parse_config_variables(raw: Any) -> dict[str, str]:
     if raw is None:
         return {}
@@ -447,7 +472,16 @@ def load_config(path: str | Path) -> AppConfig:
         storage_dir=str(app_raw.get("storage_dir", ".whesper")),
         default_session=str(app_raw.get("default_session", "main")),
         history_limit=int(app_raw.get("history_limit", 16)),
+        context_strategy=_parse_context_strategy(app_raw.get("context_strategy")),
+        recent_history_limit=int(app_raw.get("recent_history_limit", 4)),
+        tool_exposure_strategy=_parse_tool_exposure_strategy(
+            app_raw.get("tool_exposure_strategy")
+        ),
     )
+    if app.history_limit < 0:
+        raise ConfigError("app.history_limit must be >= 0.")
+    if app.recent_history_limit < 0:
+        raise ConfigError("app.recent_history_limit must be >= 0.")
     persona = PersonaConfig(
         name=str(persona_raw.get("name", "Whesper")),
         system_prompt=str(persona_raw.get("system_prompt", PersonaConfig.system_prompt)),

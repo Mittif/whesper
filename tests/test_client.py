@@ -17,6 +17,7 @@ from whesper.client import (
 from whesper.config import ModelConfig, ProviderConfig
 from whesper.provider_profile import (
     GLM_DEFAULT_PROFILE,
+    KIMI_K25_PROFILE,
     OLLAMA_QWEN_PROFILE,
     OPENAI_DEFAULT_PROFILE,
     SILICONFLOW_QWEN_PROFILE,
@@ -172,6 +173,24 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0].name, "web_search")
         self.assertIn("latest news", tool_calls[0].arguments_json)
+
+    def test_extract_tool_calls_from_text_supports_tool_tag_followed_by_json_for_kimi_profile(
+        self,
+    ) -> None:
+        content = """
+        我来帮你调快一点。
+        <tool>control_cup</tool>{"action":"nudge_intensity","direction":"up"}
+        """
+
+        tool_calls = _extract_tool_calls_from_text(
+            content,
+            profile=KIMI_K25_PROFILE,
+        )
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].name, "control_cup")
+        self.assertIn('"action": "nudge_intensity"', tool_calls[0].arguments_json)
+        self.assertIn('"direction": "up"', tool_calls[0].arguments_json)
 
     def test_extract_tool_calls_from_text_supports_action_json_for_ollama_qwen_profile(
         self,
@@ -370,6 +389,66 @@ class ClientTests(unittest.TestCase):
 
         self.assertEqual(result.tool_calls, ())
         self.assertIn("<tool>web_search</tool>", result.content)
+
+    def test_create_chat_completion_extracts_kimi_tool_tag_followed_by_json_when_tools_present(
+        self,
+    ) -> None:
+        client = OpenAICompatibleClient()
+        provider = ProviderConfig(
+            name="kimi",
+            kind="openai_compatible",
+            base_url="https://api.moonshot.cn/v1",
+        )
+        model = ModelConfig(
+            name="kimi-k2.5",
+            provider="kimi",
+            model="kimi-k2.5",
+        )
+
+        raw = {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '<tool>control_cup</tool>'
+                            '{"action":"nudge_intensity","direction":"up"}'
+                        ),
+                    }
+                }
+            ]
+        }
+
+        import json
+        from unittest import mock
+
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "control_cup", "parameters": {"type": "object"}},
+            }
+        ]
+
+        class DummyResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(raw).encode("utf-8")
+
+        with mock.patch("whesper.client.request.urlopen", return_value=DummyResponse()):
+            result = client.create_chat_completion(
+                provider,
+                model,
+                [{"role": "user", "content": "我想要快一点的速度"}],
+                tools=tools,
+            )
+
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].name, "control_cup")
+        self.assertEqual(result.content, "")
 
     def test_create_chat_completion_drops_text_tool_calls_with_unknown_names(
         self,

@@ -5,7 +5,9 @@ from datetime import UTC, date, datetime, timedelta
 from html import unescape as html_unescape
 from html.parser import HTMLParser
 import json
+import os
 import re
+import sys
 from zoneinfo import ZoneInfo
 from typing import Callable, Protocol
 from urllib import parse, request
@@ -25,6 +27,7 @@ CITY_PATTERN = re.compile(
 FLIGHT_CODE_PATTERN = re.compile(r"\b([A-Z]{2,3}\s?\d{2,4})\b")
 TRAIN_CODE_PATTERN = re.compile(r"\b([GDCZKTLSY]\d{1,4})\b", re.IGNORECASE)
 TRACKING_CODE_PATTERN = re.compile(r"\b([A-Z0-9]{8,22})\b")
+_ALLOW_DDGS_ON_PY314_ENV = "WHESPER_ENABLE_DDGS_PY314"
 
 
 WEATHER_CODE_LABELS = {
@@ -1532,6 +1535,24 @@ class SearchContextService:
         )
 
     def _search_with_duckduckgo(self, query: str) -> SearchSnapshot:
+        # ddgs currently depends on the native `primp` extension, which can abort
+        # the interpreter on some Python 3.14 builds. Guard this path to avoid
+        # crashing the whole CLI process.
+        if sys.version_info >= (3, 14):
+            allow_unsafe_runtime = os.getenv(_ALLOW_DDGS_ON_PY314_ENV, "").strip().lower()
+            if allow_unsafe_runtime not in {"1", "true", "yes", "on"}:
+                return SearchSnapshot(
+                    query=query,
+                    provider="duckduckgo",
+                    status="error",
+                    error_code="unsupported_runtime",
+                    error_message=(
+                        "duckduckgo search is disabled on Python 3.14+ to avoid a known "
+                        "native extension crash (primp). Use /websearch brave or /websearch "
+                        "serpapi, or run with Python 3.13. Set "
+                        f"{_ALLOW_DDGS_ON_PY314_ENV}=1 to force-enable at your own risk."
+                    ),
+                )
         try:
             from ddgs import DDGS  # type: ignore[import-untyped]
         except ImportError:

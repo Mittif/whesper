@@ -1,6 +1,6 @@
 # Whesper
 
-Whesper is a Python-first CLI companion focused on natural conversation, configurable personas, memory, and multi-model routing.
+Whesper is a Python-first CLI companion focused on natural conversation, configurable personas, memory, and tool-augmented routing.
 
 The project is local-first: you can run it with Ollama on your machine, with Kimi or SiliconFlow, or with a local chat model plus a remote fallback.
 
@@ -8,7 +8,7 @@ The project is local-first: you can run it with Ollama on your machine, with Kim
 
 - Interactive CLI chat with streaming responses
 - Session persistence, session switching, rename, retry, and transcript history
-- Per-session model pinning with `/model` and route-mode override with `/mode`
+- Model selection at startup (`whesper chat --model ...`) and route-mode override with `/mode`
 - Local memory capture and recall with `/memory`, `/remember`, and `/forget`
 - Search / live-data assisted turns for things like weather, news, docs, and URLs
 - Config-driven providers through `TOML`
@@ -76,13 +76,15 @@ cp whesper.example.toml whesper.toml
 .venv/bin/python -m whesper --config whesper.toml chat
 ```
 
+Optional: pick a specific model for this run:
+
+```bash
+.venv/bin/python -m whesper --config whesper.toml chat --model kimi-k2.5
+```
+
 ## Common Commands
 
 - `/models`
-- `/model local_chat`
-- `/model kimi-k2.5`
-- `/model siliconflow-qwen3-8b`
-- `/model auto`
 - `/mode auto`
 - `/mode reasoning`
 - `/search latest AI news`
@@ -138,6 +140,7 @@ Leave them empty if you want a narrow default setup.
 - Kimi and SiliconFlow are optional remote fallbacks
 - SiliconFlow uses the OpenAI-compatible API; Whesper maps `think` to SiliconFlow's `enable_thinking` field automatically
 - Session and memory data are stored under `.whesper/`
+- Historical transcript is compressed and quoted before being injected back into model context
 - `whesper.toml` is local-only and should not be committed
 
 ## Project Status

@@ -10,7 +10,7 @@ import re
 from whesper.session import utc_now_iso
 
 
-WORD_RE = re.compile(r"[A-Za-z0-9']+")
+WORD_RE = re.compile(r"[A-Za-z0-9']+|[\u4e00-\u9fff]{2,}")
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -36,11 +36,15 @@ def _memory_id(memory_type: str, content: str) -> str:
 
 
 def _tokenize(text: str) -> set[str]:
-    return {
-        token.lower()
-        for token in WORD_RE.findall(text)
-        if len(token) >= 3
-    }
+    tokens: set[str] = set()
+    for token in WORD_RE.findall(text):
+        lowered = token.lower()
+        if re.fullmatch(r"[\u4e00-\u9fff]{2,}", token):
+            tokens.add(token)
+            continue
+        if len(lowered) >= 3:
+            tokens.add(lowered)
+    return tokens
 
 
 def _truncate_fact(value: str, *, limit: int = 120) -> str:
@@ -48,6 +52,52 @@ def _truncate_fact(value: str, *, limit: int = 120) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: limit - 3].rstrip() + "..."
+
+
+def _future_iso(*, hours: int = 0, days: int = 0) -> str:
+    return (datetime.now(UTC) + timedelta(hours=hours, days=days)).replace(
+        microsecond=0
+    ).isoformat()
+
+
+def _as_mapping(value: object) -> dict[str, object] | None:
+    return value if isinstance(value, dict) else None
+
+
+def _coerce_number(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "on", "enabled", "enable", "yes"}:
+            return True
+        if normalized in {"false", "0", "off", "disabled", "disable", "no"}:
+            return False
+    return None
+
+
+def _normalize_hex_color(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if re.fullmatch(r"#[0-9a-f]{6}", normalized):
+        return normalized
+    return None
 
 
 @dataclass(slots=True)
@@ -79,6 +129,7 @@ class MemoryCandidate:
     content: str
     confidence: float
     expires_at: str | None = None
+    memory_key: str | None = None
 
 
 class MemoryStore:
@@ -124,9 +175,10 @@ class MemoryStore:
         confidence: float,
         session_id: str | None = None,
         expires_at: str | None = None,
+        memory_key: str | None = None,
     ) -> MemoryItem:
         now = utc_now_iso()
-        memory_id = _memory_id(memory_type, content)
+        memory_id = _memory_id(memory_type, memory_key or content)
 
         for existing in self._load_all():
             if existing.memory_id != memory_id:
@@ -234,6 +286,7 @@ class MemoryService:
                 confidence=candidate.confidence,
                 session_id=session_id,
                 expires_at=candidate.expires_at,
+                memory_key=candidate.memory_key,
             )
             if memory.memory_id in seen_ids:
                 continue
@@ -241,35 +294,97 @@ class MemoryService:
             saved.append(memory)
         return saved
 
-    def relevant_memories(self, query: str, *, limit: int = 6) -> list[MemoryItem]:
+    def capture_tool_result(
+        self,
+        session_id: str,
+        tool_name: str,
+        content: str,
+    ) -> list[MemoryItem]:
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(payload, dict):
+            return []
+
+        saved: list[MemoryItem] = []
+        seen_ids: set[str] = set()
+        for candidate in extract_tool_memory_candidates(
+            tool_name,
+            payload,
+            session_id=session_id,
+        ):
+            memory = self.store.remember(
+                memory_type=candidate.memory_type,
+                title=candidate.title,
+                content=candidate.content,
+                source="tool_result",
+                confidence=candidate.confidence,
+                session_id=session_id,
+                expires_at=candidate.expires_at,
+                memory_key=candidate.memory_key,
+            )
+            if memory.memory_id in seen_ids:
+                continue
+            seen_ids.add(memory.memory_id)
+            saved.append(memory)
+        return saved
+
+    def relevant_memories(
+        self,
+        query: str,
+        *,
+        limit: int = 6,
+        session_id: str | None = None,
+    ) -> list[MemoryItem]:
         memories = self.store.list_memories()
         if not memories:
             return []
 
         query_tokens = _tokenize(query)
         if not query_tokens:
-            return memories[:limit]
+            return self._fallback_memories(memories, limit=limit, session_id=session_id)
 
-        scored: list[tuple[int, float, datetime, MemoryItem]] = []
+        scored: list[tuple[int, int, float, datetime, MemoryItem]] = []
         for memory in memories:
             haystack = f"{memory.title} {memory.content}"
             overlap = len(query_tokens & _tokenize(haystack))
+            same_session = 1 if session_id is not None and memory.session_id == session_id else 0
             updated_at = _parse_iso(memory.updated_at) or datetime.min.replace(tzinfo=UTC)
-            scored.append((overlap, memory.confidence, updated_at, memory))
+            scored.append((overlap, same_session, memory.confidence, updated_at, memory))
 
-        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-        matched = [memory for overlap, _, _, memory in scored if overlap > 0]
+        scored.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+        matched = [memory for overlap, _, _, _, memory in scored if overlap > 0]
         if matched:
             return matched[:limit]
+        return self._fallback_memories(memories, limit=limit, session_id=session_id)
+
+    def _fallback_memories(
+        self,
+        memories: list[MemoryItem],
+        *,
+        limit: int,
+        session_id: str | None,
+    ) -> list[MemoryItem]:
+        if session_id is not None:
+            same_session = [memory for memory in memories if memory.session_id == session_id]
+            if same_session:
+                return same_session[: min(limit, 3)]
         return memories[: min(limit, 3)]
 
-    def build_prompt_context(self, query: str, *, limit: int = 6) -> str | None:
-        memories = self.relevant_memories(query, limit=limit)
+    def build_prompt_context(
+        self,
+        query: str,
+        *,
+        limit: int = 6,
+        session_id: str | None = None,
+    ) -> str | None:
+        memories = self.relevant_memories(query, limit=limit, session_id=session_id)
         if not memories:
             return None
 
         lines = [
-            "Known memory about the user. Use it when relevant, and ask a quick follow-up if it may be outdated:",
+            "Known memory about the user and recent session context. Use it when relevant, and ask a quick follow-up if it may be outdated:",
         ]
         for memory in memories:
             lines.append(f"- [{memory.memory_type}] {memory.content}")
@@ -352,5 +467,188 @@ def extract_memory_candidates(user_text: str) -> list[MemoryCandidate]:
 
     unique: dict[str, MemoryCandidate] = {}
     for candidate in candidates:
-        unique[_memory_id(candidate.memory_type, candidate.content)] = candidate
+        unique[_memory_id(candidate.memory_type, candidate.memory_key or candidate.content)] = candidate
+    return list(unique.values())
+
+
+_COLOR_LABELS: dict[str, str] = {
+    "#0000ff": "blue (蓝色)",
+    "#ff0000": "red (红色)",
+    "#00ff00": "green (绿色)",
+    "#ff69b4": "pink (粉色)",
+    "#ffb460": "warm white (暖白)",
+    "#ffb36b": "warm amber (暖橙)",
+    "#40c4ff": "bright cyan (亮青蓝)",
+    "#ff3b30": "intense red (强烈红)",
+    "#7fd8ff": "cool blue (冷蓝)",
+}
+
+
+def _describe_color(hex_color: str | None) -> str | None:
+    if hex_color is None:
+        return None
+    label = _COLOR_LABELS.get(hex_color)
+    return f"{label} ({hex_color})" if label is not None else hex_color
+
+
+def _cup_led_color_from_payload(payload: dict[str, object]) -> str | None:
+    for container in (
+        _as_mapping(payload.get("requested")),
+        _as_mapping(payload.get("led")),
+        _as_mapping(payload.get("result")),
+        _as_mapping(payload.get("led_result")),
+    ):
+        if container is None:
+            continue
+        for key in ("color", "led_color"):
+            color = _normalize_hex_color(container.get(key))
+            if color is not None:
+                return color
+    return None
+
+
+def _cup_motor_target_from_payload(payload: dict[str, object]) -> float | None:
+    for container in (
+        _as_mapping(payload.get("motor")),
+        _as_mapping(payload.get("requested")),
+        _as_mapping(payload.get("motor_result")),
+        _as_mapping(payload.get("result")),
+    ):
+        if container is None:
+            continue
+        for key in ("target_velocity", "target", "vel"):
+            target = _coerce_number(container.get(key))
+            if target is not None:
+                return round(target, 3)
+    target = _coerce_number(payload.get("target_velocity"))
+    return round(target, 3) if target is not None else None
+
+
+def _cup_motor_enabled_from_payload(payload: dict[str, object]) -> bool | None:
+    if payload.get("action") == "stop":
+        return False
+    for container in (
+        _as_mapping(payload.get("motor")),
+        _as_mapping(payload.get("requested")),
+        _as_mapping(payload.get("motor_result")),
+        _as_mapping(payload.get("result")),
+    ):
+        if container is None:
+            continue
+        enabled = _coerce_bool(container.get("enabled"))
+        if enabled is not None:
+            return enabled
+    return None
+
+
+def extract_tool_memory_candidates(
+    tool_name: str,
+    payload: dict[str, object],
+    *,
+    session_id: str,
+) -> list[MemoryCandidate]:
+    if tool_name != "control_cup" or payload.get("ok") is not True:
+        return []
+    action = payload.get("action")
+    if not isinstance(action, str):
+        return []
+
+    candidates: list[MemoryCandidate] = []
+    session_prefix = f"{session_id}:control_cup"
+    color_description = _describe_color(_cup_led_color_from_payload(payload))
+    motor_target = _cup_motor_target_from_payload(payload)
+    motor_enabled = _cup_motor_enabled_from_payload(payload)
+
+    if color_description is not None:
+        candidates.append(
+            MemoryCandidate(
+                memory_type="device_state_memory",
+                title="CUP LED State",
+                content=f"The CUP LED is currently set to {color_description}.",
+                confidence=0.9,
+                expires_at=_future_iso(hours=12),
+                memory_key=f"{session_prefix}:led_state",
+            )
+        )
+
+    if motor_enabled is not None or motor_target is not None:
+        if motor_enabled is False or (motor_target is not None and motor_target <= 0):
+            motor_content = "The CUP motor is currently stopped."
+        elif motor_target is not None:
+            motor_content = (
+                f"The CUP motor is currently enabled with target velocity {motor_target:g}."
+            )
+        else:
+            motor_content = "The CUP motor is currently enabled."
+        candidates.append(
+            MemoryCandidate(
+                memory_type="device_state_memory",
+                title="CUP Motor State",
+                content=motor_content,
+                confidence=0.9,
+                expires_at=_future_iso(hours=12),
+                memory_key=f"{session_prefix}:motor_state",
+            )
+        )
+
+    if action == "set_led" and color_description is not None:
+        candidates.append(
+            MemoryCandidate(
+                memory_type="device_preference_memory",
+                title="CUP Lighting Preference",
+                content=f"The user recently chose {color_description} lighting for the CUP.",
+                confidence=0.78,
+                expires_at=_future_iso(days=7),
+                memory_key=f"{session_prefix}:led_preference",
+            )
+        )
+
+    if action == "apply_scene":
+        scene = payload.get("scene")
+        if isinstance(scene, str) and scene.strip():
+            scene_name = scene.strip()
+            candidates.extend(
+                (
+                    MemoryCandidate(
+                        memory_type="device_state_memory",
+                        title="CUP Scene State",
+                        content=f"The CUP is currently using the {scene_name} scene.",
+                        confidence=0.92,
+                        expires_at=_future_iso(hours=12),
+                        memory_key=f"{session_prefix}:scene_state",
+                    ),
+                    MemoryCandidate(
+                        memory_type="device_preference_memory",
+                        title="CUP Scene Preference",
+                        content=f"The user recently chose the {scene_name} scene for the CUP.",
+                        confidence=0.8,
+                        expires_at=_future_iso(days=7),
+                        memory_key=f"{session_prefix}:scene_preference",
+                    ),
+                )
+            )
+
+    if action == "nudge_intensity":
+        direction = payload.get("direction")
+        if direction == "up":
+            preference_text = "The user recently asked for stronger CUP stimulation."
+        elif direction == "down":
+            preference_text = "The user recently asked for gentler CUP stimulation."
+        else:
+            preference_text = None
+        if preference_text is not None:
+            candidates.append(
+                MemoryCandidate(
+                    memory_type="device_preference_memory",
+                    title="CUP Intensity Preference",
+                    content=preference_text,
+                    confidence=0.76,
+                    expires_at=_future_iso(days=3),
+                    memory_key=f"{session_prefix}:intensity_preference",
+                )
+            )
+
+    unique: dict[str, MemoryCandidate] = {}
+    for candidate in candidates:
+        unique[_memory_id(candidate.memory_type, candidate.memory_key or candidate.content)] = candidate
     return list(unique.values())
