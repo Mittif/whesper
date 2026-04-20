@@ -385,7 +385,7 @@ class ConfigTests(unittest.TestCase):
 
             [providers.ollama_local]
             kind = "ollama_native"
-            base_url = "${TEST_WHESPER_OLLAMA_BASE_URL:-http://localhost:11434}"
+            base_url = "${WHESPER_OLLAMA_BASE_URL:-http://localhost:11434}"
 
             [models.local]
             provider = "ollama_local"
@@ -397,12 +397,165 @@ class ConfigTests(unittest.TestCase):
             fh.write(content)
             temp_path = fh.name
 
-        with mock.patch.dict(os.environ, {}, clear=False):
+        with mock.patch.dict(os.environ, {}, clear=True):
             config = load_config(temp_path)
         self.assertEqual(
             config.get_provider("ollama_local").base_url,
             "http://localhost:11434",
         )
+
+    def test_server_settings_default_when_section_absent(self) -> None:
+        content = textwrap.dedent(
+            """
+            [scheduler]
+            chat_model = "local"
+
+            [providers.main]
+            base_url = "http://localhost:11434/v1"
+
+            [models.local]
+            provider = "main"
+            model = "qwen"
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        config = load_config(temp_path)
+        self.assertFalse(config.server.enabled)
+        self.assertEqual(config.server.host, "127.0.0.1")
+        self.assertEqual(config.server.port, 8765)
+        self.assertTrue(config.server.require_auth)
+        self.assertEqual(config.server.cors_origins, ())
+        self.assertEqual(config.server.request_timeout_seconds, 300)
+        self.assertEqual(config.server.max_concurrent_turns, 4)
+        self.assertEqual(config.server.api_token_env, "WHESPER_SERVER_TOKEN")
+        self.assertIsNone(config.server.api_token)
+
+    def test_loads_optional_server_settings(self) -> None:
+        content = textwrap.dedent(
+            """
+            [scheduler]
+            chat_model = "local"
+
+            [providers.main]
+            base_url = "http://localhost:11434/v1"
+
+            [models.local]
+            provider = "main"
+            model = "qwen"
+
+            [server]
+            enabled = true
+            host = "0.0.0.0"
+            port = 9000
+            require_auth = false
+            api_token = "inline-secret"
+            cors_origins = ["https://app.example.com", "https://other.example.com"]
+            request_timeout_seconds = 120
+            max_concurrent_turns = 8
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        config = load_config(temp_path)
+        self.assertTrue(config.server.enabled)
+        self.assertEqual(config.server.host, "0.0.0.0")
+        self.assertEqual(config.server.port, 9000)
+        self.assertFalse(config.server.require_auth)
+        self.assertEqual(
+            config.server.cors_origins,
+            ("https://app.example.com", "https://other.example.com"),
+        )
+        self.assertEqual(config.server.request_timeout_seconds, 120)
+        self.assertEqual(config.server.max_concurrent_turns, 8)
+        self.assertEqual(config.server.resolved_api_token(), "inline-secret")
+
+    def test_server_api_token_resolves_from_environment(self) -> None:
+        content = textwrap.dedent(
+            """
+            [scheduler]
+            chat_model = "local"
+
+            [providers.main]
+            base_url = "http://localhost:11434/v1"
+
+            [models.local]
+            provider = "main"
+            model = "qwen"
+
+            [server]
+            enabled = true
+            api_token_env = "TEST_WHESPER_SERVER_TOKEN"
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        with mock.patch.dict(
+            os.environ,
+            {"TEST_WHESPER_SERVER_TOKEN": "env-secret"},
+            clear=False,
+        ):
+            config = load_config(temp_path)
+            self.assertEqual(config.server.resolved_api_token(), "env-secret")
+
+    def test_rejects_invalid_server_port(self) -> None:
+        content = textwrap.dedent(
+            """
+            [scheduler]
+            chat_model = "local"
+
+            [providers.main]
+            base_url = "http://localhost:11434/v1"
+
+            [models.local]
+            provider = "main"
+            model = "qwen"
+
+            [server]
+            port = 99999
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        with self.assertRaises(ConfigError):
+            load_config(temp_path)
+
+    def test_rejects_invalid_server_cors_origins(self) -> None:
+        content = textwrap.dedent(
+            """
+            [scheduler]
+            chat_model = "local"
+
+            [providers.main]
+            base_url = "http://localhost:11434/v1"
+
+            [models.local]
+            provider = "main"
+            model = "qwen"
+
+            [server]
+            cors_origins = "https://app.example.com"
+            """
+        ).strip()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = fh.name
+
+        with self.assertRaises(ConfigError):
+            load_config(temp_path)
 
     def test_loads_provider_base_url_from_environment_variable_override(self) -> None:
         content = textwrap.dedent(
@@ -412,7 +565,7 @@ class ConfigTests(unittest.TestCase):
 
             [providers.ollama_local]
             kind = "ollama_native"
-            base_url = "${TEST_WHESPER_OLLAMA_BASE_URL:-http://localhost:11434}"
+            base_url = "${WHESPER_OLLAMA_BASE_URL:-http://localhost:11434}"
 
             [models.local]
             provider = "ollama_local"
@@ -426,13 +579,13 @@ class ConfigTests(unittest.TestCase):
 
         with mock.patch.dict(
             os.environ,
-            {"TEST_WHESPER_OLLAMA_BASE_URL": "http://family.zhoudians.com:41434"},
+            {"WHESPER_OLLAMA_BASE_URL": "http://example.invalid:41434"},
             clear=False,
         ):
             config = load_config(temp_path)
         self.assertEqual(
             config.get_provider("ollama_local").base_url,
-            "http://family.zhoudians.com:41434",
+            "http://example.invalid:41434",
         )
 
 

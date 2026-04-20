@@ -36,6 +36,7 @@ tests/test_commands.py
 tests/test_config.py
 tests/test_live_data.py
 tests/test_memory.py
+tests/test_message_builder.py
 tests/test_payload.py
 tests/test_provider_profile.py
 tests/test_router.py

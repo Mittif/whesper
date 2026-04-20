@@ -76,6 +76,27 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("models", help="List configured models")
     subparsers.add_parser("sessions", help="List local saved sessions")
 
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Start the HTTP/SSE backend server (requires the `server` extra).",
+    )
+    serve_parser.add_argument(
+        "--host",
+        default=None,
+        help="Override [server].host from config.",
+    )
+    serve_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Override [server].port from config.",
+    )
+    serve_parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="Enable uvicorn auto-reload (development only).",
+    )
+
     return parser
 
 
@@ -1969,6 +1990,59 @@ def interactive_chat(
             cup_heartbeat_monitor.stop()
 
 
+def run_server(
+    config: AppConfig,
+    *,
+    host_override: str | None = None,
+    port_override: int | None = None,
+    reload: bool = False,
+) -> int:
+    server_settings = config.server
+    if not server_settings.enabled:
+        print(
+            "Server is disabled. Set [server].enabled = true in your config to enable it.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if server_settings.require_auth and not server_settings.resolved_api_token():
+        print(
+            "Server requires auth but no token is configured. Set [server].api_token "
+            "or export the env var referenced by [server].api_token_env.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        import uvicorn  # noqa: PLC0415
+        from whesper.api.application import AgentApplication  # noqa: PLC0415
+        from whesper.server.http import create_app  # noqa: PLC0415
+    except ImportError as exc:
+        print(
+            "Missing server extra. Install with `python3 -m pip install -e \".[server]\"`.",
+            file=sys.stderr,
+        )
+        print(f"underlying error: {exc}", file=sys.stderr)
+        return 1
+
+    host = host_override or server_settings.host
+    port = port_override or server_settings.port
+    application = AgentApplication(config)
+    app = create_app(application)
+    print(
+        f"Starting Whesper server on http://{host}:{port} "
+        f"(auth {'on' if server_settings.require_auth else 'off'})"
+    )
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        reload=reload,
+        timeout_keep_alive=server_settings.request_timeout_seconds,
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1988,6 +2062,15 @@ def main(argv: list[str] | None = None) -> None:
     if command == "sessions":
         print_sessions(store)
         raise SystemExit(0)
+
+    if command == "serve":
+        exit_code = run_server(
+            config,
+            host_override=getattr(args, "host", None),
+            port_override=getattr(args, "port", None),
+            reload=getattr(args, "reload", False),
+        )
+        raise SystemExit(exit_code)
 
     exit_code = interactive_chat(
         config,

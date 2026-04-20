@@ -1285,6 +1285,7 @@ class ChatService:
             return None
         system = payload.get("system")
         motor = payload.get("motor")
+        config = payload.get("config")
         connected = True
         if isinstance(system, dict):
             connected_value = self._first_bool_value(
@@ -1293,6 +1294,10 @@ class ChatService:
             )
             if connected_value is not None:
                 connected = connected_value
+        # Motor state must come from /api/motor (realtime telemetry). /api/config
+        # exposes persisted NVS values that can lag the runtime state (e.g. POST
+        # /api/motor updates the FOC manager but not NVS), so using it as a
+        # fallback would surface stale values and produce false failures.
         motor_target = self._first_numeric_value(
             motor,
             keys=("target", "target_velocity", "vel", "velocity"),
@@ -1301,24 +1306,32 @@ class ChatService:
             motor,
             keys=("enabled", "running", "on"),
         )
+        # LED state lives in /api/config (led_color_rgb, led_blink_hz,
+        # led_blink_mode). Older fixtures may embed the same fields in
+        # /api/status, so keep that as a fallback.
         led_color = None
         led_blink_hz = None
         led_blink_mode = None
-        if isinstance(system, dict):
-            led_color = self._first_hex_color_value(
-                system,
-                keys=("led_color", "color"),
-            )
-            led_blink_hz = self._first_numeric_value(
-                system,
-                keys=("led_blink_hz", "blink_hz", "blinkHz"),
-            )
-            blink_mode_value = self._first_numeric_value(
-                system,
-                keys=("led_blink_mode", "blink_mode", "blinkMode"),
-            )
-            if blink_mode_value is not None:
-                led_blink_mode = int(round(blink_mode_value))
+        for source in (config, system):
+            if not isinstance(source, dict):
+                continue
+            if led_color is None:
+                led_color = self._first_hex_color_value(
+                    source,
+                    keys=("led_color_rgb", "led_color", "color"),
+                )
+            if led_blink_hz is None:
+                led_blink_hz = self._first_numeric_value(
+                    source,
+                    keys=("led_blink_hz", "blink_hz", "blinkHz"),
+                )
+            if led_blink_mode is None:
+                blink_mode_value = self._first_numeric_value(
+                    source,
+                    keys=("led_blink_mode", "blink_mode", "blinkMode"),
+                )
+                if blink_mode_value is not None:
+                    led_blink_mode = int(round(blink_mode_value))
         return CupStatusSnapshot(
             connected=connected,
             motor_target=motor_target,

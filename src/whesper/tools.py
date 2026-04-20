@@ -1210,12 +1210,17 @@ def _handle_control_cup(
     if action == "status":
         system_response = cup_request(_CUP_STATUS_ENDPOINT)
         motor_response = cup_request(_CUP_MOTOR_ENDPOINT)
+        # /api/config carries the persisted LED/motor settings (led_color_rgb,
+        # led_blink_hz, led_blink_mode, ...). The device has no GET /api/led,
+        # so config is the authoritative source for LED state.
+        config_response = cup_request(_CUP_CONFIG_ENDPOINT)
         return {
             "ok": True,
             "device": base_url,
             "action": "status",
             "system": _unwrap_device_response(system_response),
             "motor": _unwrap_device_response(motor_response),
+            "config": _unwrap_device_response(config_response),
             "request_trace": request_trace,
         }
 
@@ -1952,6 +1957,7 @@ _CUP_STATUS_ENDPOINT = "/status"
 _CUP_MOTOR_ENDPOINT = "/motor"
 _CUP_STOP_ENDPOINT = "/motor/stop"
 _CUP_LED_ENDPOINT = "/led"
+_CUP_CONFIG_ENDPOINT = "/config"
 _CUP_MAX_TARGET_VELOCITY = 140.0
 _CUP_SCENES: dict[str, dict[str, object]] = {
     "gentle": {

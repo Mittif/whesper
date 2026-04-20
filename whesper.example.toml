@@ -69,6 +69,21 @@ reasoning_keywords = ["分析", "总结", "比较", "计划", "设计", "为什�
 # api_token_env = "WHESPER_CUP_API_TOKEN"
 # timeout_seconds = 5
 
+# Optional backend HTTP/SSE server. Used by `whesper serve` to expose the
+# Agent to remote clients (mobile, web, second CLI). Leaving [server] absent
+# keeps the local CLI working exactly as before.
+#
+# [server]
+# enabled = false                              # the `whesper serve` CLI command still requires this be true
+# host = "127.0.0.1"                           # bind address; use "0.0.0.0" only when reverse-proxied + TLS
+# port = 8765
+# require_auth = true                          # set to false for local-only development
+# api_token_env = "WHESPER_SERVER_TOKEN"       # env var to read the bearer token from
+# # api_token = "paste-inline-if-you-must"     # overrides api_token_env when set; avoid committing secrets
+# cors_origins = []                            # e.g. ["https://app.example.com"]; leave empty to disable CORS
+# request_timeout_seconds = 300                # per-turn upper bound for long generations
+# max_concurrent_turns = 4                     # process-wide cap; per-session concurrency is always 1
+
 [providers.ollama_local]
 kind = "ollama_native"
 base_url = "${WHESPER_OLLAMA_BASE_URL:-http://localhost:11434}"

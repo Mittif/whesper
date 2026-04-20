@@ -150,6 +150,30 @@ class HardwareSettings:
 
 
 @dataclass(slots=True)
+class ServerSettings:
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 8765
+    api_token: str | None = None
+    api_token_env: str | None = "WHESPER_SERVER_TOKEN"
+    require_auth: bool = True
+    cors_origins: tuple[str, ...] = ()
+    request_timeout_seconds: int = 300
+    max_concurrent_turns: int = 4
+
+    def resolved_api_token(self) -> str | None:
+        if self.api_token is not None:
+            token = self.api_token.strip()
+            return token or None
+        if self.api_token_env:
+            token = os.getenv(self.api_token_env)
+            if token is not None:
+                normalized = token.strip()
+                return normalized or None
+        return None
+
+
+@dataclass(slots=True)
 class AppConfig:
     app: AppSettings
     persona: PersonaConfig
@@ -160,6 +184,7 @@ class AppConfig:
     models: dict[str, ModelConfig]
     source_path: Path
     hardware: HardwareSettings = field(default_factory=HardwareSettings)
+    server: ServerSettings = field(default_factory=ServerSettings)
 
     def get_provider(self, name: str) -> ProviderConfig:
         try:
@@ -453,6 +478,64 @@ def _parse_cup_hardware_settings(
     )
 
 
+def _parse_server_settings(raw: Any) -> ServerSettings:
+    if raw is None:
+        return ServerSettings()
+    if not isinstance(raw, dict):
+        raise ConfigError("Invalid [server] section in config.")
+
+    host = str(raw.get("host", "127.0.0.1")).strip()
+    if not host:
+        raise ConfigError("server.host must be a non-empty string.")
+
+    port_raw = raw.get("port", 8765)
+    try:
+        port = int(port_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("server.port must be an integer.") from exc
+    if not (1 <= port <= 65535):
+        raise ConfigError("server.port must be between 1 and 65535.")
+
+    api_token = raw.get("api_token")
+    api_token_env = raw.get("api_token_env", "WHESPER_SERVER_TOKEN")
+    normalized_api_token = (
+        str(api_token).strip() if api_token is not None else None
+    ) or None
+    normalized_api_token_env = (
+        str(api_token_env).strip() if api_token_env is not None else None
+    ) or None
+
+    cors_origins_raw = raw.get("cors_origins")
+    if cors_origins_raw is None:
+        cors_origins: tuple[str, ...] = ()
+    elif isinstance(cors_origins_raw, list) and all(
+        isinstance(item, str) for item in cors_origins_raw
+    ):
+        cors_origins = tuple(item.strip() for item in cors_origins_raw if item.strip())
+    else:
+        raise ConfigError("server.cors_origins must be a list of strings.")
+
+    request_timeout_seconds = int(raw.get("request_timeout_seconds", 300))
+    if request_timeout_seconds <= 0:
+        raise ConfigError("server.request_timeout_seconds must be > 0.")
+
+    max_concurrent_turns = int(raw.get("max_concurrent_turns", 4))
+    if max_concurrent_turns <= 0:
+        raise ConfigError("server.max_concurrent_turns must be > 0.")
+
+    return ServerSettings(
+        enabled=bool(raw.get("enabled", False)),
+        host=host,
+        port=port,
+        api_token=normalized_api_token,
+        api_token_env=normalized_api_token_env,
+        require_auth=bool(raw.get("require_auth", True)),
+        cors_origins=cors_origins,
+        request_timeout_seconds=request_timeout_seconds,
+        max_concurrent_turns=max_concurrent_turns,
+    )
+
+
 def load_config(path: str | Path) -> AppConfig:
     config_path = Path(path).expanduser().resolve()
     with config_path.open("rb") as fh:
@@ -464,6 +547,7 @@ def load_config(path: str | Path) -> AppConfig:
     live_context_raw = raw.get("live_context", {})
     shell_sandbox_raw = raw.get("shell_sandbox", {})
     hardware_raw = raw.get("hardware", {})
+    server_raw = raw.get("server", {})
     scheduler_raw = _require_table(raw, "scheduler")
     providers_raw = _require_table(raw, "providers")
     models_raw = _require_table(raw, "models")
@@ -507,6 +591,8 @@ def load_config(path: str | Path) -> AppConfig:
         raise ConfigError("Invalid [shell_sandbox] section in config.")
     if hardware_raw and not isinstance(hardware_raw, dict):
         raise ConfigError("Invalid [hardware] section in config.")
+    if server_raw and not isinstance(server_raw, dict):
+        raise ConfigError("Invalid [server] section in config.")
     live_context = LiveContextSettings(
         search_api=_parse_search_api_settings(
             live_context_raw.get("search_api") if isinstance(live_context_raw, dict) else None
@@ -545,6 +631,7 @@ def load_config(path: str | Path) -> AppConfig:
             variables=variables,
         ),
     )
+    server = _parse_server_settings(server_raw if isinstance(server_raw, dict) else None)
 
     providers: dict[str, ProviderConfig] = {}
     for name, item in providers_raw.items():
@@ -611,6 +698,7 @@ def load_config(path: str | Path) -> AppConfig:
         models=models,
         source_path=config_path,
         hardware=hardware,
+        server=server,
     )
 
     if scheduler.chat_model not in models:

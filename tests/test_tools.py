@@ -991,7 +991,16 @@ class ToolRegistryTests(unittest.TestCase):
                 seen_requests.append(url)
                 if url.endswith("/api/status"):
                     return {"ok": True, "data": {"ip": "192.168.1.42", "wifi_state": "connected"}}
-                return {"ok": True, "data": {"target": 70.0, "vel": 68.5}}
+                if url.endswith("/api/motor"):
+                    return {"ok": True, "data": {"target": 70.0, "vel": 68.5}}
+                return {
+                    "ok": True,
+                    "data": {
+                        "led_color_rgb": 255,
+                        "led_blink_hz": 0,
+                        "led_blink_mode": 0,
+                    },
+                }
 
             tools_module._tool_http_json_request = request
             payload = _handle_control_cup(
@@ -1008,11 +1017,13 @@ class ToolRegistryTests(unittest.TestCase):
             [
                 f"{CUP_DEFAULT_API_BASE_URL}/status",
                 f"{CUP_DEFAULT_API_BASE_URL}/motor",
+                f"{CUP_DEFAULT_API_BASE_URL}/config",
             ],
         )
         self.assertEqual(payload["action"], "status")
         self.assertEqual(payload["system"]["ip"], "192.168.1.42")
         self.assertEqual(payload["motor"]["target"], 70.0)
+        self.assertEqual(payload["config"]["led_color_rgb"], 255)
 
     def test_handle_control_cup_accepts_base_url_with_api_suffix(self) -> None:
         from whesper import tools as tools_module
@@ -1039,6 +1050,7 @@ class ToolRegistryTests(unittest.TestCase):
             [
                 f"{CUP_DEFAULT_API_BASE_URL}/status",
                 f"{CUP_DEFAULT_API_BASE_URL}/motor",
+                f"{CUP_DEFAULT_API_BASE_URL}/config",
             ],
         )
 
